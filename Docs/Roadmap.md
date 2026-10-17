@@ -15,17 +15,41 @@ ambient, cube-grid instancing (2 instance buffers, 18 instances captured; astron
 geometry all render, log clean), and a placeholder ACES tonemap with fixed exposure 0.03 in `CompositePass` (the
 cockpit capture shows correct detail and colors). Visual limitations are expected at this stage: no IBL/eye
 adaptation (ambient is the game's 0.02 probe floor), no shadows, transparency, voxels, skinning, culling or LOD
-selection. Never run git; the user commits.
+selection. **Monitor selection fixed and verified by the user across restarts** (2026-10-17): the adapter (game
+"Video Adapter", an adapter+output pair) is now forwarded on adapter changes too, and the SDL window targets the
+matching display so fullscreen lands on the selected monitor. The world correctness pass is also in: all MWM LODs
+load (SquarePlate 2, Cockpit 4, astronaut 3, EdgeStraight 3; zero warnings), per-actor LOD selection with the
+stock distance formula and 10% hysteresis, infinite far-plane frustum culling, `MaxViewDistance` culling, and
+D3D-matching clockwise front-face culling (`FrontFace=Clockwise`, back culling). Verified in game: 47-59 draws
+depending on view, 1 culled when looking away, solid blocks with no holes, clean log. **Static IBL is also in**:
+the `BackgroundCube` skybox is drawn as the depth-less background, `BackgroundCubeIndirect.dds` (10 prefiltered
+mips) provides diffuse irradiance and roughness-based sky reflections, and `ambient_brdf.dds` provides the
+split-sum BRDF; the game's 0.02 probe ambient floor is kept as a minimum. Verified by capture (stars/nebula,
+cockpit reflections, correct texture loading: IBL slot 1 with 10 mips, BRDF ready within 0.3 s). **Transparent
+materials are implemented and verified** (cockpit windows are visible; the stock material's `ColorAdd.a`
+contributes to transparency, which was the missing piece). **Character parenting is fixed** (`CreateManualCullObject`
+/ `SetParentCullObject` hierarchy; the camera now moves the character) and per-material visibility flags work.
+**GPU skinning is implemented**: the MWM skinned vertex buffer feeds a compute pass that deforms vertices with the
+per-actor bone palette (skin transforms built from `SetCharacterSkeleton` + `SetCharacterTransforms`) into the
+normal static vertex layout; the forward pass is unchanged. The critical missing link was **visibility output**:
+the game only calls `Render.Draw()` (and thus sends `SetCharacterTransforms`) for IDs in
+`MyRenderProxy.VisibleObjectsWrite`, so `ModelPass` now reports every visible actor with `SetVisibilityUpdates`.
+The character appears and animates; a skinning position bug (dropped bone translations from row 3) was fixed and
+needs a final pose check. **Cockpit/LCD texture changes** (`ChangeMaterialTexture` + generated offscreen textures +
+per-material Visible flags) are implemented; need an inside-cockpit check. **Automated tests** now work via
+`VULKAN_AUTOLOAD=<seconds>`. Still missing by design: dynamic lights, dynamic scene probe (the hard sun terminator
+on the dark side stays dark until it exists), shadows, eye adaptation. Never run git; the user commits.
 
 **Next tasks, in order:**
-1. **World correctness pass**: per-actor frustum culling (bounds are loaded already), LOD selection
-   (`MyLODDescriptor`), back-face culling, depth bias check, non-uniform scale normal matrix.
-2. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
-   MRT pass) so TAA/FSR/GI can build on it, then Phase 3 lighting/shadows (environment probe/IBL and eye
-   adaptation replace the ambient and fixed-exposure placeholders).
-3. Remaining Phase 2: voxel cells, skinned characters, transparent materials, static/merge groups.
-4. Remaining Phase 1 odds: texture messages (Preload/Unload/Deprioritize), verify LCD offscreen targets in-world,
-   options presets as features land.
+1. **Verify GPU skinning/pose in third person and first person** (head materials hidden, body posed, no distortion)
+   and the cockpit screens inside a cockpit (battery/panels). Fix any remaining bone-mapping issues.
+2. **Dynamic environment probe** (scene cubemap capture + prefilter, close/far blend) to soften the hard sunlight
+   terminator and light interiors, then dynamic lights (`CreateRenderLight`/`UpdateRenderLight`), shadows.
+3. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
+   MRT pass) so TAA/FSR/GI can build on it.
+4. Remaining Phase 2: voxel cells, static/merge groups; remaining Phase 1 odds: texture load/unload messages,
+   options presets.
+5. When flying away, watch the `LOD histogram` in the 5-second `Scene:` log line to confirm LOD switching.
 
 **User preferences / rules (all sessions):**
 - Never run git commands. The user commits and pushes.
@@ -52,10 +76,16 @@ selection. Never run git; the user commits.
 | DDS loader survey | `dotnet run --project Tools/VulkanSmokeTest -- --dds ~/.local/share/Steam/steamapps/common/SpaceEngineers/Content/Textures` (expect 1 failure: a PSD misnamed `.dds`) |
 | Run the game | `cd ~/.local/share/PulsarRelease && ./Interim.bin -sources` (Pulsar **v2.4.3** official release). Steam launch option alternative: `/home/sentorx/.local/share/PulsarRelease/Interim.bin %command% -sources` with Proton disabled. Pulsar recompiles the plugin from `~/Development/Vulkan` when files change (debug build). |
 | Frame capture | Run with `VULKAN_SCREENSHOT=/tmp/x.png VULKAN_SCREENSHOT_DELAY=25` (env vars); the renderer writes one PNG after the delay. View it with the Read tool. This is how to verify rendering without the user. |
+| Automatic test | Add `VULKAN_AUTOLOAD=<seconds>` to press **Continue Game** on the main menu automatically (last session), then combine with the frame capture env vars. Fully headless of user input: no clicking needed. |
 | Stop the game | `kill -TERM $(pgrep Interim)`. **Never `pkill -f <pattern>`** — it matches the invoking shell's own command line and kills the tool shell instead. |
 | Logs | Game log (has `[Vulkan]` lines): newest `~/.config/SpaceEngineers/SpaceEngineers_*.log`; console: `~/.config/SpaceEngineers/Console_*.log` or redirect stdout. Pulsar log: `~/.local/share/PulsarRelease/Legacy/info.log` (plugin compile errors appear here). |
 | Pulsar dev folder config | `~/.local/share/PulsarRelease/Legacy/Sources/sources.xml` (`<LocalPlugin>` Folder=repo, File=`Vulkan.xml`) and `Legacy/Profiles/Current.xml` (`<DevFolder><LocalFolderConfig><Id>7C5A605C-1041-4C94-988A-5DF95F3145F8</Id>`). Already set up. |
 | Plugin config file | `~/.config/SpaceEngineers/Storage/Vulkan.cfg` (`Config.Renderer`, `Validation`; XML). Only exists once saved (config dialog, or the automatic switch to DirectX11 after a device creation failure); defaults apply otherwise (Renderer=Vulkan). |
+
+Testing note: Space Engineers' **trash collector** deletes unowned/nearby-abandoned grids when the player flies
+away (`Info: Trash collector removed grid ...` in the game log), including their physics. Disable trash removal in
+the world settings (or make the grid a station/owned) when testing rendering at a distance; a disappearing grid is
+not necessarily a renderer bug. Our renderer correctly drops actors/instance buffers on `RemoveRenderObject`.
 
 Expected/benign log noise: `Failed to load plugin 'libdecor-gtk.so'`; on exit the shell prints `Killed` (LinuxCompat
 ends the process with `Process.Kill()` in `MySandboxGame.ExitThreadSafe`; `DisposeDevice` does not run). The
@@ -93,6 +123,11 @@ Pulsar client plugin, that:
 | Native interop | `NativeLibrary.Load`/`GetExport` + `delegate* unmanaged` function pointers. **No `[LibraryImport]`** and no other source generators (`[GeneratedRegex]`, JSON source gen, …): Pulsar compiles plugins with plain Roslyn (`CSharpCompilation.Create` + `Emit`) and never runs generators. Avoid `[DllImport]` too. Unsafe code is allowed. A local SDK build passing does **not** prove Pulsar can compile it. |
 | Publicizer | Krafs.Publicizer for `VRage.Platform.Windows` and `VRage.Render` (csproj `<Publicize>` items **and** `[assembly: IgnoresAccessChecksTo]` in `ClientPlugin/Tools/GameAssembliesToPublicize.cs` — keep both in sync; Pulsar reads the attributes). `IgnoresAccessChecksToAttribute.cs` defines the attribute for Pulsar builds (`!LOCAL_BUILD`). |
 | Root namespace | `ClientPlugin` (template default). LinuxCompat also uses `ClientPlugin.*`; no clash (different assemblies), but look its types up by full name. |
+| Monitor selection | The game's "Video Adapter" is an adapter+output pair (`MyAdapterInfo.OutputName`/`DesktopBounds`); SE stores its index (`VideoAdapter`). We forward `AdapterOrdinal` changes (not only window-mode changes) and select the SDL display whose bounds/name matches, via `SDL_SetWindowPosition(SDL_WINDOWPOS_CENTERED_DISPLAY(id), …)`: SDL records it as the pending fullscreen display even on Wayland, where moving a toplevel is refused. Done on LinuxCompat's SDL thread through reflection on `SdlRenderThread.Dispatch`. |
+| Winding / culling | D3D's default front face is **clockwise** (`FrontCounterClockwise=false`). Our projection negates `M22` for Vulkan, which cancels Vulkan's opposite framebuffer Y direction, so final screen-space winding stays clockwise: model pipelines use `FrontFace.Clockwise` + `CullMode.Back` (or `None` for `NoBackFaceCulling`). Pipelines that do not follow this will show holes/inside-out geometry. |
+| Image-based lighting | Static first pass: `BackgroundCube.dds` is the depth-less background; `BackgroundCubeIndirect.dds` (10 prefiltered mips) gives diffuse irradiance (last mip) and roughness-based reflections; `ambient_brdf.dds` (R16G16F, linear) gives the split-sum BRDF. Cubemaps use their own bindless array (set 0, binding 2); sampling follows stock `ApplySkyboxOrientation`. The dynamic scene probe (stock `MyEnvironmentProbe`), far/near probe blending and eye adaptation come later. |
+| Transparent models | Glass/holo/shield parts look up `VRageRender.MyTransparentMaterials` by material name (fallback `GlassCCW`), use the stock material color (premultiplied linear), color add, light multiplier, reflectivity/fresnel/gloss and texture/gloss texture. Drawn after opaque with depth test read-only, no depth write, premultiplied-alpha blending, back-to-front sorting, and per-material `TriangleFaceCulling`. OIT, dithering and per-instance sorting are not implemented yet. |
+| Skinning | **GPU compute deformation**, no CPU vertex work: the skinned MWM buffer (64 B/vertex with bone indices/weights) is deformed by a compute pass using a per-actor bone palette (bind-inverse × absolute, ~81 matrices assembled per frame on the CPU) into the normal 32 B static vertex layout; the forward pass is unchanged. The game calls `Render.Draw` only for IDs reported in `MyRenderProxy.VisibleObjectsWrite`, so visible IDs of actors with `SetVisibilityUpdates` are published each frame; without this the game never sends `SetCharacterTransforms`. |
 | Git | The user does all git operations. Sessions never run git commands. |
 
 ## Our code map
@@ -103,6 +138,7 @@ Pulsar client plugin, that:
 | `ClientPlugin/Plugin.cs` | `IPlugin`; `PatchAllUncategorized` only (renderer patches are early). Config dialog. |
 | `ClientPlugin/Config.cs` | `RendererKind Renderer` (Vulkan/DirectX11), `bool Validation`, read-only `[Info]` status properties (getter-only, so `XmlSerializer` skips them). Template `SettingsGenerator` UI. |
 | `ClientPlugin/Gui/GraphicsOptionsPatch.cs` | Postfix on `MyGuiScreenOptionsGraphics.RecreateControls`: "Vulkan Renderer" button (found by control names `GraphicsPreset` / `EnableDamageEffects`). |
+| `ClientPlugin/Testing/AutoLoadMainMenu.cs` | Harmony postfix on the main menu input: `VULKAN_AUTOLOAD=<seconds>` presses Continue Game for automated tests. |
 | `ClientPlugin/Settings/Elements/Info.cs` | Read-only label/value settings element. |
 | `Render/RendererStatus.cs` | Which renderer runs, fallback reason, selected GPU capabilities (for the settings dialog). |
 | `Render/RenderProxyInitializePatch.cs` | Prefix on `MyRenderProxy.Initialize(ref IMyRender)`: swaps `MyDX11Render` for `VulkanRender` if selected and the probe passes. |
@@ -120,12 +156,20 @@ Pulsar client plugin, that:
 | `Render/Vulkan/GpuMemory.cs` | Block sub-allocator (64 MB blocks, dedicated ≥ 32 MB, buffers and images in separate blocks, host-visible blocks persistently mapped, every block has DEVICE_ADDRESS flag). |
 | `Render/Vulkan/GpuBuffer.cs`, `GpuImage.cs` | Resources; `Dispose` defers destruction through `GpuContext.Release`. |
 | `Render/Vulkan/UploadQueue.cs` | Per-frame 32 MB staging rings; copies recorded at the start of the frame's command buffer; images end in ShaderReadOnlyOptimal. Render thread only. |
-| `Render/Vulkan/BindlessDescriptors.cs` | Set 0 (binding 0: up to 65536 sampled images, binding 1: 4 immutable samplers), the shared pipeline layout (128 B push constants, all stages), fixed texture slots White/Black/Missing/Transparent. |
+| `Render/Vulkan/BindlessDescriptors.cs` | Set 0 (binding 0: up to 65536 sampled images, binding 1: 4 immutable samplers, binding 2: 16 cubemaps with a black default), the shared pipeline layout (128 B push constants, all stages), fixed texture slots White/Black/Missing/Transparent. |
 | `Render/Vulkan/MipGenerator.cs` | Blit-chain mip generation (uploads with `generateMips`, offscreen targets). |
 | `Render/Vulkan/GraphicsPipelineBuilder.cs` | Init-property description → graphics pipeline (dynamic rendering, shared bindless layout, dynamic viewport/scissor, no vertex input, reverse-Z depth compare by default). Use it for every new pipeline. |
 | `Render/Vulkan/TransientAllocator.cs` | `GpuContext.Transient`: per-frame linear host-visible scratch with device addresses (frame constants, per-draw data, instances). Reset in `GpuContext.BeginFrame`. |
 | `Render/Scene/SceneTargets.cs` | HDR color (R16G16B16A16_SFLOAT) + depth (D32_SFLOAT, reverse Z, cleared to 0) at the game resolution, bindless slots; recreated on resize. |
-| `Render/Scene/CompositePass.cs` | Fullscreen triangle: scene color → backbuffer (clamp placeholder for tonemapping). |
+| `Render/Scene/SkyboxPass.cs` | Depth-less fullscreen background sampling the environment cubemap along the view ray. |
+| `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, IBL slots/params), LOD coefficient. |
+| `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy, instance ranges/bounds, max view distance, per-actor LOD. |
+| `Render/Scene/Frustum.cs` | Five-plane infinite-far-plane culling from the stock view-projection. |
+| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: LOD choice, frustum/distance culling, cull-back and no-cull pipelines, bindless materials, IBL + sun shading, cube instancing; GPU skinning compute pre-pass; visible-object reporting for the game (`VisibleObjectsWrite`). |
+| `Render/Scene/InstanceBuffers.cs` | GPU instance buffers for cube/generic ranges (replaced per update for frames-in-flight safety). |
+| `Render/Models/MwmLoader.cs`, `MwmMeshData.cs` | Background MWM parsing through `MyModelImporter`, all LODs, stock vertex decodes, texture path resolution. |
+| `Render/Models/ModelCache.cs` | Model path → parsed LOD data → device-local GPU buffers, parts and texture entries; LOD selection helper. |
+| `Render/Scene/CompositePass.cs` | Fullscreen triangle: scene color → backbuffer (fixed-exposure ACES placeholder). |
 | `Render/Vulkan/ShaderModule.cs`, `VkNames.cs`, `DeviceCapabilities.cs` | Helpers. |
 | `Render/Textures/DdsLoader.cs`, `TextureData.cs` | DDS → upload layout (DX10, FourCC, masks, palette; conversions to RGBA8 where Vulkan has no format). |
 | `Render/Textures/TextureCache.cs` | Name → texture; async decode, render-thread finish/upload, sRGB + GUI premultiply like stock, size/loaded queries. |
@@ -133,7 +177,7 @@ Pulsar client plugin, that:
 | `Render/Sprites/SpriteBatcher.cs`, `SpriteRenderer.cs`, `SpriteInstance.cs` | CPU batching (stock geometry rules) and GPU drawing (instances by device address, bindless textures). |
 | `Render/Sprites/RenderFont.cs` | Port of stock `MyRenderFont` text layout on the game's `MyFont`. |
 | `Render/Shaders/ShaderBytecode.g.cs` | Generated SPIR-V. Do not edit. |
-| `Shaders/` | Slang sources: `Common/Bindless.slang` (must match `BindlessDescriptors`), `Common/Color.slang`, `Sprites/Sprite.slang`, `Post/Composite.slang`; `shaders.json` manifest. |
+| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Post/Composite.slang`, `Scene/Model.slang`, `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Scene/Skinning.slang` (compute); `shaders.json` manifest. |
 | `Tools/ShaderCompiler`, `Tools/VulkanSmokeTest` | Dev tools (not in `<SourceDirectories>`, never shipped). |
 
 ## Architecture
@@ -163,14 +207,16 @@ Pulsar client plugin, that:
 3. `messages.Process(frameStarted)` — **after** the fence wait, because uploads issued while processing (e.g.
    `WaitTillLoaded` textures) write into this slot's staging ring. Without a frame, only state changes run.
 4. `TextureCache.ProcessDecoded()` → `UploadQueue.Record(cmd)` → `GuiRenderer.RecordOffscreen` (LCD/generated
-   targets) → `RecordScene` (only if a `DrawScene` message arrived this frame: HDR + depth pass, geometry goes here)
-   → `RecordFrame` (backbuffer: clear, composite scene if drawn, GUI) → `FrameLoop.EndFrame()`.
+   targets) → `RecordScene` (only if a `DrawScene` message arrived this frame: build frame constants, skybox
+   background, then opaque geometry into the HDR + depth pass) → `RecordFrame` (backbuffer: clear, composite scene
+   if drawn, GUI) → `FrameLoop.EndFrame()`.
 5. `Present()` → `FrameLoop.Present()` (+ frame capture completion).
 
 ### Invariants (easy to break)
 - Bindless texture slots are written **once** (when the texture is ready) and freed only via deferred release:
   descriptors use `UPDATE_AFTER_BIND | PARTIALLY_BOUND | UPDATE_UNUSED_WHILE_PENDING`; never overwrite a slot a frame
-  in flight may read. Textures still loading sample the Transparent slot; failed ones Missing.
+  in flight may read. Textures still loading sample the Transparent slot; failed ones Missing. Cubemaps use their
+  own array (binding 2, slot 0 = black); cube slots are allocated/freed the same way.
 - Every GPU object destroyed while frames are in flight must go through `GpuContext.Release` (`Dispose` on
   `GpuBuffer`/`GpuImage` already does).
 - `UploadQueue`, `GuiRenderer` message handling and `TextureCache.Get`/`ProcessDecoded` are render-thread only.
@@ -498,21 +544,26 @@ Known gaps from Phase 0:
       `TransientAllocator`, `DrawScene` handling (scene drawn only on frames with `DrawScene`)
 - [x] World message spec written into this roadmap (see [World message spec](#world-message-spec))
 - [x] Camera, frame constants, reverse-Z infinite projection, camera-relative world matrices
-- [ ] Frustum culling, LOD selection (bounds and LOD descriptors are loaded, only LOD0 is used)
+- [x] Frustum culling, `MaxViewDistance`, LOD selection (all LODs loaded, stock distances + hysteresis)
+- [x] Back-face culling matching D3D (clockwise front faces; `NoBackFaceCulling` uses a no-cull pipeline)
 - [x] Actors/render entities, MWM meshes, cube-grid instancing, static groups
 - [x] Materials (standard + alpha-masked) on bindless textures, stock decodes and colorize
-- [ ] Remaining materials (triplanar, glass, holo, shield) and transparency
-- [ ] Skinned characters
+- [~] Transparent models (glass, holo, shield): implemented with `MyTransparentMaterials`, premultiplied blend,
+      depth read-only, back-to-front sorting; visual verification pending
+- [ ] Triplanar materials, decals and OIT/dithering
+- [~] Skinned characters: GPU compute deformation, skeleton/transforms, visibility output; character appears and
+      animates, final pose/head verification pending
 - [ ] Voxel cells (consume game-meshed clipmap data), voxel materials; `ClipmapsReady` output
 - [ ] G-buffer **including motion vectors** (needed later for TAA/FSR/GI); forward sun lighting is done
 - [ ] Frame graph + pipeline cache
 - **Milestone:** load a world; grids, characters and planets render.
 
 ### Phase 3 — Lighting and shadows
-- [ ] PBR lighting (GGX, energy-conserving), sun + IBL
+- [~] PBR lighting (GGX, energy-conserving), sun + static skybox IBL (done); dynamic scene probe and eye
+      adaptation still open
 - [ ] Cascaded shadow maps (+ PCSS option, contact shadows), spot shadow pool
-- [ ] Clustered point/spot lights
-- [ ] Environment probe + prefiltering, SSR
+- [ ] Clustered point/spot lights (`CreateRenderLight` messages are ignored today)
+- [ ] Dynamic environment probe + prefiltering (scene capture, close/far blend), SSR
 - [ ] SSAO / GTAO
 - **Milestone:** lighting at least equal to stock.
 
@@ -578,8 +629,11 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
 ## Risks and open questions
 
 - **LinuxCompat coupling** — we depend on its SDL3 window (`MyWindowsWindows.WindowHandle` = `SDL_Window*`,
-  `ClientPlugin.Patches.PlatformGuards.SdlInput2Provider.Instance.OnModeChanged`). Changes there can break us;
-  detection is defensive and falls back to D3D11.
+  `ClientPlugin.Patches.PlatformGuards.SdlInput2Provider.Instance.OnModeChanged`, and by reflection
+  `ClientPlugin.Compatibility.SdlRenderThread.Dispatch` to run SDL calls on its video thread). Changes there can
+  break us; detection is defensive and falls back to D3D11. Windowed mode cannot be moved on Wayland (the
+  compositor owns placement); only the fullscreen display selection is under our control. Exclusive `Fullscreen`
+  still lets LinuxCompat pick the mode from the window's current display; the tested mode is `FullscreenWindow`.
 - **Ray tracing on voxels** — voxel cells change constantly; BLAS rebuild budget needs design.
 - **Video playback** — stock uses DirectShow; needs a cross-platform decoder.
 - **Mods** — mod models/textures/LCD scripts must keep working through the same message boundary.
@@ -628,3 +682,60 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   with Phase 3. Added an explicit ambient floor (game probe `AmbientMinClamp` 0.02) and a placeholder ACES tonemap
   with fixed exposure 0.03 in `CompositePass`; verified by capture (cockpit details and yellow accents read
   correctly, HUD unaffected, log clean). Next: culling/LOD, then G-buffer/motion vectors.
+- **2026-10-17** — Fixed monitor selection. The game's `VideoAdapter` (adapter+output index) was only forwarded on
+  window-mode changes and LinuxCompat's SDL mode change always used the window's current display, so fullscreen
+  opened on the active monitor. `VulkanRender` now forwards adapter changes too; `SdlWindowBridge` finds the SDL
+  display matching `MyAdapterInfo.DesktopBounds`/`OutputName` and sets `SDL_WINDOWPOS_CENTERED_DISPLAY` on
+  LinuxCompat's SDL thread before the mode change, which makes SDL's pending fullscreen output the selected
+  monitor (Wayland refuses to move toplevel windows, but records the pending display). Diagnostic `[Vulkan]`
+  lines added. User verified across restarts: the game now remembers and loads only on the selected monitor.
+- **2026-10-17** — World correctness pass. `MwmLoader` reads the `LODs` descriptors and resolves them through
+  `MyFileSystem` (raw `File.Exists` is case-sensitive on Linux; LOD files were being dropped), `ModelCache` loads
+  every LOD into its own GPU buffers, and `ModelPass` selects LODs with the stock `distance/scale *
+  LODCoefficient + Add` formula and 10% hysteresis (`MyLodStrategyInfo`). Added infinite-far-plane frustum culling
+  (five planes from the stock unflipped view-projection), `MaxViewDistance` culling, `SetInstanceBuffer.LocalAabb`
+  as the culling bounds for grids, and a 5-second log summary with draw/cull counts and a LOD histogram. Fixed the
+  back-face winding: D3D's default front face is clockwise, and the Y-flipped projection preserves that in final
+  screen space, so the model pipelines now use `FrontFace.Clockwise` with back culling; the wrong setting had been
+  drawing back faces (holes and dark inverted normals). Also made asset path normalization platform-aware
+  (`Path.DirectorySeparatorChar`) instead of assuming `/`. Verified in game: 2-4 LOD models load with no warnings,
+  solid blocks, view-dependent culling, clean log. Remaining darkness on unlit faces is the missing IBL/probe.
+  During the flight the LOD histogram moved through LOD0..LOD3, confirming LOD switching. A later "everything
+  vanished" report was the game's trash collector deleting the unowned grids after the player left
+  (`Trash collector removed grid ...` in the game log, physics included), not a renderer fault; the renderer
+  removed the actors and instance buffers only after the game's `RemoveRenderObject` messages. Next: G-buffer +
+  motion vectors.
+- **2026-10-17** — Static IBL and skybox background. Added a cube bindless array (set 0 binding 2, black default
+  cube, slot allocation/free), `TextureKind.Skybox`/`Data`, cubemap loading with mips, `Shaders/Common/Environment.slang`
+  (shared `FrameConstants`, stock `ApplySkyboxOrientation`, skybox/IBL lookups), `Scene/Skybox.slang` +
+  `SkyboxPass` (depth-less background inside the HDR pass), and replaced the model shader's placeholder ambient
+  with split-sum IBL: diffuse irradiance from `BackgroundCubeIndirect.dds` (last mip), roughness-mip sky
+  reflections with the `ambient_brdf.dds` LUT, and the game's 0.02 probe floor as a minimum. The indirect cubemap is
+  resolved next to the game's skybox name (`*Indirect.dds`) with the direct skybox as a fallback. Diagnostics:
+  environment texture states and slots are logged when they change. Verified in game: IBL 10 mips + BRDF ready
+  within 0.3 s; stars/nebula background and cockpit reflections visible; build clean. Known remaining gaps: glass/
+  holo/shield transparency, dynamic lights, dynamic scene probe, eye adaptation. Next: transparency, lights.
+- **2026-10-17** — Transparent models (glass/holo/shield). `ModelCache` resolves the MWM part's material through
+  the game's `VRageRender.MyTransparentMaterials` (with the `GlassCCW` fallback) and loads the material texture and
+  gloss texture. Added `Shaders/Scene/Transparent.slang` (stock glass formula: premultiplied material color,
+  texture/gloss, color add, light/ambient factors incl. the x4 glass ambient, IBL reflection + fresnel/reflectivity)
+  plus transparent pipelines (premultiplied alpha, depth test read-only, no depth write, front-face clockwise,
+  back/no-cull per `TriangleFaceCulling`). `ModelPass` collects transparent parts after the opaque pass and sorts
+  them back-to-front by camera-relative distance. Builds clean. In-game log confirms the cockpit glass parts
+  resolve and draw (`GlassInside -> GlassInside`, `CockpitGlassOutside -> CockpitGlassOutside`, draw count 35 -> 45,
+  no missing-material warnings); **user visual confirmation of the glass itself is still pending** (the capture angle
+  makes it hard to judge). Next: verify glass from inside/outside, then dynamic lights.
+- **2026-10-17** — GPU skinning, visibility output, cockpit texture changes, automatic tests. Fixed the character
+  staying at spawn: the game parents characters to manual cull objects and only updates the parent, so
+  `CreateManualCullObject`/`SetParentCullObject` are now handled with a draw-time world-matrix hierarchy. Added
+  per-material visibility flags (head materials hidden in first person without hiding the whole actor) and
+  `ChangeMaterialTexture` (with generated/offscreen texture lookup) so cockpit/LCD screen materials can swap to
+  their render targets. Implemented **GPU skinning**: ModelCache stores a 64-byte skinned vertex stream, ModelPass
+  runs a compute pre-pass with a per-actor bone palette (bind-inverse × absolute; 81 matrices) writing the normal
+  32-byte static layout, and the existing forward pass draws it. The missing link was visibility output: the game
+  calls `Render.Draw()` only for IDs in `MyRenderProxy.VisibleObjectsWrite`, so visible actors with
+  `SetVisibilityUpdates` are now published; transforms then arrive. Fixed the compute position transform to add
+  the bone translations from row 3 (XNA row-vector). Auto-load for tests: `VULKAN_AUTOLOAD=<seconds>` presses
+  Continue Game via a Harmony postfix. Verified: auto-load + frame capture fully automatic; character appears and
+  animates in third person; build and shaders clean. Remaining: final pose/head verification, cockpit screen
+  verification, dynamic probe/lights, G-buffer.

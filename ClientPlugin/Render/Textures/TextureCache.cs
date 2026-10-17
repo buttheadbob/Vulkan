@@ -8,6 +8,7 @@ using Vortice.Vulkan;
 using VRage.FileSystem;
 using VRage.Render.Image;
 using VRageMath;
+using VRageRender;
 using VRageRender.Messages;
 
 namespace ClientPlugin.Render.Textures;
@@ -33,6 +34,8 @@ internal sealed class TextureCache : IDisposable
         NormalGloss,
         Extensions,
         Alphamask,
+        Skybox, // sRGB cubemap
+        Data,   // linear data texture (e.g. the ambient BRDF LUT)
     }
 
     public sealed class Entry
@@ -42,6 +45,8 @@ internal sealed class TextureCache : IDisposable
         public readonly TextureKind Kind;
         public volatile State Status = State.Loading;
         public uint Slot;
+        public uint CubeSlot;
+        public bool IsCube;
         public GpuImage Image;
         public Vector2I Size;
         public TextureData Pending;
@@ -74,6 +79,13 @@ internal sealed class TextureCache : IDisposable
     public Entry Get(string name, bool waitTillLoaded, TextureKind kind = TextureKind.Gui)
     {
         if (string.IsNullOrEmpty(name))
+            return null;
+
+        // Model materials can be swapped to a generated offscreen texture (cockpit/LCD screens).
+        // Those live in the plain-name entries created by CreateGenerated.
+        if (entries.TryGetValue(name, out var generated) && generated.IsGenerated)
+            return generated;
+        if (MyRenderProxy.IsValidGeneratedTextureName(name))
             return null;
 
         var key = kind == TextureKind.Gui ? name : $"{(int)kind}:{name}";
@@ -109,6 +121,13 @@ internal sealed class TextureCache : IDisposable
             _ => (uint)BindlessDescriptors.TextureSlot.Transparent,
         };
     }
+
+    // Cubemap slot to sample; 0 is the fixed black cube (also used while loading or on failure)
+    public static uint CubeSlotOf(Entry entry) =>
+        entry is { Status: State.Ready, IsCube: true } ? entry.CubeSlot : 0;
+
+    public static uint MipLevelsOf(Entry entry) =>
+        entry is { Status: State.Ready, IsCube: true } ? entry.Image.MipLevels : 1;
 
     // Render thread, once per frame before rendering: creates and uploads the textures decoded since the last frame
     public void ProcessDecoded()
@@ -241,7 +260,13 @@ internal sealed class TextureCache : IDisposable
         entry.Image?.Dispose();
         entry.Image = null;
         if (entry.Status == State.Ready)
-            context.Bindless.FreeTextureSlot(entry.Slot);
+        {
+            if (entry.IsCube)
+                context.Bindless.FreeCubeSlot(entry.CubeSlot);
+            else
+                context.Bindless.FreeTextureSlot(entry.Slot);
+        }
+
         entry.Status = State.Failed;
     }
 
@@ -291,11 +316,19 @@ internal sealed class TextureCache : IDisposable
                 VkImageUsageFlags.Sampled | VkImageUsageFlags.TransferDst, data.IsCube);
             context.Uploads.UploadImage(image, data.Data, data.Regions);
 
-            var slot = context.Bindless.AllocateTextureSlot();
-            context.Bindless.WriteTexture(slot, image.View);
-
             entry.Image = image;
-            entry.Slot = slot;
+            entry.IsCube = data.IsCube;
+            if (data.IsCube)
+            {
+                entry.CubeSlot = context.Bindless.AllocateCubeSlot();
+                context.Bindless.WriteCube(entry.CubeSlot, image.View);
+            }
+            else
+            {
+                entry.Slot = context.Bindless.AllocateTextureSlot();
+                context.Bindless.WriteTexture(entry.Slot, image.View);
+            }
+
             entry.Status = State.Ready;
         }
     }
@@ -317,6 +350,15 @@ internal sealed class TextureCache : IDisposable
             case TextureKind.Extensions:
                 // Stock MyGlobalResources: ColorMetal and Extension textures are BC7/BC3 sRGB
                 data.Format = DdsLoader.MakeSrgb(data.Format);
+                break;
+
+            case TextureKind.Skybox:
+                // BackgroundCube and BackgroundCubeIndirect are BC7 sRGB cubemaps
+                data.Format = DdsLoader.MakeSrgb(data.Format);
+                break;
+
+            case TextureKind.Data:
+                // Linear data (ambient BRDF LUT)
                 break;
 
             // NormalGloss and Alphamask are linear (MyGlobalResources: BC7_UNorm, R8_UNorm)
@@ -404,7 +446,11 @@ internal sealed class TextureCache : IDisposable
         foreach (var entry in entries.Values)
         {
             entry.Image?.Dispose();
-            if (entry.Status == State.Ready)
+            if (entry.Status != State.Ready)
+                continue;
+            if (entry.IsCube)
+                context.Bindless.FreeCubeSlot(entry.CubeSlot);
+            else
                 context.Bindless.FreeTextureSlot(entry.Slot);
         }
 

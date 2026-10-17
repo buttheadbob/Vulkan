@@ -17,6 +17,14 @@ internal sealed class MwmMeshData
     public BoundingBox Bounds;
     public bool HasTangents;
     public bool Skinned;
+
+    // Skinning streams (model bone space, stock layout)
+    public Vector4I[] BoneIndices;
+    public Vector4[] BoneWeights;
+
+    // LOD1..N model files and the switching distances from the parent file's LODs tag
+    public string[] LodModels;
+    public float[] LodDistances;
 }
 
 internal sealed class MwmPartData
@@ -29,4 +37,7 @@ internal sealed class MwmPartData
     public string NormalGloss;
     public string Extensions;
     public string Alphamask;
+
+    // Glass materials can carry a separate CCW material name (MyMaterialDescriptor.GlassCCW)
+    public string GlassCCW;
 }

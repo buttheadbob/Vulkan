@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using ClientPlugin.Render.Models;
 using ClientPlugin.Render.Platform;
@@ -10,6 +11,7 @@ using ClientPlugin.Render.Vulkan;
 using ClientPlugin.Settings;
 using Vortice.Vulkan;
 using VRage;
+using VRage.FileSystem;
 using VRage.Library.Utils;
 using VRage.Profiler;
 using VRage.Utils;
@@ -40,8 +42,11 @@ public sealed class VulkanRender : IMyRender
     private GuiRenderer gui;
     private FrameCapture capture;
     private SceneTargets sceneTargets;
+    private SkyboxPass skyboxPass;
     private CompositePass composite;
     private VkFormat compositeFormat;
+    private string environmentStatus = "";
+    private bool reportedCharacterTransforms;
     private ModelCache models;
     private InstanceBuffers instanceBuffers;
     private ModelPass modelPass;
@@ -52,6 +57,8 @@ public sealed class VulkanRender : IMyRender
     private bool hasEnvironment;
     private int sceneFrameCounter;
     private int lastDrawnActors;
+    private int lastCulledActors;
+    private MyNewLoddingSettings loddingSettings = new();
     private readonly HashSet<MyRenderMessageEnum> reported = new();
 
     // Set by the DrawScene message of the frame being drawn (MyRender11.m_drawScene): without it only the GUI is shown
@@ -60,6 +67,7 @@ public sealed class VulkanRender : IMyRender
     private MyAdapterInfo[] adapters = [];
     private MyRenderDeviceSettings settings = new() { AdapterOrdinal = -1 };
     private MyWindowModeEnum? lastForwardedWindowMode;
+    private int lastForwardedAdapter = -1;
     private MyRenderSettings renderSettings;
     private MyRenderDebugOverrides debugOverrides = new();
 
@@ -132,10 +140,11 @@ public sealed class VulkanRender : IMyRender
             textures = new TextureCache(gpu);
             models = new ModelCache(gpu, textures);
             instanceBuffers = new InstanceBuffers(gpu);
-            modelPass = new ModelPass(gpu, models, instanceBuffers);
+            modelPass = new ModelPass(gpu, models, instanceBuffers, textures);
             gui = new GuiRenderer(gpu, textures, () => messages.FrameId);
             capture = FrameCapture.FromEnvironment(gpu);
             sceneTargets = new SceneTargets(gpu);
+            skyboxPass = new SkyboxPass(gpu);
 
             settings = requested;
             ForwardWindowMode(force: true);
@@ -181,6 +190,9 @@ public sealed class VulkanRender : IMyRender
 
         composite?.Dispose();
         composite = null;
+
+        skyboxPass?.Dispose();
+        skyboxPass = null;
 
         sceneTargets?.Dispose();
         sceneTargets = null;
@@ -242,15 +254,20 @@ public sealed class VulkanRender : IMyRender
     // HiDPI resize feedback loop, so only window mode transitions are forwarded.
     private void ForwardWindowMode(bool force)
     {
-        if (!force && lastForwardedWindowMode == settings.WindowMode)
+        // The adapter is the game's monitor/output choice: changing it must retarget the window
+        // even when the window mode and resolution stay the same.
+        if (!force && lastForwardedWindowMode == settings.WindowMode && lastForwardedAdapter == settings.AdapterOrdinal)
             return;
 
         if (settings.AdapterOrdinal < 0 || settings.AdapterOrdinal >= adapters.Length)
             return;
 
         lastForwardedWindowMode = settings.WindowMode;
+        lastForwardedAdapter = settings.AdapterOrdinal;
         try
         {
+            RenderLog.Info($"Forwarding window mode {settings.WindowMode} on adapter {settings.AdapterOrdinal}: " +
+                           $"{adapters[settings.AdapterOrdinal].Name}, desktop {adapters[settings.AdapterOrdinal].DesktopBounds}");
             window.OnModeChanged(settings, adapters[settings.AdapterOrdinal]);
         }
         catch (Exception e)
@@ -355,20 +372,103 @@ public sealed class VulkanRender : IMyRender
             pDepthAttachment = &depthAttachment,
         };
 
+        lastCulledActors = 0;
+        lastDrawnActors = 0;
+        var sceneReady = camera.HasValue && hasEnvironment;
+        var frameConstants = 0ul;
+        if (sceneReady)
+        {
+            frameConstants = PrepareFrameConstants(environment);
+            // Compute skinning must run outside the dynamic rendering pass
+            modelPass.RecordSkinning(commands, camera, loddingSettings, actors);
+        }
+
         api.vkCmdBeginRendering(commands, &renderingInfo);
-        lastDrawnActors = camera.HasValue && hasEnvironment
-            ? modelPass.Record(commands, sceneTargets, camera, environment, actors)
-            : 0;
+        if (sceneReady)
+        {
+            skyboxPass.Record(commands, sceneTargets, frameConstants);
+            lastDrawnActors = modelPass.Record(commands, sceneTargets, camera, loddingSettings, actors,
+                frameConstants, out lastCulledActors);
+        }
+
         api.vkCmdEndRendering(commands);
 
         if (++sceneFrameCounter % 300 == 0)
-            RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced), {lastDrawnActors} draws, " +
+        {
+            Span<int> lods = stackalloc int[8];
+            var skinned = 0;
+            foreach (var actor in actors.All)
+            {
+                lods[Math.Min(actor.Lod, lods.Length - 1)]++;
+                if (actor.SkinnedVertexAddress != 0)
+                    skinned++;
+            }
+
+            RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced, {skinned} skinned), " +
+                           $"{lastDrawnActors} draws, {lastCulledActors} culled, " +
+                           $"LOD histogram [{string.Join(",", lods.ToArray())}], " +
                            $"instance buffers {instanceBuffers.Count} ({instanceBuffers.TotalInstances} instances), " +
                            $"camera {camera.HasValue}, environment {hasEnvironment}");
+        }
 
         frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
             VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal,
             VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
+    }
+
+    // Resolves the environment cubemaps and writes this frame's constants. The indirect (prefiltered)
+    // skybox is the IBL source; until it is ready the direct skybox's mips are used as a fallback.
+    private ulong PrepareFrameConstants(MyEnvironmentData environment)
+    {
+        var skyboxName = string.IsNullOrEmpty(environment.Skybox) ? null : NormalizeAssetPath(environment.Skybox);
+        var skyboxEntry = skyboxName != null
+            ? textures.Get(skyboxName, waitTillLoaded: false, TextureCache.TextureKind.Skybox)
+            : null;
+
+        TextureCache.Entry iblEntry = null;
+        if (skyboxName != null)
+        {
+            var indirectName = Path.Combine(MyFileSystem.ContentPath, IndirectSkyboxPath(skyboxName));
+            if (MyFileSystem.FileExists(indirectName))
+                iblEntry = textures.Get(indirectName, waitTillLoaded: false, TextureCache.TextureKind.Skybox);
+            if (iblEntry is not { Status: TextureCache.State.Ready })
+                iblEntry = skyboxEntry;
+        }
+
+        var brdf = textures.Get("Textures/Miscellaneous/ambient_brdf.dds", waitTillLoaded: false,
+            TextureCache.TextureKind.Data);
+
+        var skyboxSlot = TextureCache.CubeSlotOf(skyboxEntry);
+        var iblSlot = TextureCache.CubeSlotOf(iblEntry);
+        var iblMips = TextureCache.MipLevelsOf(iblEntry);
+        var brdfSlot = TextureCache.SlotOf(brdf);
+
+        var status = $"skybox {skyboxEntry?.Status.ToString() ?? "none"} (slot {skyboxSlot}), " +
+                     $"IBL {iblEntry?.Status.ToString() ?? "none"} (slot {iblSlot}, {iblMips} mips), " +
+                     $"BRDF {brdf?.Status.ToString() ?? "none"} (slot {brdfSlot})";
+        if (status != environmentStatus)
+        {
+            environmentStatus = status;
+            RenderLog.Info($"Environment textures: {status}");
+        }
+
+        var allocation = gpu.Transient.Allocate<FrameConstants>();
+        allocation.As<FrameConstants>() = camera.BuildFrameConstants(environment,
+            skyboxSlot, iblSlot, brdfSlot, iblMips);
+
+        return allocation.Address;
+    }
+
+    private static string NormalizeAssetPath(string path) =>
+        path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+
+    // MyRender11: the prefiltered companion of BackgroundCube.dds is BackgroundCubeIndirect.dds
+    private static string IndirectSkyboxPath(string skybox)
+    {
+        var path = NormalizeAssetPath(skybox);
+        var directory = Path.GetDirectoryName(path);
+        var name = Path.GetFileNameWithoutExtension(path) + "Indirect" + Path.GetExtension(path);
+        return string.IsNullOrEmpty(directory) ? name : Path.Combine(directory, name);
     }
 
     private unsafe void RecordFrame(VkCommandBuffer commands)
@@ -488,6 +588,10 @@ public sealed class VulkanRender : IMyRender
                 renderSettings = ((MyRenderMessageSwitchRenderSettings)message).Settings;
                 break;
 
+            case MyRenderMessageEnum.UpdateNewLoddingSettings:
+                loddingSettings = ((MyRenderMessageUpdateNewLoddingSettings)message).Settings;
+                break;
+
             case MyRenderMessageEnum.UpdateDebugOverrides:
                 debugOverrides = ((MyRenderMessageUpdateDebugOverrides)message).Overrides;
                 break;
@@ -534,6 +638,30 @@ public sealed class VulkanRender : IMyRender
                 break;
             }
 
+            case MyRenderMessageEnum.SetVisibilityUpdates:
+            {
+                var m = (MyRenderMessageSetVisibilityUpdates)message;
+                actors.SetVisibilityUpdates(m.ID, m.State);
+                break;
+            }
+
+            case MyRenderMessageEnum.SetCharacterSkeleton:
+                actors.SetCharacterSkeleton((MyRenderMessageSetCharacterSkeleton)message);
+                break;
+
+            case MyRenderMessageEnum.SetCharacterTransforms:
+            {
+                var m = (MyRenderMessageSetCharacterTransforms)message;
+                if (!reportedCharacterTransforms)
+                {
+                    reportedCharacterTransforms = true;
+                    RenderLog.Info($"First SetCharacterTransforms: id {m.CharacterID}, " +
+                                   $"{m.BoneAbsoluteTransforms?.Length ?? 0} transforms");
+                }
+                actors.SetCharacterTransforms(m);
+                break;
+            }
+
             case MyRenderMessageEnum.CreateStaticGroup:
             {
                 var m = (MyRenderMessageCreateStaticGroup)message;
@@ -541,6 +669,14 @@ public sealed class VulkanRender : IMyRender
                 models?.StartLoading(m.Model);
                 break;
             }
+
+            case MyRenderMessageEnum.CreateManualCullObject:
+                actors.CreateManualCullObject((MyRenderMessageCreateManualCullObject)message);
+                break;
+
+            case MyRenderMessageEnum.SetParentCullObject:
+                actors.SetParentCullObject((MyRenderMessageSetParentCullObject)message);
+                break;
 
             case MyRenderMessageEnum.UpdateRenderObject:
                 actors.Update((MyRenderMessageUpdateRenderObject)message);
@@ -559,6 +695,10 @@ public sealed class VulkanRender : IMyRender
 
             case MyRenderMessageEnum.UpdateModelProperties:
                 actors.SetModelProperties((MyRenderMessageUpdateModelProperties)message);
+                break;
+
+            case MyRenderMessageEnum.ChangeMaterialTexture:
+                actors.ChangeMaterialTexture((MyRenderMessageChangeMaterialTexture)message);
                 break;
 
             case MyRenderMessageEnum.UpdateColorEmissivity:
@@ -590,8 +730,6 @@ public sealed class VulkanRender : IMyRender
                 break;
 
             // Not implemented yet; report each kind once so the log shows what a world still needs.
-            case MyRenderMessageEnum.CreateManualCullObject:
-            case MyRenderMessageEnum.SetParentCullObject:
             case MyRenderMessageEnum.VoxelCreate:
             case MyRenderMessageEnum.CreateRenderVoxelMaterials:
             case MyRenderMessageEnum.UpdateRenderVoxelMaterials:

@@ -4,6 +4,7 @@ module Bindless;
 
 [[vk::binding(0, 0)]] public Texture2D textures[];
 [[vk::binding(1, 0)]] public SamplerState samplers[];
+[[vk::binding(2, 0)]] public TextureCube cubeTextures[];
 
 // Fixed sampler slots, see BindlessDescriptors.SamplerSlot
 public enum SamplerSlot : uint
@@ -26,4 +27,9 @@ public enum TextureSlot : uint
 public float4 sampleTexture(uint texture, SamplerSlot sampler, float2 uv)
 {
     return textures[NonUniformResourceIndex(texture)].Sample(samplers[uint(sampler)], uv);
+}
+
+public float4 sampleCube(uint texture, SamplerSlot sampler, float3 direction, float level)
+{
+    return cubeTextures[NonUniformResourceIndex(texture)].SampleLevel(samplers[uint(sampler)], direction, level);
 }

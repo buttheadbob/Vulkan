@@ -31,13 +31,18 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
     }
 
     private const uint FixedTextureSlots = 4;
+    private const uint MaxCubes = 16;
+    private const uint FixedCubeSlots = 1; // slot 0: 1x1 black cube
 
     private readonly GpuContext context;
     private readonly VkSampler[] samplers = new VkSampler[4];
     private readonly GpuImage[] defaultTextures = new GpuImage[FixedTextureSlots];
     private readonly Stack<uint> freeSlots = new();
+    private readonly Stack<uint> freeCubeSlots = new();
     private readonly object sync = new();
     private uint nextSlot = FixedTextureSlots;
+    private uint nextCubeSlot = FixedCubeSlots;
+    private GpuImage defaultCube;
 
     public uint MaxTextures { get; }
     public VkDescriptorSetLayout SetLayout { get; private set; }
@@ -97,7 +102,7 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
 
         fixed (VkSampler* immutableSamplers = samplers)
         {
-            var bindings = stackalloc VkDescriptorSetLayoutBinding[2];
+            var bindings = stackalloc VkDescriptorSetLayoutBinding[3];
             bindings[0] = new VkDescriptorSetLayoutBinding
             {
                 binding = 0,
@@ -113,23 +118,31 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
                 stageFlags = VkShaderStageFlags.All,
                 pImmutableSamplers = immutableSamplers,
             };
+            bindings[2] = new VkDescriptorSetLayoutBinding
+            {
+                binding = 2,
+                descriptorType = VkDescriptorType.SampledImage,
+                descriptorCount = MaxCubes,
+                stageFlags = VkShaderStageFlags.All,
+            };
 
-            var bindingFlags = stackalloc VkDescriptorBindingFlags[2];
+            var bindingFlags = stackalloc VkDescriptorBindingFlags[3];
             bindingFlags[0] = VkDescriptorBindingFlags.PartiallyBound
                               | VkDescriptorBindingFlags.UpdateAfterBind
                               | VkDescriptorBindingFlags.UpdateUnusedWhilePending;
             bindingFlags[1] = VkDescriptorBindingFlags.None;
+            bindingFlags[2] = bindingFlags[0];
 
             var flagsInfo = new VkDescriptorSetLayoutBindingFlagsCreateInfo
             {
-                bindingCount = 2,
+                bindingCount = 3,
                 pBindingFlags = bindingFlags,
             };
             var layoutInfo = new VkDescriptorSetLayoutCreateInfo
             {
                 pNext = &flagsInfo,
                 flags = VkDescriptorSetLayoutCreateFlags.UpdateAfterBindPool,
-                bindingCount = 2,
+                bindingCount = 3,
                 pBindings = bindings,
             };
 
@@ -163,7 +176,7 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
         var api = context.Device.Api;
 
         var poolSizes = stackalloc VkDescriptorPoolSize[2];
-        poolSizes[0] = new VkDescriptorPoolSize { type = VkDescriptorType.SampledImage, descriptorCount = MaxTextures };
+        poolSizes[0] = new VkDescriptorPoolSize { type = VkDescriptorType.SampledImage, descriptorCount = MaxTextures + MaxCubes };
         poolSizes[1] = new VkDescriptorPoolSize { type = VkDescriptorType.Sampler, descriptorCount = (uint)samplers.Length };
 
         var poolInfo = new VkDescriptorPoolCreateInfo
@@ -198,6 +211,7 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
         Create(TextureSlot.Black, 1, [0x00, 0x00, 0x00, 0xFF]);
         Create(TextureSlot.Missing, 2, [0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF]);
         Create(TextureSlot.Transparent, 1, [0x00, 0x00, 0x00, 0x00]);
+        CreateCubeDefault();
 
         void Create(TextureSlot slot, uint size, byte[] pixels)
         {
@@ -211,6 +225,29 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
             defaultTextures[(int)slot] = image;
             WriteTexture((uint)slot, image.View);
         }
+    }
+
+    // Slot 0 is a black 1x1 cube used until a skybox or IBL cubemap is ready
+    private void CreateCubeDefault()
+    {
+        var image = GpuImage.Create2D(context, 1, 1, 1, 6, VkFormat.R8G8B8A8Srgb,
+            VkImageUsageFlags.Sampled | VkImageUsageFlags.TransferDst, isCube: true);
+
+        var pixels = new byte[6 * 4];
+        var regions = new VkBufferImageCopy[6];
+        for (var layer = 0u; layer < 6; layer++)
+        {
+            pixels[layer * 4 + 3] = 0xFF;
+            regions[layer] = new VkBufferImageCopy
+            {
+                imageSubresource = new VkImageSubresourceLayers(VkImageAspectFlags.Color, 0, layer, 1),
+                imageExtent = new VkExtent3D(1, 1, 1),
+            };
+        }
+
+        context.Uploads.UploadImage(image, pixels, regions);
+        defaultCube = image;
+        WriteCube(0, image.View);
     }
 
     // Reserves a slot for a texture. Write it with WriteTexture once the image is ready.
@@ -260,6 +297,52 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
         context.Device.Api.vkUpdateDescriptorSets(1, &write, 0, null);
     }
 
+    // Cubemaps have their own array (binding 2). Slot 0 is the fixed black cube.
+    public uint AllocateCubeSlot()
+    {
+        lock (sync)
+        {
+            if (freeCubeSlots.Count != 0)
+                return freeCubeSlots.Pop();
+
+            if (nextCubeSlot >= MaxCubes)
+                throw new InvalidOperationException($"Out of bindless cube slots ({MaxCubes})");
+
+            return nextCubeSlot++;
+        }
+    }
+
+    public void FreeCubeSlot(uint slot)
+    {
+        if (slot < FixedCubeSlots)
+            return;
+
+        context.Release(() =>
+        {
+            lock (sync)
+                freeCubeSlots.Push(slot);
+        });
+    }
+
+    public void WriteCube(uint slot, VkImageView view)
+    {
+        var imageInfo = new VkDescriptorImageInfo
+        {
+            imageView = view,
+            imageLayout = VkImageLayout.ShaderReadOnlyOptimal,
+        };
+        var write = new VkWriteDescriptorSet
+        {
+            dstSet = Set,
+            dstBinding = 2,
+            dstArrayElement = slot,
+            descriptorCount = 1,
+            descriptorType = VkDescriptorType.SampledImage,
+            pImageInfo = &imageInfo,
+        };
+        context.Device.Api.vkUpdateDescriptorSets(1, &write, 0, null);
+    }
+
     public void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint)
     {
         var set = Set;
@@ -271,6 +354,7 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
         var api = context.Device.Api;
         foreach (var texture in defaultTextures)
             texture?.Dispose();
+        defaultCube?.Dispose();
 
         api.vkDestroyPipelineLayout(PipelineLayout, null);
         api.vkDestroyDescriptorPool(Pool, null);

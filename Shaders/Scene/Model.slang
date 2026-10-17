@@ -4,17 +4,7 @@
 
 import Common.Bindless;
 import Common.Color;
-
-struct FrameConstants
-{
-    float4 viewProj0;
-    float4 viewProj1;
-    float4 viewProj2;
-    float4 viewProj3;
-    float4 sunDirection;    // xyz: direction from the sun, w: diffuse factor
-    float4 sunColor;        // rgb: linear, w: specular factor
-    float4 ambientColor;    // rgb: linear, w: ambient factor
-};
+import Common.Environment;
 
 // Must match ClientPlugin/Render/Scene/ModelPass.cs (std430, 48 bytes)
 struct DrawMaterial
@@ -302,6 +292,26 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 diffuse = baseColor * (1.0 - metalness) * (nol / PI);
     float3 direct = (diffuse + fresnel * specular * nol) * sunColor;
 
+    // Image-based ambient: diffuse irradiance (last prefiltered mip) and rough sky reflections.
+    // Until the indirect cubemap is ready, fall back to the small neutral ambient floor.
     float3 ambient = baseColor * push.frame.ambientColor.rgb * push.frame.ambientColor.w * ao;
-    return float4(direct + ambient + baseColor * emissive, 1.0);
+    float3 ambientSpecular = 0;
+    if (push.frame.iblCube != 0)
+    {
+        float maxIblMip = max(push.frame.skyboxParams.y - 1.0, 0.0);
+
+        float3 irradiance = iblColor(*push.frame, n, maxIblMip);
+
+        // The game's probe clamps resolved ambient to a minimum; the skybox alone can be nearly black
+        irradiance = max(irradiance, push.frame.ambientColor.rgb * push.frame.ambientColor.w);
+        ambient = baseColor * irradiance * push.frame.skyboxParams.z * ao;
+
+        float3 reflection = reflect(-toCamera, n);
+        float3 prefiltered = iblColor(*push.frame, reflection, (1.0 - gloss) * maxIblMip);
+        float2 brdf = sampleTexture(push.frame.brdfLut, SamplerSlot.LinearClamp,
+                                    float2(gloss, nov)).rg;
+        ambientSpecular = prefiltered * (f0 * brdf.x + brdf.y) * push.frame.skyboxParams.w * ao;
+    }
+
+    return float4(direct + ambient + ambientSpecular + baseColor * emissive, 1.0);
 }

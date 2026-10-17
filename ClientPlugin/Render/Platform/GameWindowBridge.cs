@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using ClientPlugin.Render;
 using Vortice.Vulkan;
 using VRage;
 using VRage.Platform.Windows.Forms;
@@ -158,6 +159,25 @@ internal sealed class SdlWindowBridge : GameWindowBridge
         if (window == null)
             return;
 
+        // LinuxCompat positions the window from the game's adapter but cannot select the output for
+        // fullscreen: the mode change only uses the window's current display. Target the SDL display
+        // that matches the selected adapter first. SDL remembers it as the pending fullscreen display
+        // even on Wayland, where moving a window is the compositor's business.
+        var handle = Handle;
+        var desktopBounds = adapter.DesktopBounds;
+        var outputName = adapter.OutputName;
+        var adapterName = adapter.Name;
+        if (!DispatchToSdlThread(() =>
+            {
+                if (Sdl3.TrySetWindowDisplay(handle, desktopBounds, outputName, out var description))
+                    RenderLog.Info($"Target monitor: {description} (adapter '{adapterName}')");
+                else
+                    RenderLog.Warning($"Cannot target monitor '{adapterName}' {desktopBounds}: {description}");
+            }))
+        {
+            RenderLog.Warning("LinuxCompat SDL thread not found, cannot target the selected monitor");
+        }
+
         var refreshRate = 0f;
         if (settings.RefreshRate != 0)
             refreshRate = adapter.GetDisplayMode(settings.BackBufferWidth, settings.BackBufferHeight, settings.RefreshRate)?.RefreshRateF ?? 0f;
@@ -166,5 +186,22 @@ internal sealed class SdlWindowBridge : GameWindowBridge
         window.GetType()
             .GetMethod("OnModeChanged", BindingFlags.Public | BindingFlags.Instance)
             ?.Invoke(window, [settings.WindowMode, settings.BackBufferWidth, settings.BackBufferHeight, adapter.DesktopBounds, refreshRate]);
+    }
+
+    // ClientPlugin.Compatibility.SdlRenderThread.Dispatch(Action): every SDL video call must run on
+    // LinuxCompat's SDL thread. Pulsar may rename the assembly, so look the type up by name.
+    private static bool DispatchToSdlThread(Action action)
+    {
+        var dispatch = AppDomain.CurrentDomain.GetAssemblies()
+            .Where(a => a != Assembly.GetExecutingAssembly())
+            .Select(a => a.GetType("ClientPlugin.Compatibility.SdlRenderThread", false))
+            .FirstOrDefault(t => t != null)
+            ?.GetMethod("Dispatch", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static, null, [typeof(Action)], null);
+
+        if (dispatch == null)
+            return false;
+
+        dispatch.Invoke(null, [action]);
+        return true;
     }
 }

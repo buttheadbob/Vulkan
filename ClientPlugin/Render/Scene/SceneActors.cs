@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using VRage.Utils;
 using VRageMath;
@@ -11,6 +12,7 @@ internal sealed class MaterialOverride
 {
     public Vector3? ColorMul;
     public float? Emissivity;
+    public RenderFlagsChange? FlagsChange;
 }
 
 // A render object created by the game (CreateRenderEntity, CreateRenderCharacter, CreateStaticGroup).
@@ -31,8 +33,15 @@ internal sealed class SceneActor
     public Vector3 ColorMul = Vector3.One;
     public float Emissivity = 1f;
     public int DepthBias;
+    public float MaxViewDistance = float.MaxValue;
+    public BoundingBox? LocalAabb;
+    public int Lod;
+    public bool VisibilityUpdates; // SetVisibilityUpdates: report this ID to the game when visible
 
     public Dictionary<string, MaterialOverride> MaterialOverrides;
+
+    // ChangeMaterialTexture: material slot -> replacement textures (cockpit/LCD screen areas)
+    public Dictionary<string, MyTextureChange> TextureChanges;
 
     // CreateStaticGroup: one model drawn once per local matrix
     public Vector3D StaticTranslation;
@@ -44,12 +53,25 @@ internal sealed class SceneActor
     public int InstanceCount;
 
     public bool HasInstances => InstanceCount > 0 && InstanceBufferId != 0;
+
+    // Manual cull object hierarchy: the game updates the root (e.g. a character's) world matrix
+    // and expects the children to follow it; the child's own matrix is relative to the parent.
+    public uint ParentId;
+    public Matrix LocalMatrix = Matrix.Identity;
+
+    // GPU skinning: skeleton description, per-frame absolute bone transforms, and the model-bone palette
+    public MySkeletonBoneDescription[] SkeletonBones;
+    public int[] SkeletonIndices;
+    public Matrix[] BoneTransforms;
+    public Matrix[] SkinPalette;
+    public ulong SkinnedVertexAddress; // this frame's compute output
 }
 
 // Actors by render object ID. The game owns lifetime; messages mutate this on the render thread only.
 internal sealed class SceneActors
 {
     private readonly Dictionary<uint, SceneActor> actors = new();
+    private readonly HashSet<uint> reportedMissingTransforms = new();
 
     public int Count => actors.Count;
 
@@ -83,6 +105,7 @@ internal sealed class SceneActors
             Visible = (message.Flags & RenderFlags.Visible) != 0,
             Near = (message.Flags & RenderFlags.Near) != 0,
             DepthBias = message.DepthBias,
+            MaxViewDistance = message.MaxViewDistance,
         };
 
         actors[message.ID] = actor;
@@ -116,7 +139,39 @@ internal sealed class SceneActors
         };
     }
 
+    public void CreateManualCullObject(MyRenderMessageCreateManualCullObject message)
+    {
+        actors[message.ID] = new SceneActor
+        {
+            Id = message.ID,
+            WorldMatrix = message.WorldMatrix,
+            Visible = true,
+        };
+    }
+
+    public void SetParentCullObject(MyRenderMessageSetParentCullObject message)
+    {
+        var child = Find(message.ID);
+        if (child == null)
+            return;
+
+        child.ParentId = message.CullObjectID;
+        child.LocalMatrix = message.ChildToParent ?? Matrix.Identity;
+    }
+
     public SceneActor Find(uint id) => actors.TryGetValue(id, out var actor) ? actor : null;
+
+    // Manual cull objects move; their children (characters, optionally grid cells) are drawn
+    // relative to them. Depth-limited against malformed/cyclic hierarchies.
+    public MatrixD GetWorldMatrix(SceneActor actor) => GetWorldMatrix(actor, 0);
+
+    private MatrixD GetWorldMatrix(SceneActor actor, int depth)
+    {
+        if (depth >= 4 || actor.ParentId == 0 || !actors.TryGetValue(actor.ParentId, out var parent))
+            return actor.WorldMatrix;
+
+        return (MatrixD)actor.LocalMatrix * GetWorldMatrix(parent, depth + 1);
+    }
 
     public void Update(MyRenderMessageUpdateRenderObject message)
     {
@@ -156,12 +211,11 @@ internal sealed class SceneActors
         if (actor == null)
             return;
 
-        if (message.FlagsChange.HasValue)
-            actor.Flags = (actor.Flags | message.FlagsChange.Value.Add) & ~message.FlagsChange.Value.Remove;
-
         var materialName = message.MaterialName.String;
         if (string.IsNullOrEmpty(materialName))
         {
+            if (message.FlagsChange.HasValue)
+                actor.Flags = (actor.Flags | message.FlagsChange.Value.Add) & ~message.FlagsChange.Value.Remove;
             if (message.DiffuseColor.HasValue)
                 actor.ColorMul = message.DiffuseColor.Value.ToVector3();
             if (message.Emissivity.HasValue)
@@ -173,6 +227,9 @@ internal sealed class SceneActors
         if (!overrides.TryGetValue(materialName, out var material))
             overrides[materialName] = material = new MaterialOverride();
 
+        // Material flags (e.g. screen areas hide/show only their own material, not the whole actor)
+        if (message.FlagsChange.HasValue)
+            material.FlagsChange = message.FlagsChange.Value;
         if (message.DiffuseColor.HasValue)
             material.ColorMul = message.DiffuseColor.Value.ToVector3();
         if (message.Emissivity.HasValue)
@@ -194,6 +251,52 @@ internal sealed class SceneActors
         material.Emissivity = message.Emissivity;
     }
 
+    public void SetVisibilityUpdates(uint id, bool state)
+    {
+        var actor = Find(id);
+        if (actor != null)
+            actor.VisibilityUpdates = state;
+    }
+
+    public void SetCharacterSkeleton(MyRenderMessageSetCharacterSkeleton message)
+    {
+        var actor = Find(message.CharacterID);
+        if (actor == null)
+            return;
+
+        actor.SkeletonBones = message.SkeletonBones == null
+            ? []
+            : (MySkeletonBoneDescription[])message.SkeletonBones.Clone();
+        actor.SkeletonIndices = message.SkeletonIndices == null
+            ? []
+            : (int[])message.SkeletonIndices.Clone();
+        actor.SkinPalette = new Matrix[actor.SkeletonIndices.Length];
+        RenderLog.Info($"Character skeleton {message.CharacterID}: {actor.SkeletonBones.Length} bones, " +
+                       $"{actor.SkeletonIndices.Length} skin indices");
+    }
+
+    public void SetCharacterTransforms(MyRenderMessageSetCharacterTransforms message)
+    {
+        var actor = Find(message.CharacterID);
+        if (actor == null)
+        {
+            if (reportedMissingTransforms.Add(message.CharacterID))
+                RenderLog.Warning($"SetCharacterTransforms: actor {message.CharacterID} not found");
+            return;
+        }
+
+        if (message.BoneAbsoluteTransforms == null)
+            return;
+
+        var source = message.BoneAbsoluteTransforms;
+        var first = actor.BoneTransforms == null || actor.BoneTransforms.Length < source.Length;
+        if (first)
+            actor.BoneTransforms = new Matrix[source.Length];
+        Array.Copy(source, actor.BoneTransforms, source.Length);
+        if (first)
+            RenderLog.Info($"Character transforms {message.CharacterID}: {source.Length} bone transforms per frame");
+    }
+
     public void SetInstanceBuffer(MyRenderMessageSetInstanceBuffer message)
     {
         var actor = Find(message.ID);
@@ -203,6 +306,44 @@ internal sealed class SceneActors
         actor.InstanceBufferId = message.InstanceBufferId;
         actor.InstanceStart = message.InstanceStart;
         actor.InstanceCount = message.InstanceCount;
+        actor.LocalAabb = message.LocalAabb;
+    }
+
+    // ChangeMaterialTexture: merge per-material texture replacements; Changes == null clears them
+    public void ChangeMaterialTexture(MyRenderMessageChangeMaterialTexture message)
+    {
+        var actor = Find(message.RenderObjectID);
+        if (actor == null)
+            return;
+
+        if (message.Changes == null)
+        {
+            actor.TextureChanges = null;
+            return;
+        }
+
+        var changes = actor.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in message.Changes)
+            changes[pair.Key.String] = pair.Value;
+    }
+
+    public static RenderFlags GetMaterialFlags(SceneActor actor, string materialName)
+    {
+        var flags = actor.Flags;
+        if (!string.IsNullOrEmpty(materialName) && actor.MaterialOverrides != null &&
+            actor.MaterialOverrides.TryGetValue(materialName, out var material) && material.FlagsChange.HasValue)
+        {
+            flags = (flags | material.FlagsChange.Value.Add) & ~material.FlagsChange.Value.Remove;
+        }
+
+        return flags;
+    }
+
+    public static bool TryGetTextureChange(SceneActor actor, string materialName, out MyTextureChange change)
+    {
+        change = default;
+        return !string.IsNullOrEmpty(materialName) && actor.TextureChanges != null &&
+               actor.TextureChanges.TryGetValue(materialName, out change);
     }
 
     public void ChangeModel(MyRenderMessageChangeModel message)
@@ -215,7 +356,15 @@ internal sealed class SceneActors
         actor.Scale = message.Scale != 0f ? message.Scale : 1f;
     }
 
-    public void Remove(uint id) => actors.Remove(id);
+    public void Remove(uint id)
+    {
+        actors.Remove(id);
+        foreach (var actor in actors.Values)
+        {
+            if (actor.ParentId == id)
+                actor.ParentId = 0;
+        }
+    }
 
     public void Clear() => actors.Clear();
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using ClientPlugin.Render;
 using VRage.FileSystem;
 using VRage.Import;
 using VRageMath;
@@ -26,6 +27,9 @@ internal static class MwmLoader
         return LoadFile(path, 0);
     }
 
+    // Loads one file without following its LOD descriptors (ModelCache loads those explicitly)
+    public static MwmMeshData LoadPath(string absolutePath) => LoadFile(absolutePath, 0);
+
     private static MwmMeshData LoadFile(string path, int depth)
     {
         if (depth > 4)
@@ -36,9 +40,21 @@ internal static class MwmLoader
         var tags = importer.GetTagData();
         try
         {
+            // The LOD descriptors belong to this file, even when it is a stub whose geometry lives elsewhere
+            var lodInfo = ReadLods(tags, path);
+
             // Stub models reference the file that holds the actual geometry
             if (tags.TryGetValue("GeometryDataAsset", out var geometry))
-                return LoadFile(ResolveModelFile((string)geometry), depth + 1);
+            {
+                var stub = LoadFile(ResolveModelFile((string)geometry), depth + 1);
+                if (lodInfo.HasValue)
+                {
+                    stub.LodModels = lodInfo.Value.Models;
+                    stub.LodDistances = lodInfo.Value.Distances;
+                }
+
+                return stub;
+            }
 
             if (!tags.TryGetValue("Vertices", out var verticesTag))
                 throw new InvalidDataException("No Vertices tag");
@@ -61,6 +77,8 @@ internal static class MwmLoader
                 // MyMwmData.IsSkinnedProperly; note that MESH parts of such a model still render statically
                 Skinned = count != 0 && boneIndices.Length == count && boneWeights.Length == count,
                 Bounds = tags.TryGetValue("BoundingBox", out var bounds) ? (BoundingBox)bounds : default,
+                BoneIndices = boneIndices,
+                BoneWeights = boneWeights,
             };
 
             var patternScale = tags.TryGetValue("PatternScale", out var ps) ? (float)ps : 1f;
@@ -96,6 +114,12 @@ internal static class MwmLoader
             else if (data.Bounds.Min == data.Bounds.Max)
                 data.Bounds = ComputeBounds(data.Positions);
 
+            if (lodInfo.HasValue)
+            {
+                data.LodModels = lodInfo.Value.Models;
+                data.LodDistances = lodInfo.Value.Distances;
+            }
+
             return data;
         }
         finally
@@ -125,6 +149,7 @@ internal static class MwmLoader
                     NormalGloss = ResolveTexture(Texture(descriptor, "NormalGlossTexture"), contentPath),
                     Extensions = ResolveTexture(Texture(descriptor, "AddMapsTexture"), contentPath),
                     Alphamask = ResolveTexture(Texture(descriptor, "AlphamaskTexture"), contentPath),
+                    GlassCCW = descriptor?.GlassCCW ?? "",
                 };
 
                 foreach (var index in part.m_indices)
@@ -149,6 +174,51 @@ internal static class MwmLoader
         return parts;
     }
 
+    // MyModel.LoadFromFile: LOD0 is the file itself, LOD1..N come from the LODs descriptors
+    private static (string[] Models, float[] Distances)? ReadLods(Dictionary<string, object> tags, string modelPath)
+    {
+        if (!tags.TryGetValue("LODs", out var tag) || tag is not MyLODDescriptor[] descriptors || descriptors.Length == 0)
+            return null;
+
+        var models = new List<string>();
+        var distances = new List<float>();
+        foreach (var descriptor in descriptors)
+        {
+            if (string.IsNullOrEmpty(descriptor.Model))
+                continue;
+
+            // MyLODDescriptor.GetModelAbsoluteFilePath, case-safe for Linux
+            var model = NormalizeSeparators(descriptor.Model);
+            if (!model.EndsWith(".mwm", StringComparison.OrdinalIgnoreCase))
+                model += ".mwm";
+
+            var lowerParent = modelPath.ToLowerInvariant();
+            var modelsIndex = lowerParent.IndexOf("models", StringComparison.Ordinal);
+            var path = modelsIndex >= 0 && Path.IsPathRooted(modelPath)
+                ? ExistingFile(Path.Combine(modelPath[..modelsIndex], model))
+                : null;
+            path ??= ExistingFile(Path.Combine(MyFileSystem.ContentPath, model));
+
+            if (path == null)
+            {
+                RenderLog.Warning($"LOD model '{descriptor.Model}' of {modelPath} not found");
+                continue;
+            }
+
+            models.Add(path);
+            distances.Add(descriptor.Distance);
+        }
+
+        return models.Count == 0 ? null : (models.ToArray(), distances.ToArray());
+    }
+
+    // Game assets use Windows separators; use the running platform's separator on both pipelines
+    private static string NormalizeSeparators(string path) =>
+        path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+
+    private static string ExistingFile(string path) =>
+        MyFileSystem.FileExists(path) ? path : null;
+
     private static string Texture(MyMaterialDescriptor descriptor, string key) =>
         descriptor != null && descriptor.Textures.TryGetValue(key, out var value) ? value : "";
 
@@ -172,17 +242,18 @@ internal static class MwmLoader
         if (string.IsNullOrEmpty(model))
             return model;
 
-        var path = model.Replace('\\', '/');
+        var path = NormalizeSeparators(model);
         if (!path.EndsWith(".mwm", StringComparison.OrdinalIgnoreCase))
             path += ".mwm";
         if (!Path.IsPathRooted(path))
             path = Path.Combine(MyFileSystem.ContentPath, path);
 
-        if (File.Exists(path))
+        // MyFileSystem resolves paths case-insensitively like the game (raw File.Exists does not on Linux)
+        if (MyFileSystem.FileExists(path))
             return path;
 
         var lower = path.ToLowerInvariant();
-        return File.Exists(lower) ? lower : path;
+        return MyFileSystem.FileExists(lower) ? lower : path;
     }
 
     // MyMwmUtils.GetFullMwmContentPath: everything before the "models" folder, so textures next to the model win
@@ -199,20 +270,20 @@ internal static class MwmLoader
         if (string.IsNullOrEmpty(texture))
             return "";
 
-        var path = texture.Replace('\\', '/');
+        var path = NormalizeSeparators(texture);
         if (Path.IsPathRooted(path))
             return ExistingOrLower(path);
 
         if (!string.IsNullOrEmpty(contentPath))
         {
             var candidate = Path.Combine(contentPath, path);
-            if (File.Exists(candidate) || File.Exists(candidate.ToLowerInvariant()))
-                return ExistingOrLower(candidate);
+            if (MyFileSystem.FileExists(candidate))
+                return candidate;
         }
 
         return ExistingOrLower(Path.Combine(MyFileSystem.ContentPath, path));
     }
 
     private static string ExistingOrLower(string path) =>
-        File.Exists(path) ? path : File.Exists(path.ToLowerInvariant()) ? path.ToLowerInvariant() : path;
+        MyFileSystem.FileExists(path) ? path : MyFileSystem.FileExists(path.ToLowerInvariant()) ? path.ToLowerInvariant() : path;
 }

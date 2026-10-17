@@ -22,8 +22,28 @@ internal struct FrameConstants
     // rgb: linear sun color (SunColorRaw), w: sun specular factor
     public Vector4 SunColor;
 
-    // rgb: linear ambient color, w: ambient factor
+    // rgb: linear fallback ambient, w: factor (used until the IBL cubemap is ready)
     public Vector4 AmbientColor;
+
+    // Inverse of the Y-flipped view-projection, transposed rows (skybox view rays)
+    public Vector4 InvViewProjection0;
+    public Vector4 InvViewProjection1;
+    public Vector4 InvViewProjection2;
+    public Vector4 InvViewProjection3;
+
+    // SkyboxOrientation, transposed rows
+    public Vector4 BackgroundOrientation0;
+    public Vector4 BackgroundOrientation1;
+    public Vector4 BackgroundOrientation2;
+    public Vector4 BackgroundOrientation3;
+
+    // x: EnvSkyboxBrightness, y: IBL mip count, z: AmbientDiffuseFactor, w: AmbientSpecularFactor
+    public Vector4 SkyboxParams;
+
+    public uint SkyboxCube;
+    public uint IblCube;
+    public uint BrdfLut;
+    public uint Pad;
 }
 
 // Camera from MyRenderMessageSetCameraViewMatrix, plus the stock projection and camera-relative setup.
@@ -35,11 +55,18 @@ internal sealed class CameraState
     public MatrixD ViewD { get; private set; }
     public Matrix ViewAt0 { get; private set; }
     public Matrix ViewProjectionAt0 { get; private set; }
+
+    // Stock (unflipped) projection for frustum extraction, camera-relative
+    public Matrix CullingViewProjection { get; private set; }
+
     public Vector3D Position { get; private set; }
     public float Near { get; private set; }
     public float Far { get; private set; }
     public float FovH { get; private set; }
     public float FovV { get; private set; }
+
+    // MyCommon.MoveToNextFrame: scales LOD switching distances by FOV and resolution
+    public float LodCoefficient { get; private set; } = 1f;
 
     public void Set(MyRenderMessageSetCameraViewMatrix message, Vector2I resolution)
     {
@@ -57,6 +84,10 @@ internal sealed class CameraState
         projection.M31 = message.ProjectionOffsetX;
         projection.M32 = message.ProjectionOffsetY;
 
+        // Frustum culling uses the stock D3D-space matrix (the Y flip below does not change the volume,
+        // but keeping the stock matrix avoids mirrored plane winding)
+        CullingViewProjection = view * projection;
+
         // Vulkan clip space has +Y down; the stock matrices are D3D (Y up)
         projection.M22 = -projection.M22;
         projection.M32 = -projection.M32;
@@ -69,6 +100,9 @@ internal sealed class CameraState
         Far = message.FarPlane;
         FovH = message.FOV;
         FovV = (float)(2.0 * Math.Atan(Math.Tan(message.FOV / 2.0) * (resolution.Y / (double)resolution.X)));
+        LodCoefficient = message.FOV > 0f && resolution.Y > 0
+            ? (float)(Math.Tan(message.FOV / 2.0) / Math.Tan(35.0 * Math.PI / 180.0) * (1080.0 / resolution.Y))
+            : 1f;
         HasValue = true;
     }
 
@@ -87,7 +121,8 @@ internal sealed class CameraState
         };
     }
 
-    public FrameConstants BuildFrameConstants(MyEnvironmentData environment)
+    public FrameConstants BuildFrameConstants(MyEnvironmentData environment,
+        uint skyboxCube, uint iblCube, uint brdfLut, uint iblMipCount)
     {
         var light = environment.EnvironmentLight;
         var sun = light.SunColorRaw;
@@ -104,6 +139,9 @@ internal sealed class CameraState
         // The shader computes dot(position, row) (row-vector math), so hand it the transpose: each float4
         // is then a column of the XNA matrix, which is what that dot product needs.
         var viewProjection = Matrix.Transpose(ViewProjectionAt0);
+        var invViewProjection = Matrix.Transpose(Matrix.Invert(ViewProjectionAt0));
+        var orientation = Matrix.Transpose(Matrix.CreateFromQuaternion(environment.SkyboxOrientation));
+
         return new FrameConstants
         {
             ViewProjection0 = new Vector4(viewProjection.M11, viewProjection.M12, viewProjection.M13, viewProjection.M14),
@@ -113,6 +151,22 @@ internal sealed class CameraState
             SunDirection = new Vector4(sunDirection, light.SunDiffuseFactor),
             SunColor = new Vector4(sun, light.SunSpecularFactor),
             AmbientColor = new Vector4(1f, 1f, 1f, ambient * light.AmbientDiffuseFactor),
+
+            InvViewProjection0 = new Vector4(invViewProjection.M11, invViewProjection.M12, invViewProjection.M13, invViewProjection.M14),
+            InvViewProjection1 = new Vector4(invViewProjection.M21, invViewProjection.M22, invViewProjection.M23, invViewProjection.M24),
+            InvViewProjection2 = new Vector4(invViewProjection.M31, invViewProjection.M32, invViewProjection.M33, invViewProjection.M34),
+            InvViewProjection3 = new Vector4(invViewProjection.M41, invViewProjection.M42, invViewProjection.M43, invViewProjection.M44),
+
+            BackgroundOrientation0 = new Vector4(orientation.M11, orientation.M12, orientation.M13, orientation.M14),
+            BackgroundOrientation1 = new Vector4(orientation.M21, orientation.M22, orientation.M23, orientation.M24),
+            BackgroundOrientation2 = new Vector4(orientation.M31, orientation.M32, orientation.M33, orientation.M34),
+            BackgroundOrientation3 = new Vector4(orientation.M41, orientation.M42, orientation.M43, orientation.M44),
+
+            SkyboxParams = new Vector4(light.EnvSkyboxBrightness, iblMipCount,
+                light.AmbientDiffuseFactor, light.AmbientSpecularFactor),
+            SkyboxCube = skyboxCube,
+            IblCube = iblCube,
+            BrdfLut = brdfLut,
         };
     }
 }
