@@ -16,7 +16,7 @@ namespace ClientPlugin;
 // ReSharper disable once UnusedType.Global
 public class Plugin : IPlugin
 {
-    public const string Name = "ClientPluginTemplate";
+    public const string Name = "Vulkan";
     public static Plugin Instance { get; private set; }
     private SettingsGenerator settingsGenerator;
 
@@ -26,9 +26,9 @@ public class Plugin : IPlugin
         Instance = this;
         Instance.settingsGenerator = new SettingsGenerator();
 
-        // TODO: Put your one time initialization code here.
+        // The renderer patches are applied by the Preloader, before the game starts
         var harmony = new Harmony(Name);
-        harmony.PatchAll(Assembly.GetExecutingAssembly());
+        harmony.PatchAllUncategorized(Assembly.GetExecutingAssembly());
     }
 
     public void Dispose()

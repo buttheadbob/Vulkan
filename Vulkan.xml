@@ -2,16 +2,16 @@
 <PluginData xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="GitHubPlugin">
 
     <!-- The ID of your plugin, never change this -->
-    <Id>A061FC6C-713E-42CD-B413-151AC8A5074C</Id>
+    <Id>7C5A605C-1041-4C94-988A-5DF95F3145F8</Id>
 
     <!-- GitHub repository ID -->
-    <RepoId>todo-github-user/project-name</RepoId>
+    <RepoId>buttheadbob/Vulkan</RepoId>
 
     <!-- The name of your plugin that will appear in the plugin list -->
-    <FriendlyName>TODO ClientPluginTemplate</FriendlyName>
+    <FriendlyName>Vulkan</FriendlyName>
 
     <!-- The author name that you want to appear in the plugin list -->
-    <Author>TODO Author Name</Author>
+    <Author>SentorX</Author>
 
     <!-- Optional tooltip for the plugin in the plugin list -->
     <Tooltip>TODO Short description</Tooltip>
@@ -32,11 +32,10 @@
     <!-- To specify asset files to be copied onto disk, use the AssetFolder tag.
     <AssetFolder>Project/Assets/</AssetFolder> -->
 
-    <!-- To specify a required NuGet package, use either a list of PackageReference tags OR a Config tag.
+    <!-- To specify a required NuGet package, use either a list of PackageReference tags OR a Config tag. -->
     <NuGetReferences>
-      <PackageReference Include="OVRSharp" Version="1.2.0" />
-    </NuGetReferences> 
-    -->
+      <PackageReference Include="Vortice.Vulkan" Version="3.3.0" />
+    </NuGetReferences>
 
     <!-- Optional tag that specifies what dependencies this plugin has. Dependencies will be automatically enabled when this plugin is enabled.
     <DependencyIds>
@@ -44,9 +43,8 @@
     </DependencyIds> 
     -->
 
-    <!-- Optional tag that restricts the plugin to specific runtimes (case sensitive: NETFramework, NETCoreApp). List multiple, comma separated. If omitted, the runtime is detected from the compiled assembly.
-    <Runtimes>NETFramework,NETCoreApp</Runtimes>
-    -->
+    <!-- Optional tag that restricts the plugin to specific runtimes. Pulsar 2.4+ values: CLR (.NET Framework), CoreCLR (.NET), Mono. List multiple, comma separated. If omitted, the runtime is detected from the compiled assembly. -->
+    <Runtimes>CoreCLR</Runtimes>
 
     <!-- Optional tag that restricts the plugin to specific platforms (case sensitive: Windows, Linux). List multiple, comma separated. If omitted, the plugin loads on all platforms.
     <Platforms>Windows,Linux</Platforms>

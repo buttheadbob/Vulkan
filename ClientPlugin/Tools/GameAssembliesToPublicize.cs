@@ -1,8 +1,5 @@
-﻿using System.Runtime.CompilerServices;
+using System.Runtime.CompilerServices;
 
-/* Uncomment to enable publicizer support, extend with the game assemblies you need to publicize
-
-[assembly: IgnoresAccessChecksTo("Sandbox.Game")]
-[assembly: IgnoresAccessChecksTo("SpaceEngineers.Game")]
-
-*/
+// Keep in sync with the Publicize items in ClientPlugin.csproj
+[assembly: IgnoresAccessChecksTo("VRage.Platform.Windows")]
+[assembly: IgnoresAccessChecksTo("VRage.Render")]
