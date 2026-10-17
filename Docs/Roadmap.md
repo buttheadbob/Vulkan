@@ -7,38 +7,34 @@
 
 ## Start here
 
-**Current state (end of 2026-10-17 session):** Phase 0 and Phase 1 done (menus, HUD, text, Vulkan settings
-dialog all verified by the user; world load/save/reload works with the HUD over an empty scene). Phase 2 started:
-scene infrastructure only (HDR + depth targets, composite pass, pipeline builder, transient allocator) — builds
-clean, **not yet checked in game** (expected: very dark space color behind the HUD in a world instead of black).
-Never run git; the user commits.
+**Current state (2026-10-17 session):** Phase 0 and Phase 1 done (menus, HUD, text, Vulkan settings dialog all
+verified by the user; world load/save/reload works). Phase 2 first slice is implemented, builds clean and is
+**verified in game by frame capture**: camera + environment state, actor registry, background MWM loader (LOD0),
+texture kinds (model CM/Extensions sRGB, normal maps and alphamasks linear), forward opaque model pass with sun +
+ambient, cube-grid instancing (2 instance buffers, 18 instances captured; astronaut, armor blocks, cockpit and grid
+geometry all render, log clean), and a placeholder ACES tonemap with fixed exposure 0.03 in `CompositePass` (the
+cockpit capture shows correct detail and colors). Visual limitations are expected at this stage: no IBL/eye
+adaptation (ambient is the game's 0.02 probe floor), no shadows, transparency, voxels, skinning, culling or LOD
+selection. Never run git; the user commits.
 
 **Next tasks, in order:**
-1. **Research spec for world messages** (was running in a background agent when the session ended; its result was
-   lost — redo it). Produce, with file:line refs into the decompiled source: (a) camera: `SetCameraViewMatrix`
-   fields, stock projection (`MyRender11.cs` ~:1863 `CreatePerspectiveFovRhInfiniteComplementary`), camera-relative
-   precision handling, `UpdateRenderEnvironment` (sun, skybox, ambient); (b) entities: CreateRenderEntity,
-   UpdateRenderObject, RemoveRenderObject, UpdateRenderObjectVisibility, ChangeModel, UpdateModelProperties,
-   UpdateColorEmissivity, UpdateRenderEntity, SetParentCullObject, CreateManualCullObject, RenderFlags, world
-   matrices; (c) cube grid instancing: CreateRenderInstanceBuffer, UpdateRenderCubeInstanceBuffer
-   (`MyCubeInstanceData` byte layout + how stock shaders decode it), UpdateRenderInstanceBufferRange,
-   SetInstanceBuffer, CreateStaticGroup; (d) MWM import (`VRage.Render/VRageRender.Import/MyModelImporter.cs`):
-   vertex encodings and exact decode formulas (see `GeometryStage2.Model`, legacy `MyMeshes`), LODs, parts,
-   materials; (e) materials: techniques, texture slots (ColorMetal/NormalGloss/Extensions/Alphamask; normal maps are
-   NOT sRGB), channel meanings, keen color-mask/HSV recolor formula (`Content/Shaders/Geometry/Materials/Standard`,
-   `GBuffer/GBufferWrite.hlsli`); (f) characters: CreateRenderCharacter, SetCharacterSkeleton,
-   SetCharacterTransforms. Write the result into this roadmap (new "World message spec" section) so it survives.
-2. **Quick in-game check** of the scene infrastructure (user loads a world, or use `VULKAN_SCREENSHOT` after the
-   user is in a world): dark space color behind the HUD, no errors.
-3. **Phase 2 implementation**: frame constants (camera-relative matrices, previous-frame matrices for motion
-   vectors) in the transient allocator → actor registry (create/update/remove by render object ID) → MWM model
-   cache (GPU vertex/index buffers, LODs) → material textures via `TextureCache` (needs non-sRGB normal maps:
-   `TextureCache` currently applies GUI rules, add a texture "kind") → first opaque pass with a simple sun light
-   into `SceneTargets` → cube grid instancing → G-buffer + motion vectors.
-4. Remaining Phase 1 odds: texture messages (Preload/Unload/Deprioritize), options presets as features land.
+1. **World correctness pass**: per-actor frustum culling (bounds are loaded already), LOD selection
+   (`MyLODDescriptor`), back-face culling, depth bias check, non-uniform scale normal matrix.
+2. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
+   MRT pass) so TAA/FSR/GI can build on it, then Phase 3 lighting/shadows (environment probe/IBL and eye
+   adaptation replace the ambient and fixed-exposure placeholders).
+3. Remaining Phase 2: voxel cells, skinned characters, transparent materials, static/merge groups.
+4. Remaining Phase 1 odds: texture messages (Preload/Unload/Deprioritize), verify LCD offscreen targets in-world,
+   options presets as features land.
 
 **User preferences / rules (all sessions):**
 - Never run git commands. The user commits and pushes.
+- Do all work directly in this session: **no subagents and no task tool**.
+- Never guess. Verify claims against the decompiled source, the shipped shaders or official docs; when a
+  runtime behaviour is unknown, instrument it instead of assuming.
+- If there is a problem to diagnose, add console logging (`RenderLog.Info/Warning/Error`, which prefixes
+  `[Vulkan]`) and run an in-game test. After every test read the actual game log file (plus the Pulsar
+  log when relevant) for errors and other messages, not only the console output.
 - Keep this roadmap current; the user relies on it to continue across sessions without re-explaining.
 - One code path for Windows and Linux; Linux tested first. Modernize, don't just match stock.
 - Ask only when a decision is genuinely the user's; otherwise pick a sensible default and say so.
@@ -275,6 +271,171 @@ targets before the main GUI pass each frame; `SpriteRenderer` needs a pipeline p
 See [Options UI](#options-ui). Start with: renderer choice, validation, texture anisotropy, and a placeholder
 "Presets" dropdown; greyed items with reason strings come from `DeviceCapabilities`.
 
+## World message spec
+
+Researched 2026-10-17 from the decompiled source and the shipped shaders. File paths below are relative to
+`SpaceEngineersDecompiled/` unless they start with `Content/` (shipped shaders). This is the reference the Phase 2
+implementation follows; keep it updated when behaviour is discovered in game.
+
+### Camera (`SetCameraViewMatrix`)
+
+`VRage.Render/VRageRender.Messages/MyRenderMessageSetCameraViewMatrix.cs`: `ViewMatrix` (MatrixD),
+`ProjectionMatrix`, `ProjectionFarMatrix` (skybox), `FOV`, `FOVForSkybox`, `NearPlane`, `FarPlane`, `FarFarPlane`,
+`ProjectionOffsetX/Y`, `CameraPosition` (Vector3D), `LastMomentUpdateIndex`, `Smooth`, `UpdateTime`.
+Stock processing: `VRage.Render11/VRageRender/MyRender11.cs:1825` and `:1844-1896` (`SetupCameraMatricesInternal`).
+
+- `ViewAt0` = rotation-only view: copy the matrix, zero `M14/M24/M34/M41/M42/M43`, set `M44=1` (`:1850-1857`).
+- Projection when `FOV > 0`: `Matrix.CreatePerspectiveFovRhInfiniteComplementary(FOV, aspect, near)` —
+  `VRage.Math/VRageMath/Matrix.cs:1984`: `M11=1/(tan(fov/2)*aspect)`, `M22=1/tan(fov/2)`, `M33=0`, `M34=-1`,
+  `M43=near`. Depth is reverse-Z (`near/z_view`), 1 at the near plane, 0 at infinity. `M31/M32` are overwritten
+  with `ProjectionOffsetX/Y` (`:1864-1865`). Aspect = viewport width/height (`:1858`).
+- `ViewProjectionAt0 = ViewAt0 * Projection` (row-vector XNA convention). `FovV = 2*atan(tan(FovH/2) * height/width)`.
+- Stock renders camera-relative for precision: view has no translation, object matrices are translated by
+  `-CameraPosition` (`MyCommon.UpdateFrameConstants`, `MyCommon.cs:396-416`, `WorldOffset`). We do the same.
+- **Vulkan**: the stock projection is D3D Y-up. Our `CameraState` negates `M22` and `M32` so a positive-height
+  viewport renders upright (clip Y is down in Vulkan); scene shaders then use normal viewports.
+- Environment (`UpdateRenderEnvironment`, `MyRender11.cs:3223`): `MyEnvironmentData` (`MyEnvironmentData.cs`) has
+  `EnvironmentLight`, `Skybox`, `SkyboxOrientation`, `EnvironmentProbe`, env map sizes, `TextureMultipliers`.
+  `MyEnvironmentLightData` (`MyEnvironmentLightData.cs`): `SunColorRaw` and `SunSpecularColorRaw` are **linear**;
+  `SunLightDirection` is the direction **from** the sun (shaders use `L = -directionalLightVec`,
+  `Content/Shaders/Lighting/LightingModel.hlsli:41`); defaults `SunDiffuseFactor=2.9`, `SunSpecularFactor=1`,
+  `AmbientDiffuseFactor=1`, `AmbientForwardPass=0.01`. No IBL/probe yet, so the forward pass uses
+  `SunColorRaw * AmbientForwardPass` as ambient.
+
+### Entities and actors
+
+| Message | Fields (message class) | Stock handling |
+|---------|------------------------|----------------|
+| `CreateRenderEntity` | ID, DebugName, Model, WorldMatrix (MatrixD), Technique, RenderFlags, DepthBias, CullingOptions, MaxViewDistance, Rescale, ForceReload | `MyRender11.cs:2587` |
+| `UpdateRenderObject` | ID, LastMomentUpdateIndex, `MyRenderObjectUpdateData` (WorldMatrix/LocalMatrix/LocalAABB + Has* flags) | `:2728` |
+| `RemoveRenderObject` | ID, FadeOut | `:2748` |
+| `UpdateRenderObjectVisibility` | ID, Visible, NearFlag | `:2797` |
+| `ChangeModel` | ID, Model, Scale | `:2541` |
+| `UpdateModelProperties` | ID, MaterialName (MyStringId), FlagsChange {Add,Remove}, DiffuseColor, Emissivity | `:2988` |
+| `UpdateColorEmissivity` | ID, LOD, MaterialName, DiffuseColor, Emissivity | `:3061` |
+| `UpdateRenderEntity` | ID, DiffuseColor, ColorMaskHSV, Dithering, FadeIn | `:2485` |
+| `CreateStaticGroup` | ID, Model, Translation (Vector3D), LocalMatrices (Matrix[]) | `:2648` |
+| `CreateManualCullObject` / `SetParentCullObject` | ID, DebugName/WorldMatrix; ID, CullObjectID, ChildToParent | `:2883`/`:2892` (culling only) |
+| `CreateRenderCharacter` | ID, DebugName, Model, LOD1, WorldMatrix, RenderFlags, DiffuseColor, ColorMaskHSV, FadeIn | `:2453` |
+| `SetCharacterSkeleton` | CharacterID, SkeletonBones (MySkeletonBoneDescription[]), SkeletonIndices | `:2473` |
+| `SetCharacterTransforms` | CharacterID, BoneAbsoluteTransforms (Matrix[]), BoneDecalUpdates | `:2479` |
+
+- `RenderFlags` (`VRage.Render/VRageRender/RenderFlags.cs`): `Visible=0x10`, `Near=0x40`,
+  `SkipInMainView=0x400`, `SkipInForward=0x20000`, `NoBackFaceCulling=0x200`, `CastShadows=8`,
+  `DistanceFade=0x4000`, etc. Our main pass skips `SkipInMainView | SkipInForward`; `Visible` gates drawing.
+- `ColorMaskHSV` is passed to the shader **as HSV delta**, unchanged (`ColorFromMask` at `MyRender11.cs:2398`
+  returns its argument). The shader adds it to the texture HSV (`ColorizeGray`).
+- `UpdateRenderEntity.DiffuseColor` is not applied to entities by stock Render11 (only debris/instances use their
+  own data); `UpdateModelProperties.DiffuseColor`/`Emissivity` are per material. Default emissivity is 1
+  (`VRage.Render11.Scene.Components/MyModelProperties.cs:8`). Our actor registry applies these as color/emissive
+  overrides keyed by material name.
+- Static groups: the actor matrix is `CreateTranslation(Translation)`; `LocalMatrices` are model transforms
+  relative to it (`VRage.Render11.GeometryStage2.StaticGroup/MyStaticGroupComponent.cs:64-90`). World =
+  local matrix, translation moved by the group translation (camera-relative in our pass).
+- Initial visibility comes from `RenderFlags.Visible` (all game `CreateRenderEntity` calls set it; verified in
+  `Sandbox.Game/.../MyRenderComponent.cs:105`, `MyCubeGridRenderCell.cs:536`, `MyInstancedRenderSector.cs:72`).
+
+### Cube grid instancing
+
+Messages: `CreateRenderInstanceBuffer` (ID, ParentID, DebugName, `MyRenderInstanceBufferType`), then
+`UpdateRenderCubeInstanceBuffer` (ID, `List<MyCubeInstanceData>`, `List<MyCubeInstanceDecalData>`, Capacity) for
+cubes, or `UpdateRenderInstanceBufferRange` (ID, `MyInstanceData[]`, StartOffset, Trim) for generic instances.
+`SetInstanceBuffer` (ID, InstanceBufferId, InstanceStart, InstanceCount, InstanceData, LocalAabb) binds a range of
+an instance buffer to a render entity; stock handling `MyRender11.cs:2828-2880`, instances live in
+`MyInstancing`/`MyRenderInstanceBuffer`.
+
+- `MyCubeInstanceData` (`VRage/VRage/MyCubeInstanceData.cs`): 64 bytes:
+  `byte bones[32]` (8 x Vector4UByte: bone indices/weights/range/flags/texture offset; index 8 is spread over
+  the W bytes), then `Vector4 m_translationAndRot`, then `Vector4 ColorMaskHSV`. `LocalMatrix` is decoded from
+  `m_translationAndRot` via `Vector4.UnpackOrthoMatrix` (`VRage.Math/VRageMath/Vector4.cs:370`):
+  translation in xyz, `w = forwardDir*6 + upDir` with `Base6Directions` order
+  `(0,0,-1),(0,0,1),(-1,0,0),(1,0,0),(0,1,0),(0,-1,0)` (`Content/Shaders/VertexTransformations.hlsli:117-127`);
+  `Matrix.CreateWorld(position, forward, up)`. Bone flag bit 1 (in bone3.w) = hologram; bit 2 =
+  skinning; `ColorMaskHSV.w < 0` sets the hologram bit and stores the absolute value.
+- `MyInstanceData` (`VRage/VRage/MyInstanceData.cs`): 32 bytes, three `HalfVector4` matrix rows (translation in
+  row W) + `ColorMaskHSV` `HalfVector4`.
+- Shader side: `Content/Shaders/Geometry/VertexTemplateBase.hlsli` reads `__cube_transformation` /
+  `__packed_bone0..7` and calls `construct_cube_instance_matrix` (`:262`, `:276`), key color comes from
+  `__colormask` (`:490`, hologram/dithering flags at `:492-502`). Instance transforms are applied before the
+  entity world matrix (`:356`, `:369`).
+- Planned: one GPU buffer per instance-buffer ID, entity IDs referencing it; draw the cube model instanced;
+  skip decals initially.
+
+### MWM models and materials
+
+`VRage.Render/VRageRender.Import/MyModelImporter.cs` reads the binary MWM. Version >= 1066002 has a string→offset
+index dictionary (`:886-936`); older files are sequential (`:938`). Modern tag readers: `Vertices`
+(`HalfVector4[]`), `Normals`/`Tangents`/`Binormals` (`Byte4[]`), `TexCoords0` (`HalfVector2[]`), `BlendIndices`
+(`Vector4I[]`), `BlendWeights` (`Vector4[]`), `Bones` (`MyModelBone[]`), `MeshParts`
+(`List<MyMeshPartInfo>`), `Sections`, `BoundingBox`, `BoundingSphere`, `LODs` (`MyLODDescriptor[]`),
+`PatternScale`, `GeometryDataAsset`, animations.
+
+`VRage.Render11/VRage.Render11.GeometryStage2.Model/MyMwmData.cs:153-297` is the authoritative load path:
+
+- `GeometryDataAsset` present = stub; the actual geometry is that file (recursively resolved).
+- `PatternScale` divides UVs (`:216-222`).
+- Tangents are rebuilt from normals/tangents/binormals: `w = sign(cross(t,n) . b)`, packed with
+  `VF_Packer.PackTangentSignB4` (`:134-151`).
+- Parts are sorted by technique, indices concatenated in that order (`:229-281`). Each part stores technique,
+  material name and the four texture paths (ColorMetal/NormalGloss/AddMaps/Alphamask, `MyMwmDataPart.cs`).
+- LOD0 is in the main file; `LODs` describes the others (`MyLODDescriptor.cs`).
+
+Vertex encodings (`VRage/VRage.Import/PositionPacker.cs`, `VF_Packer.cs`):
+
+- Position `HalfVector4`: xyz scaled by `1/floor(max(|x|,|y|,|z|))`, w = that scale, capped at 2048; decode
+  `w * xyz`.
+- Normal `Byte4`: 15-bit x and 15-bit z packed little-endian in the low/high halves; the high bit of the x half
+  is the sign of z; decode with `Content/Shaders/VertexTransformations.hlsli:62-74`.
+- Tangent `Byte4` = same layout plus the sign of bitangent in the high bit of the second half; decode
+  `:77-87` (y is flipped for normal maps in the pixel shader, `Content/Shaders/PixelUtils.hlsli:47-70`).
+- UV `HalfVector2`. Skinned models add `BlendIndices` (4 x int) and `BlendWeights` (4 x float).
+
+Material channels (`Content/Shaders/Geometry/Materials/Standard/Pixel.hlsl`,
+`Content/Shaders/Geometry/Materials/PixelUtilsMaterials.hlsli:67-103`,
+`Content/Shaders/GBuffer/GBufferWrite.hlsli:18-33`):
+
+- ColorMetal (`MyFileTextureEnum.COLOR_METAL`): sRGB; `.rgb` albedo, `.a` metalness.
+- NormalGloss (`NORMALMAP_GLOSS`): **linear**; `.xy(z)` tangent-space normal (y flipped in the shader), `.w` gloss.
+- Extensions (`EXTENSIONS`): sRGB; `.x` AO, `.y` emissive, `.w` coloring factor (`.z` unused by Standard).
+- Alphamask (`ALPHAMASK`): linear, R8; `clip(alpha - 0.5)` for alpha-masked techniques.
+- Recolor: `ColorizeGray` — `hsv = rgb_to_hsv(rgb_to_srgb(texel)); hsv.xy = 0; final = saturate(hsv + keyColorHSV);
+  texel = lerp(texel, srgb_to_rgb(hsv_to_rgb(final)), coloring)` (`PixelUtilsMaterials.hlsli:15-31`).
+  Stock also reduces coloring on metal (`RemoveMetalnessFromColoring`, `:60-65`) unless `METALNESS_COLORABLE`.
+- Emissive = `saturate(extensions.y - 1/255) * emissivity`; base color is multiplied by the material color and the
+  actor color, then lit (`LightingModel.hlsli`). We implement GGX sun + ambient in the forward pass.
+- Texture path resolution: `MyMwmUtils`/`MyResourceUtils.GetTextureFullPath` — relative to the model's content
+  root (the path before the `models` folder) when the file exists there, else the game `Content` root. Our loader
+  adds Linux case fallback (exact case first, lower case second).
+- sRGB rules come from `VRage.Render11/VRage.Render11.Resources/MyGlobalResources.cs:25-30` (CM/Extensions
+  `BC7_UNorm_SRgb`, NG `BC7_UNorm`, alphamask linear).
+
+### Characters
+
+`CreateRenderCharacter` creates a `SKINNED` actor; `SetCharacterSkeleton` gives bone descriptions and the
+skeleton index map; `SetCharacterTransforms` gives `BoneAbsoluteTransforms` every frame plus decal updates
+(`MyRender11.cs:2453-2483`). Stock skinning is `matrix += bone[blendIndex] * blendWeight` for four bones
+(`Content/Shaders/Geometry/VertexTemplateBase.hlsli:244-255`). Not implemented yet: skinned models are loaded but
+skipped with one log line.
+
+### Our Phase 2 first slice (implemented 2026-10-17)
+
+`CameraState` + `FrameConstants` (transposed view-projection for the shader's dot-product convention, sun and
+ambient), `SceneActors` (create/update/remove/visibility/model change/material overrides/static groups),
+`MwmLoader` (background parse through `MyModelImporter`, exact stock decodings, pattern scale, flat index list,
+absolute texture paths) + `ModelCache` (device-local vertex/index buffers via `UploadQueue.UploadBuffer`, parts
+with `TextureCache` entries), `TextureCache.TextureKind` (GUI sRGB+premultiply, CM/Extensions sRGB, NG/alphamask
+linear), and `ModelPass` (forward opaque, reverse-Z, sun + ambient, per-material draw data in the transient
+allocator, texture slots through the bindless set). `Shaders/Scene/Model.slang` implements the stock normal and
+tangent decodes, colorize, alpha mask, GGX sun and ambient. Cube grids: `InstanceBuffers` owns one
+device-local buffer per `CreateRenderInstanceBuffer` (updated by replacing the buffer, so frames in flight never
+read swapped contents), `SetInstanceBuffer` puts the range on the actor, and the shader decodes
+`MyCubeInstanceData`'s packed ortho matrix and per-instance HSV. Verified by frame capture (18 instances).
+Generic (`MyInstanceData`) buffers are stored but not drawn yet.
+
+Not implemented yet: generic instancing (world-environment sectors), voxels, LOD selection, frustum culling,
+skinning, transparency, shadows, G-buffer/motion vectors, skybox, eye adaptation (a fixed-exposure ACES tonemap
+placeholder is in `CompositePass`).
+
 ## Phases
 
 Each phase leaves the game launchable; unimplemented message types are disposed as no-ops.
@@ -332,16 +493,18 @@ Known gaps from Phase 0:
       features land, greyed-out unsupported items with reasons.
 - **Milestone:** full main menu and options usable on Vulkan.
 
-### Phase 2 — World geometry (started)
-- [~] Scene infrastructure: `SceneTargets`, `CompositePass` + `Composite.slang`, `GraphicsPipelineBuilder`,
-      `TransientAllocator`, `DrawScene` handling (scene drawn only on frames with `DrawScene`). Builds; not seen in game.
-- [ ] World message spec written into this roadmap (see Start here, task 1)
-- [ ] Camera, frame constants, reverse-Z infinite projection, culling (frustum, later GPU-driven)
-- [ ] Actors/render entities, MWM meshes + LODs, instancing (cube grids, merge groups), static groups
-- [ ] Materials (standard, alpha-masked, triplanar, glass, holo, shield) on bindless textures
+### Phase 2 — World geometry (in progress)
+- [x] Scene infrastructure: `SceneTargets`, `CompositePass` + `Composite.slang`, `GraphicsPipelineBuilder`,
+      `TransientAllocator`, `DrawScene` handling (scene drawn only on frames with `DrawScene`)
+- [x] World message spec written into this roadmap (see [World message spec](#world-message-spec))
+- [x] Camera, frame constants, reverse-Z infinite projection, camera-relative world matrices
+- [ ] Frustum culling, LOD selection (bounds and LOD descriptors are loaded, only LOD0 is used)
+- [x] Actors/render entities, MWM meshes, cube-grid instancing, static groups
+- [x] Materials (standard + alpha-masked) on bindless textures, stock decodes and colorize
+- [ ] Remaining materials (triplanar, glass, holo, shield) and transparency
 - [ ] Skinned characters
 - [ ] Voxel cells (consume game-meshed clipmap data), voxel materials; `ClipmapsReady` output
-- [ ] G-buffer **including motion vectors** (needed later for TAA/FSR/GI), basic sun lighting
+- [ ] G-buffer **including motion vectors** (needed later for TAA/FSR/GI); forward sun lighting is done
 - [ ] Frame graph + pipeline cache
 - **Milestone:** load a world; grids, characters and planets render.
 
@@ -449,3 +612,19 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   (`Post/Composite.slang`), `GraphicsPipelineBuilder`, `TransientAllocator`, `DrawScene` handling. Builds clean, not
   checked in game. The background research on world messages/MWM/materials did not finish before the session ended;
   redo it first (Start here, task 1).
+- **2026-10-17** — Docs/status review: roadmap matches the code; `dotnet build` is clean (0 warnings/errors) and the
+  shader bytecode check passes. README is still template boilerplate. Recorded the no-subagents / no-guessing /
+  in-game-logging rules above.
+- **2026-10-17** — Phase 2 first slice. Researched the world message boundary and MWM/material formats from the
+  decompiled source and shipped shaders; wrote the [World message spec](#world-message-spec). Implemented
+  `CameraState`/`FrameConstants` (camera-relative, Vulkan Y flip, stock infinite reverse-Z projection),
+  `SceneActors`, `MwmLoader`/`ModelCache` (background parse via `MyModelImporter`, stock vertex decodes,
+  device-local buffers through `UploadQueue.UploadBuffer`), texture kinds, `ModelPass` + `Shaders/Scene/Model.slang`
+  (stock material channels/colorize, GGX sun, ambient floor), and cube-grid instancing (`InstanceBuffers`,
+  `MyCubeInstanceData` decode in the vertex shader). Verified by frame capture: main menu clean; empty world with
+  astronaut and armor blocks; a placed grid captured with 2 instance buffers / 18 instances and no errors. Fixed
+  a wrong skinned-model skip (MESH parts of models with blend arrays still render). Known visual gap: sun intensity
+  50 has no tonemap/eye adaptation yet, so lit faces clip and unlit faces use only the 0.02 ambient floor; IBL comes
+  with Phase 3. Added an explicit ambient floor (game probe `AmbientMinClamp` 0.02) and a placeholder ACES tonemap
+  with fixed exposure 0.03 in `CompositePass`; verified by capture (cockpit details and yellow accents read
+  correctly, HUD unaffected, log clean). Next: culling/LOD, then G-buffer/motion vectors.

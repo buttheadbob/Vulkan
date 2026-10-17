@@ -27,9 +27,18 @@ internal sealed unsafe class UploadQueue : IDisposable
         public GpuBuffer OwnedStaging;
     }
 
+    private sealed class PendingBufferUpload
+    {
+        public VkBuffer Source;
+        public GpuBuffer Destination;
+        public VkBufferCopy[] Regions;
+        public GpuBuffer OwnedStaging;
+    }
+
     private readonly GpuContext context;
     private readonly GpuBuffer[] rings = new GpuBuffer[FrameLoop.FramesInFlight];
     private readonly List<PendingImageUpload> pending = new();
+    private readonly List<PendingBufferUpload> pendingBuffers = new();
     private int slot;
     private ulong ringOffset;
     private bool frameOpen;
@@ -41,7 +50,7 @@ internal sealed unsafe class UploadQueue : IDisposable
             rings[i] = GpuBuffer.Create(context, RingSize, VkBufferUsageFlags.TransferSrc, hostVisible: true);
     }
 
-    public bool HasPending => pending.Count != 0;
+    public bool HasPending => pending.Count != 0 || pendingBuffers.Count != 0;
 
     // The ring of this slot is free again once its fence was waited on
     public void BeginFrame(int frameSlot)
@@ -51,33 +60,53 @@ internal sealed unsafe class UploadQueue : IDisposable
         frameOpen = true;
     }
 
-    // Queues the upload of every subresource of the image. Region buffer offsets are relative to the start of data.
-    // generateMips: the regions only cover mip level 0; the other levels are filled from it after the copy.
-    // The image ends up in ShaderReadOnlyOptimal layout.
-    public void UploadImage(GpuImage image, ReadOnlySpan<byte> data, VkBufferImageCopy[] regions, bool generateMips = false)
+    // Queues a buffer copy; the destination is visible to shaders after the next Record.
+    public void UploadBuffer(GpuBuffer destination, ReadOnlySpan<byte> data, ulong destinationOffset = 0)
     {
-        VkBuffer source;
-        ulong baseOffset;
-        GpuBuffer owned = null;
+        var (source, baseOffset, owned) = Stage(data);
 
+        pendingBuffers.Add(new PendingBufferUpload
+        {
+            Source = source,
+            Destination = destination,
+            Regions =
+            [
+                new VkBufferCopy
+                {
+                    srcOffset = baseOffset,
+                    dstOffset = destinationOffset,
+                    size = (ulong)data.Length,
+                },
+            ],
+            OwnedStaging = owned,
+        });
+    }
+
+    // Writes data into this frame's staging ring (or a one-off staging buffer when no frame is open or it is full)
+    private (VkBuffer Source, ulong BaseOffset, GpuBuffer Owned) Stage(ReadOnlySpan<byte> data)
+    {
         var size = (ulong)data.Length;
         var aligned = (ringOffset + Alignment - 1) / Alignment * Alignment;
         if (frameOpen && aligned + size <= RingSize)
         {
             var ring = rings[slot];
             data.CopyTo(new Span<byte>(ring.Mapped + aligned, data.Length));
-            source = ring.Handle;
-            baseOffset = aligned;
             ringOffset = aligned + size;
+            return (ring.Handle, aligned, null);
         }
-        else
-        {
-            // Outside a frame, or too large for what is left of the ring: a one-off staging buffer
-            owned = GpuBuffer.Create(context, size, VkBufferUsageFlags.TransferSrc, hostVisible: true);
-            data.CopyTo(new Span<byte>(owned.Mapped, data.Length));
-            source = owned.Handle;
-            baseOffset = 0;
-        }
+
+        // Outside a frame, or too large for what is left of the ring: a one-off staging buffer
+        var owned = GpuBuffer.Create(context, size, VkBufferUsageFlags.TransferSrc, hostVisible: true);
+        data.CopyTo(new Span<byte>(owned.Mapped, data.Length));
+        return (owned.Handle, 0, owned);
+    }
+
+    // Queues the upload of every subresource of the image. Region buffer offsets are relative to the start of data.
+    // generateMips: the regions only cover mip level 0; the other levels are filled from it after the copy.
+    // The image ends up in ShaderReadOnlyOptimal layout.
+    public void UploadImage(GpuImage image, ReadOnlySpan<byte> data, VkBufferImageCopy[] regions, bool generateMips = false)
+    {
+        var (source, baseOffset, owned) = Stage(data);
 
         var copies = new VkBufferImageCopy[regions.Length];
         for (var i = 0; i < regions.Length; i++)
@@ -100,10 +129,14 @@ internal sealed unsafe class UploadQueue : IDisposable
     public void Record(VkCommandBuffer commands)
     {
         frameOpen = false;
-        if (pending.Count == 0)
+        if (pending.Count == 0 && pendingBuffers.Count == 0)
             return;
 
         var api = context.Device.Api;
+        RecordBuffers(api, commands);
+        if (pending.Count == 0)
+            return;
+
         var barriers = new VkImageMemoryBarrier2[pending.Count];
 
         for (var i = 0; i < pending.Count; i++)
@@ -160,6 +193,54 @@ internal sealed unsafe class UploadQueue : IDisposable
         pending.Clear();
     }
 
+    // Copies vertex/index and other buffers, then makes them readable by every graphics stage
+    private void RecordBuffers(VkDeviceApi api, VkCommandBuffer commands)
+    {
+        if (pendingBuffers.Count == 0)
+            return;
+
+        foreach (var upload in pendingBuffers)
+        {
+            fixed (VkBufferCopy* regions = upload.Regions)
+                api.vkCmdCopyBuffer(commands, upload.Source, upload.Destination.Handle, (uint)upload.Regions.Length, regions);
+        }
+
+        var barriers = new VkBufferMemoryBarrier2[pendingBuffers.Count];
+        for (var i = 0; i < pendingBuffers.Count; i++)
+        {
+            barriers[i] = new VkBufferMemoryBarrier2
+            {
+                srcStageMask = VkPipelineStageFlags2.Copy,
+                srcAccessMask = VkAccessFlags2.TransferWrite,
+                dstStageMask = VkPipelineStageFlags2.AllGraphics,
+                dstAccessMask = VkAccessFlags2.ShaderRead
+                               | VkAccessFlags2.VertexAttributeRead
+                               | VkAccessFlags2.IndexRead
+                               | VkAccessFlags2.UniformRead,
+                srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                buffer = pendingBuffers[i].Destination.Handle,
+                offset = 0,
+                size = VK_WHOLE_SIZE,
+            };
+        }
+
+        fixed (VkBufferMemoryBarrier2* p = barriers)
+        {
+            var dependency = new VkDependencyInfo
+            {
+                bufferMemoryBarrierCount = (uint)barriers.Length,
+                pBufferMemoryBarriers = p,
+            };
+            api.vkCmdPipelineBarrier2(commands, &dependency);
+        }
+
+        foreach (var upload in pendingBuffers)
+            upload.OwnedStaging?.Dispose();
+
+        pendingBuffers.Clear();
+    }
+
     private static void PipelineBarrier(VkDeviceApi api, VkCommandBuffer commands, VkImageMemoryBarrier2[] barriers)
     {
         fixed (VkImageMemoryBarrier2* p = barriers)
@@ -180,5 +261,8 @@ internal sealed unsafe class UploadQueue : IDisposable
         foreach (var upload in pending)
             upload.OwnedStaging?.Dispose();
         pending.Clear();
+        foreach (var upload in pendingBuffers)
+            upload.OwnedStaging?.Dispose();
+        pendingBuffers.Clear();
     }
 }

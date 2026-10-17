@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using ClientPlugin.Render.Models;
 using ClientPlugin.Render.Platform;
 using ClientPlugin.Render.Scene;
 using ClientPlugin.Render.Sprites;
@@ -40,6 +42,17 @@ public sealed class VulkanRender : IMyRender
     private SceneTargets sceneTargets;
     private CompositePass composite;
     private VkFormat compositeFormat;
+    private ModelCache models;
+    private InstanceBuffers instanceBuffers;
+    private ModelPass modelPass;
+
+    private readonly CameraState camera = new();
+    private readonly SceneActors actors = new();
+    private MyEnvironmentData environment;
+    private bool hasEnvironment;
+    private int sceneFrameCounter;
+    private int lastDrawnActors;
+    private readonly HashSet<MyRenderMessageEnum> reported = new();
 
     // Set by the DrawScene message of the frame being drawn (MyRender11.m_drawScene): without it only the GUI is shown
     private bool drawScene;
@@ -117,6 +130,9 @@ public sealed class VulkanRender : IMyRender
 
             gpu = new GpuContext(instance, device);
             textures = new TextureCache(gpu);
+            models = new ModelCache(gpu, textures);
+            instanceBuffers = new InstanceBuffers(gpu);
+            modelPass = new ModelPass(gpu, models, instanceBuffers);
             gui = new GuiRenderer(gpu, textures, () => messages.FrameId);
             capture = FrameCapture.FromEnvironment(gpu);
             sceneTargets = new SceneTargets(gpu);
@@ -169,6 +185,16 @@ public sealed class VulkanRender : IMyRender
         sceneTargets?.Dispose();
         sceneTargets = null;
 
+        modelPass?.Dispose();
+        modelPass = null;
+
+        instanceBuffers?.Dispose();
+        instanceBuffers = null;
+
+        models?.Dispose();
+        models = null;
+
+        actors.Clear();
         textures?.Dispose();
         textures = null;
 
@@ -278,6 +304,7 @@ public sealed class VulkanRender : IMyRender
             return;
 
         textures.ProcessDecoded();
+        models.ProcessReady();
 
         var commands = frameLoop.Commands;
         gpu.Uploads.Record(commands);
@@ -329,8 +356,15 @@ public sealed class VulkanRender : IMyRender
         };
 
         api.vkCmdBeginRendering(commands, &renderingInfo);
-        // Geometry passes go here (Phase 2)
+        lastDrawnActors = camera.HasValue && hasEnvironment
+            ? modelPass.Record(commands, sceneTargets, camera, environment, actors)
+            : 0;
         api.vkCmdEndRendering(commands);
+
+        if (++sceneFrameCounter % 300 == 0)
+            RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced), {lastDrawnActors} draws, " +
+                           $"instance buffers {instanceBuffers.Count} ({instanceBuffers.TotalInstances} instances), " +
+                           $"camera {camera.HasValue}, environment {hasEnvironment}");
 
         frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
             VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal,
@@ -462,6 +496,108 @@ public sealed class VulkanRender : IMyRender
                 drawScene = true;
                 break;
 
+            case MyRenderMessageEnum.SetCameraViewMatrix:
+            {
+                var m = (MyRenderMessageSetCameraViewMatrix)message;
+                if (!camera.HasValue)
+                    RenderLog.Info($"Camera: FOV {m.FOV}, near {m.NearPlane}, far {m.FarPlane}, position {m.CameraPosition}");
+                camera.Set(m, BackBufferResolution);
+                break;
+            }
+
+            case MyRenderMessageEnum.UpdateRenderEnvironment:
+            {
+                var data = ((MyRenderMessageUpdateRenderEnvironment)message).Data;
+                if (!hasEnvironment)
+                    RenderLog.Info($"Environment: sun direction {data.EnvironmentLight.SunLightDirection}, " +
+                                   $"color {data.EnvironmentLight.SunColorRaw}, diffuse {data.EnvironmentLight.SunDiffuseFactor}, " +
+                                   $"ambient diffuse {data.EnvironmentLight.AmbientDiffuseFactor}, forward {data.EnvironmentLight.AmbientForwardPass}, " +
+                                   $"skybox '{data.Skybox}'");
+                environment = data;
+                hasEnvironment = true;
+                break;
+            }
+
+            case MyRenderMessageEnum.CreateRenderEntity:
+            {
+                var m = (MyRenderMessageCreateRenderEntity)message;
+                actors.Create(m);
+                models?.StartLoading(m.Model);
+                break;
+            }
+
+            case MyRenderMessageEnum.CreateRenderCharacter:
+            {
+                var m = (MyRenderMessageCreateRenderCharacter)message;
+                actors.CreateCharacter(m);
+                models?.StartLoading(m.Model);
+                break;
+            }
+
+            case MyRenderMessageEnum.CreateStaticGroup:
+            {
+                var m = (MyRenderMessageCreateStaticGroup)message;
+                actors.CreateStaticGroup(m);
+                models?.StartLoading(m.Model);
+                break;
+            }
+
+            case MyRenderMessageEnum.UpdateRenderObject:
+                actors.Update((MyRenderMessageUpdateRenderObject)message);
+                break;
+
+            case MyRenderMessageEnum.UpdateRenderObjectVisibility:
+            {
+                var m = (MyRenderMessageUpdateRenderObjectVisibility)message;
+                actors.SetVisible(m.ID, m.Visible, m.NearFlag);
+                break;
+            }
+
+            case MyRenderMessageEnum.UpdateRenderEntity:
+                actors.UpdateEntity((MyRenderMessageUpdateRenderEntity)message);
+                break;
+
+            case MyRenderMessageEnum.UpdateModelProperties:
+                actors.SetModelProperties((MyRenderMessageUpdateModelProperties)message);
+                break;
+
+            case MyRenderMessageEnum.UpdateColorEmissivity:
+                actors.SetColorEmissivity((MyRenderMessageUpdateColorEmissivity)message);
+                break;
+
+            case MyRenderMessageEnum.ChangeModel:
+            {
+                var m = (MyRenderMessageChangeModel)message;
+                actors.ChangeModel(m);
+                models?.StartLoading(m.Model);
+                break;
+            }
+
+            case MyRenderMessageEnum.CreateRenderInstanceBuffer:
+                instanceBuffers.Create((MyRenderMessageCreateRenderInstanceBuffer)message);
+                break;
+
+            case MyRenderMessageEnum.UpdateRenderCubeInstanceBuffer:
+                instanceBuffers.UpdateCube((MyRenderMessageUpdateRenderCubeInstanceBuffer)message);
+                break;
+
+            case MyRenderMessageEnum.UpdateRenderInstanceBufferRange:
+                instanceBuffers.UpdateGeneric((MyRenderMessageUpdateRenderInstanceBufferRange)message);
+                break;
+
+            case MyRenderMessageEnum.SetInstanceBuffer:
+                actors.SetInstanceBuffer((MyRenderMessageSetInstanceBuffer)message);
+                break;
+
+            // Not implemented yet; report each kind once so the log shows what a world still needs.
+            case MyRenderMessageEnum.CreateManualCullObject:
+            case MyRenderMessageEnum.SetParentCullObject:
+            case MyRenderMessageEnum.VoxelCreate:
+            case MyRenderMessageEnum.CreateRenderVoxelMaterials:
+            case MyRenderMessageEnum.UpdateRenderVoxelMaterials:
+                ReportOnce(message.MessageType);
+                break;
+
             case MyRenderMessageEnum.CollectGarbage:
                 MyVRage.Platform.System.CollectGC();
                 break;
@@ -470,6 +606,8 @@ public sealed class VulkanRender : IMyRender
             case MyRenderMessageEnum.RemoveRenderObject:
             {
                 var id = ((MyRenderMessageRemoveRenderObject)message).ID;
+                actors.Remove(id);
+                instanceBuffers.Remove(id);
                 var type = MyRenderProxy.GetObjectType(id);
                 if (type != MyRenderProxy.ObjectType.Invalid)
                     MyRenderProxy.RemoveMessageId(id, type);
@@ -483,6 +621,12 @@ public sealed class VulkanRender : IMyRender
             // Everything else is not implemented yet. Ignoring is safe: the message is
             // disposed by MessageQueueProcessor once its frame is done.
         }
+    }
+
+    private void ReportOnce(MyRenderMessageEnum type)
+    {
+        if (reported.Add(type))
+            RenderLog.Info($"Message {type} is not implemented yet, ignoring it");
     }
 
     #endregion

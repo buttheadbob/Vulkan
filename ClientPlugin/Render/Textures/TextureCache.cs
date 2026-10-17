@@ -24,9 +24,22 @@ internal sealed class TextureCache : IDisposable
         Failed,
     }
 
+    // How the stock renderer treats the texture: GUI textures are sRGB and premultiplied on load,
+    // model ColorMetal/Extensions are sRGB, normal maps and alphamasks stay linear (MyFileTexture).
+    public enum TextureKind
+    {
+        Gui,
+        ColorMetal,
+        NormalGloss,
+        Extensions,
+        Alphamask,
+    }
+
     public sealed class Entry
     {
         public readonly string Name;
+        public readonly string Path;
+        public readonly TextureKind Kind;
         public volatile State Status = State.Loading;
         public uint Slot;
         public GpuImage Image;
@@ -38,9 +51,11 @@ internal sealed class TextureCache : IDisposable
         public bool IsGenerated;
         public volatile bool GeneratedReady;
 
-        public Entry(string name)
+        public Entry(string name, string path = null, TextureKind kind = TextureKind.Gui)
         {
             Name = name;
+            Path = path ?? name;
+            Kind = kind;
         }
     }
 
@@ -55,12 +70,14 @@ internal sealed class TextureCache : IDisposable
     }
 
     // Render thread. Starts loading on first use. waitTillLoaded makes the texture usable in this frame.
-    public Entry Get(string name, bool waitTillLoaded)
+    // Non-GUI kinds get their own entry, because the same file may be sampled with different color rules.
+    public Entry Get(string name, bool waitTillLoaded, TextureKind kind = TextureKind.Gui)
     {
         if (string.IsNullOrEmpty(name))
             return null;
 
-        var entry = entries.GetOrAdd(name, static n => new Entry(n));
+        var key = kind == TextureKind.Gui ? name : $"{(int)kind}:{name}";
+        var entry = entries.GetOrAdd(key, _ => new Entry(key, name, kind));
         if (Interlocked.Exchange(ref entry.LoadStarted, 1) == 0)
         {
             if (waitTillLoaded)
@@ -235,18 +252,18 @@ internal sealed class TextureCache : IDisposable
         try
         {
             byte[] file;
-            using (var stream = MyFileSystem.OpenRead(ResolvePath(entry.Name)))
+            using (var stream = MyFileSystem.OpenRead(ResolvePath(entry.Path)))
             {
                 if (stream == null)
-                    throw new FileNotFoundException("Texture not found", entry.Name);
+                    throw new FileNotFoundException("Texture not found", entry.Path);
 
                 using var memory = new MemoryStream();
                 stream.CopyTo(memory);
                 file = memory.ToArray();
             }
 
-            var data = IsDds(file) ? DdsLoader.Load(file, entry.Name) : LoadImage(file);
-            PrepareForGui(data);
+            var data = IsDds(file) ? DdsLoader.Load(file, entry.Path) : LoadImage(file);
+            PrepareForKind(data, entry.Kind);
 
             entry.Pending = data;
             entry.Size = new Vector2I((int)data.Width, (int)data.Height);
@@ -255,7 +272,7 @@ internal sealed class TextureCache : IDisposable
         }
         catch (Exception e)
         {
-            RenderLog.Warning($"Failed to load texture {entry.Name}: {e.Message}");
+            RenderLog.Warning($"Failed to load texture {entry.Path}: {e.Message}");
             entry.Status = State.Failed;
         }
     }
@@ -283,14 +300,27 @@ internal sealed class TextureCache : IDisposable
         }
     }
 
-    // Matches the stock renderer for GUI textures: sampled as sRGB, uncompressed RGBA premultiplied on load
-    // (block compressed GUI textures are authored with premultiplied alpha)
-    private static void PrepareForGui(TextureData data)
+    private static void PrepareForKind(TextureData data, TextureKind kind)
     {
-        var raw = data.IsRawRgba;
-        data.Format = DdsLoader.MakeSrgb(data.Format);
-        if (raw)
-            PremultiplyAlpha(data.Data);
+        switch (kind)
+        {
+            case TextureKind.Gui:
+                // Stock GUI textures: sRGB, uncompressed RGBA premultiplied on load
+                // (block compressed GUI textures are authored with premultiplied alpha)
+                var raw = data.IsRawRgba;
+                data.Format = DdsLoader.MakeSrgb(data.Format);
+                if (raw)
+                    PremultiplyAlpha(data.Data);
+                break;
+
+            case TextureKind.ColorMetal:
+            case TextureKind.Extensions:
+                // Stock MyGlobalResources: ColorMetal and Extension textures are BC7/BC3 sRGB
+                data.Format = DdsLoader.MakeSrgb(data.Format);
+                break;
+
+            // NormalGloss and Alphamask are linear (MyGlobalResources: BC7_UNorm, R8_UNorm)
+        }
     }
 
     // Premultiplies in gamma space like MyFileTexture.PremultiplyAlpha: c' = (c^2.2 * a)^(1/2.2)

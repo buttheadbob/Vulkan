@@ -9,10 +9,15 @@ namespace ClientPlugin.Render.Scene;
 // Draws the HDR scene color onto the backbuffer (inside the backbuffer's rendering pass)
 internal sealed unsafe class CompositePass : IDisposable
 {
+    // Placeholder exposure until eye adaptation (Phase 5). The game's sun intensity is ~50, so an unmodified
+    // HDR scene would clip everything lit to white.
+    private const float DefaultExposure = 0.03f;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct PushConstants
     {
         public uint SceneTexture;
+        public float Exposure;
     }
 
     private readonly GpuContext context;
@@ -41,7 +46,7 @@ internal sealed unsafe class CompositePass : IDisposable
         api.vkCmdSetViewport(commands, 0, 1, &viewport);
         api.vkCmdSetScissor(commands, 0, 1, &scissor);
 
-        var push = new PushConstants { SceneTexture = targets.ColorSlot };
+        var push = new PushConstants { SceneTexture = targets.ColorSlot, Exposure = DefaultExposure };
         api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All, 0, (uint)sizeof(PushConstants), &push);
         api.vkCmdDraw(commands, 3, 1, 0, 0);
     }
