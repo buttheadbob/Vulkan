@@ -15,8 +15,6 @@ struct PushConstants
     float luminanceExposure;
     float minLogBrightness;
     float maxLogBrightness;
-    float exposureScale;
-    uint pad1;
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> push;
@@ -79,6 +77,6 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     // key value. Do not scale it down: the LDR scene is calibrated in the same linear units as the
     // shipped shaders (BloomEmissiveness 120, WhitePoint 11.2), so a second calibration darkens the
     // whole world and makes emissive LCD/indicator content look like unlit paint.
-    float exposure = clamp(exp2(logExposure) * push.exposureScale, 0.02f, 4.0f);
+    float exposure = clamp(exp2(logExposure) * renderSettings[0].post.x, 0.02f, 4.0f);
     return float4(exposure, 0.0f, 0.0f, 1.0f);
 }

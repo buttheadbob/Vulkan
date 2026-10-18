@@ -57,11 +57,6 @@ internal struct FrameConstants
     // brighter than 1 (the test world uses 120)
     public float EmissiveScale;
     public uint Pad3;
-
-    // x: sun, y: ambient, z: direct specular, w: metalness scale
-    public Vector4 Tuning0;
-    // x: emissive, y: dynamic lights, z: IBL reflection, w: generated screen
-    public Vector4 Tuning1;
 }
 
 // Camera from MyRenderMessageSetCameraViewMatrix, plus the stock projection and camera-relative setup.
@@ -202,10 +197,6 @@ internal sealed class CameraState
             SkyboxCube = skyboxCube,
             IblCube = iblCube,
             BrdfLut = brdfLut,
-            Tuning0 = new Vector4(Config.Current.SunScale, Config.Current.AmbientScale,
-                Config.Current.SpecularScale, Config.Current.MetalnessScale),
-            Tuning1 = new Vector4(Config.Current.EmissiveScale, Config.Current.LightScale,
-                Config.Current.ReflectionScale, Config.Current.ScreenScale),
         };
     }
 }

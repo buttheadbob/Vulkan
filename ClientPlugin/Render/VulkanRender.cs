@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using ClientPlugin.Render.Models;
 using ClientPlugin.Render.Platform;
 using ClientPlugin.Render.Scene;
@@ -47,6 +49,8 @@ public sealed class VulkanRender : IMyRender
     private SkyboxPass skyboxPass;
     private CompositePass composite;
     private VkFormat compositeFormat;
+    private GpuBuffer renderSettingsBuffer;
+    private int renderSettingsDirty;
     private string environmentStatus = "";
     private bool reportedCharacterTransforms;
     private ModelCache models;
@@ -145,6 +149,11 @@ public sealed class VulkanRender : IMyRender
             frameLoop = new FrameLoop(device, swapchain);
 
             gpu = new GpuContext(instance, device);
+            renderSettingsBuffer = GpuBuffer.Create(gpu, (ulong)GpuRenderSettings.Size,
+                VkBufferUsageFlags.StorageBuffer, hostVisible: true);
+            gpu.Bindless.SetSettingsBuffer(renderSettingsBuffer);
+            UploadRenderSettings();
+            Config.Current.PropertyChanged += OnConfigChanged;
             textures = new TextureCache(gpu);
             models = new ModelCache(gpu, textures);
             instanceBuffers = new InstanceBuffers(gpu);
@@ -190,7 +199,11 @@ public sealed class VulkanRender : IMyRender
 
     public void DisposeDevice()
     {
+        Config.Current.PropertyChanged -= OnConfigChanged;
         device?.WaitIdle();
+
+        renderSettingsBuffer?.Dispose();
+        renderSettingsBuffer = null;
 
         gui?.Dispose();
         gui = null;
@@ -374,6 +387,11 @@ public sealed class VulkanRender : IMyRender
         textures.ProcessDecoded();
         models.ProcessReady();
         ApplyDebugCamera();
+
+        // Slider changes only mark a flag; the GPU buffer is refreshed on the render thread and the
+        // shaders read it directly. No per-frame Config reads or tuning uploads.
+        if (Interlocked.Exchange(ref renderSettingsDirty, 0) != 0)
+            UploadRenderSettings();
 
         var commands = frameLoop.Commands;
         gpu.Uploads.Record(commands);
@@ -560,6 +578,28 @@ public sealed class VulkanRender : IMyRender
             VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
     }
 
+    private void OnConfigChanged(object sender, PropertyChangedEventArgs e)
+    {
+        if (renderSettingsBuffer != null)
+            Interlocked.Exchange(ref renderSettingsDirty, 1);
+    }
+
+    private unsafe void UploadRenderSettings()
+    {
+        if (renderSettingsBuffer == null)
+            return;
+
+        var settings = new GpuRenderSettings
+        {
+            Tuning0 = new Vector4(Config.Current.SunScale, Config.Current.AmbientScale,
+                Config.Current.SpecularScale, Config.Current.MetalnessScale),
+            Tuning1 = new Vector4(Config.Current.EmissiveScale, Config.Current.LightScale,
+                Config.Current.ReflectionScale, Config.Current.ScreenScale),
+            Post = new Vector4(Config.Current.ExposureScale, Config.Current.BloomScale, 0f, 0f),
+        };
+        *(GpuRenderSettings*)renderSettingsBuffer.Mapped = settings;
+    }
+
     // Resolves the environment cubemaps and writes this frame's constants. The indirect (prefiltered)
     // skybox is the IBL source; until it is ready the direct skybox's mips are used as a fallback.
     private ulong PrepareFrameConstants(MyEnvironmentData environment)
@@ -672,7 +712,7 @@ public sealed class VulkanRender : IMyRender
             }
 
             composite.Record(commands, sceneTargets, extent, exposurePass.Slot, bloomPass.Slot,
-                Config.Current.BloomScale, postprocessSettings.Data.WhitePoint);
+                postprocessSettings.Data.WhitePoint);
         }
 
         gui.RecordMain(commands, swapchain.Format, BackBufferResolution, extent);

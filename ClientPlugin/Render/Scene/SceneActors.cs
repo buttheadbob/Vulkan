@@ -373,6 +373,7 @@ internal sealed class SceneActors
         actor.InstanceStart = message.InstanceStart;
         actor.InstanceCount = message.InstanceCount;
         actor.LocalAabb = message.LocalAabb;
+        revision++;
     }
 
     // ChangeMaterialTexture: merge per-material texture replacements; Changes == null clears them

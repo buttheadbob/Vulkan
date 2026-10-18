@@ -320,7 +320,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
     float metalness = (flags & uint(MaterialFlags.Screen)) != 0
         ? 0.0
-        : saturate(cm.w * push.frame.tuning0.w);
+        : saturate(cm.w * renderSettings[0].tuning0.w);
     float coloring = extras.w;
     if ((flags & uint(MaterialFlags.MetalnessColorable)) == 0)
     {
@@ -352,7 +352,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
     float3 toCamera = normalize(-input.worldPosition);
     float3 toSun = -normalize(push.frame.sunDirection.xyz);
-    float3 sunColor = push.frame.sunColor.rgb * push.frame.sunDirection.w * push.frame.tuning0.x;
+    float3 sunColor = push.frame.sunColor.rgb * push.frame.sunDirection.w * renderSettings[0].tuning0.x;
 
     float nol = saturate(dot(n, toSun));
     float3 halfVector = normalize(toSun + toCamera);
@@ -369,7 +369,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     // Stock forward shading (LightingModel.hlsli MainDirectionalLightEnv) is Lambert only; metalness
     // belongs to the PBR/GBuffer path and must not darken forward albedo.
     float3 diffuse = baseColor * (nol / PI);
-    float3 direct = (diffuse + fresnel * specular * nol * push.frame.tuning0.z) * sunColor;
+    float3 direct = (diffuse + fresnel * specular * nol * renderSettings[0].tuning0.z) * sunColor;
 
     // Dynamic point/spot lights. The game's light component already multiplies intensity into the
     // linear color; falloff is the converted polynomial from MyLightComponent.
@@ -412,7 +412,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
                                   visibilitySmithGGX(nov, nolLight, alpha);
             float3 fresnelLight = fresnelSchlick(f0, vohLight);
 
-            float3 lightColor = light.colorFalloff.rgb * attenuationHard * attenuationDiffuse * push.frame.tuning1.y;
+            float3 lightColor = light.colorFalloff.rgb * attenuationHard * attenuationDiffuse * renderSettings[0].tuning1.y;
             float3 lightDiffuse = baseColor * (nolLight / PI) * light.params.y * lightColor;
             float3 lightSpecular = fresnelLight * specularLight * nolLight *
                                    light.params.x * lightColor;
@@ -423,16 +423,16 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     // Stock: shaded += albedo * emissive * BloomEmissiveness. LCD screen materials use the
     // ScreenArea_add/CockpitScreen_add emissive channel, so the display does not depend on scene
     // lighting. The Screen flag also forces metalness 0 (generated targets have opaque alpha).
-    float screenScale = (flags & uint(MaterialFlags.Screen)) != 0 ? push.frame.tuning1.w : 1.0;
+    float screenScale = (flags & uint(MaterialFlags.Screen)) != 0 ? renderSettings[0].tuning1.w : 1.0;
     float3 emissiveColor = baseColor * (1.0 - metalness) * emissive * push.frame.emissiveScale *
-                           push.frame.tuning1.x * screenScale;
+                           renderSettings[0].tuning1.x * screenScale;
 
     // Stock forward ambient is the game's AmbientForwardPass floor (0.01 + probe clamp), not the
     // full skybox irradiance. Using the nebula cubemap as ambient washed every albedo out to white.
     float3 ambient = baseColor * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
-                     push.frame.tuning0.y * ao;
+                     renderSettings[0].tuning0.y * ao;
     float3 ambientSpecular = 0;
-    if (push.frame.iblCube != 0 && push.frame.tuning1.z > 0.0)
+    if (push.frame.iblCube != 0 && renderSettings[0].tuning1.z > 0.0)
     {
         float maxIblMip = max(push.frame.skyboxParams.y - 1.0, 0.0);
         float3 reflection = reflect(-toCamera, n);
@@ -440,7 +440,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         float2 brdf = sampleTexture(push.frame.brdfLut, SamplerSlot.LinearClamp,
                                     float2(gloss, nov)).rg;
         ambientSpecular = prefiltered * (f0 * brdf.x + brdf.y) * push.frame.skyboxParams.w * ao *
-                          push.frame.tuning1.z;
+                          renderSettings[0].tuning1.z;
     }
     return float4(direct + ambient + ambientSpecular + emissiveColor, 1.0);
 }

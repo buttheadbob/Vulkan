@@ -23,8 +23,6 @@ internal sealed unsafe class ExposurePass : IDisposable
         public float LuminanceExposure;
         public float MinLogBrightness;
         public float MaxLogBrightness;
-        public float ExposureScale;
-        public uint Pad1;
     }
 
     private readonly GpuContext context;
@@ -102,7 +100,6 @@ internal sealed unsafe class ExposurePass : IDisposable
             LuminanceExposure = data.LuminanceExposure,
             MinLogBrightness = settings.MinEyeAdaptationLogBrightness,
             MaxLogBrightness = settings.MaxEyeAdaptationLogBrightness,
-            ExposureScale = Config.Current.ExposureScale,
         };
         api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
             0, (uint)sizeof(PushConstants), &push);

@@ -50,9 +50,7 @@ public struct FrameConstants
     public float emissiveScale;    // MyPostprocessSettings.Data.BloomEmissiveness
     public uint pad3;
 
-    // Debug/user tuning from the plugin settings (1 = stock-derived defaults)
-    public float4 tuning0;         // x: sun, y: ambient, z: direct specular, w: metalness
-    public float4 tuning1;         // x: emissive, y: dynamic lights, z: IBL reflection, w: screen
+    // User tuning lives in the persistent GPU settings buffer (Bindless.renderSettings).
 };
 
 // Lighting/EnvAmbient.hlsli ApplySkyboxOrientation (row-vector, transposed rows here)

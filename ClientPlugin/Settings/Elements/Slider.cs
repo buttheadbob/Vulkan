@@ -1,8 +1,14 @@
 ﻿using Sandbox;
+using Sandbox.Graphics;
 using Sandbox.Graphics.GUI;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Reflection;
+using System.Text;
+using VRage.Game;
 using VRage.Utils;
+using VRageMath;
 
 namespace ClientPlugin.Settings.Elements;
 
@@ -53,6 +59,8 @@ internal class SliderAttribute : Attribute, IElement
     public List<Control> GetControls(string name, Func<object> propertyGetter, Action<object> propertySetter)
     {
         var valueLabel = new MyGuiControlLabel();
+        var defaultValue = GetDefaultValue(name);
+        var defaultFloat = Convert.ToSingle(defaultValue, CultureInfo.InvariantCulture);
 
         void ValueUpdate(MyGuiControlSlider element)
         {
@@ -91,7 +99,9 @@ internal class SliderAttribute : Attribute, IElement
 
         if (Type == SliderType.Float)
         {
-            slider.LabelDecimalPlaces = (int)Math.Max(1, Math.Ceiling(-Math.Log10(2f * Step)));
+            // Four decimals so small slider movements are visible; the old one-decimal display
+            // rounded 0.01/0.05 steps to the same text.
+            slider.LabelDecimalPlaces = 4;
         }
 
         slider.ValueChanged += ValueUpdate;
@@ -100,12 +110,41 @@ internal class SliderAttribute : Attribute, IElement
         ValueUpdate(slider);
 
         var label = Tools.Tools.GetLabelOrDefault(name, Label);
+        var resetText = new StringBuilder("Reset");
+        var reset = new MyGuiControlButton(
+            size: new Vector2(0.06f, 0.04f),
+            visualStyle: MyGuiControlButtonStyleEnum.RectangularBorderLess,
+            text: resetText,
+            toolTip: $"Reset {label} to its default ({defaultFloat.ToString("0.####", CultureInfo.InvariantCulture)})",
+            textAlignment: MyGuiDrawAlignEnum.HORISONTAL_CENTER_AND_VERTICAL_CENTER);
+        // Size the button to its text, not the much wider default button style. RectangularBorderLess
+        // has a tiny background texture, so its minimum width does not override this size.
+        var resetTextWidth = MyGuiManager.MeasureString(reset.TextFont, resetText, reset.TextScaleWithLanguage).X;
+        var resetWidth = Math.Max(0.05f, resetTextWidth + 0.012f);
+        reset.Size = new Vector2(resetWidth, 0.04f);
+        reset.ButtonClicked += _ =>
+        {
+            propertySetter(defaultValue);
+            slider.Value = defaultFloat;
+            ValueUpdate(slider);
+        };
+
         return new List<Control>()
         {
             new Control(new MyGuiControlLabel(text: label), minWidth: Control.LabelMinWidth),
             new Control(slider, fillFactor: 1f, rightMargin: 0.005f),
             new Control(valueLabel, minWidth: 0.06f),
+            new Control(reset, fixedWidth: resetWidth, rightMargin: 0.005f),
         };
+    }
+
+    private static object GetDefaultValue(string name)
+    {
+        var property = typeof(Config).GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+        if (property == null)
+            throw new InvalidOperationException($"No Config property named {name}");
+
+        return property.GetValue(Config.Default);
     }
 
     public List<Type> SupportedTypes { get; } = new List<Type>()

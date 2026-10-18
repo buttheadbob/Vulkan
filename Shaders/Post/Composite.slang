@@ -9,7 +9,6 @@ struct PushConstants
     uint oitReveal;         // Bindless slot of the OIT revealage target
     uint exposureTexture;   // Bindless slot of the 1x1 auto-exposure target
     uint bloomTexture;      // Bindless slot of the blurred HDR bloom target
-    float bloomStrength;    // plugin setting: 0 disables bloom
     float whitePoint;       // Hable tonemapping white point
 };
 
@@ -75,7 +74,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     color = color * (1.0 - oitAlpha) + oitColor * oitAlpha;
 
     float3 bloom = sampleTexture(push.bloomTexture, SamplerSlot.LinearClamp, input.uv).rgb;
-    color += bloom * push.bloomStrength;
+    color += bloom * renderSettings[0].post.y;
 
     float exposure = sampleTexture(push.exposureTexture, SamplerSlot.PointClamp, float2(0.5, 0.5)).r;
     return float4(saturate(hable(color * exposure, push.whitePoint)), 1);

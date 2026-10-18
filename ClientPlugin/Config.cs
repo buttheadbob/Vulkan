@@ -29,7 +29,7 @@ public class Config : INotifyPropertyChanged
     private float emissiveScale = 1f;
     private float screenScale = 4f;
     private float lightScale = 1f;
-    private float bloomScale = 1f;
+    private float bloomScale = 0.2f;
 
     #endregion
 

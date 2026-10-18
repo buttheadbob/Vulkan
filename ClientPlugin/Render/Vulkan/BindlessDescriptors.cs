@@ -102,7 +102,7 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
 
         fixed (VkSampler* immutableSamplers = samplers)
         {
-            var bindings = stackalloc VkDescriptorSetLayoutBinding[3];
+            var bindings = stackalloc VkDescriptorSetLayoutBinding[4];
             bindings[0] = new VkDescriptorSetLayoutBinding
             {
                 binding = 0,
@@ -125,24 +125,32 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
                 descriptorCount = MaxCubes,
                 stageFlags = VkShaderStageFlags.All,
             };
+            bindings[3] = new VkDescriptorSetLayoutBinding
+            {
+                binding = 3,
+                descriptorType = VkDescriptorType.StorageBuffer,
+                descriptorCount = 1,
+                stageFlags = VkShaderStageFlags.All,
+            };
 
-            var bindingFlags = stackalloc VkDescriptorBindingFlags[3];
+            var bindingFlags = stackalloc VkDescriptorBindingFlags[4];
             bindingFlags[0] = VkDescriptorBindingFlags.PartiallyBound
                               | VkDescriptorBindingFlags.UpdateAfterBind
                               | VkDescriptorBindingFlags.UpdateUnusedWhilePending;
             bindingFlags[1] = VkDescriptorBindingFlags.None;
             bindingFlags[2] = bindingFlags[0];
+            bindingFlags[3] = VkDescriptorBindingFlags.None;
 
             var flagsInfo = new VkDescriptorSetLayoutBindingFlagsCreateInfo
             {
-                bindingCount = 3,
+                bindingCount = 4,
                 pBindingFlags = bindingFlags,
             };
             var layoutInfo = new VkDescriptorSetLayoutCreateInfo
             {
                 pNext = &flagsInfo,
                 flags = VkDescriptorSetLayoutCreateFlags.UpdateAfterBindPool,
-                bindingCount = 3,
+                bindingCount = 4,
                 pBindings = bindings,
             };
 
@@ -175,15 +183,16 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
     {
         var api = context.Device.Api;
 
-        var poolSizes = stackalloc VkDescriptorPoolSize[2];
+        var poolSizes = stackalloc VkDescriptorPoolSize[3];
         poolSizes[0] = new VkDescriptorPoolSize { type = VkDescriptorType.SampledImage, descriptorCount = MaxTextures + MaxCubes };
         poolSizes[1] = new VkDescriptorPoolSize { type = VkDescriptorType.Sampler, descriptorCount = (uint)samplers.Length };
+        poolSizes[2] = new VkDescriptorPoolSize { type = VkDescriptorType.StorageBuffer, descriptorCount = 1 };
 
         var poolInfo = new VkDescriptorPoolCreateInfo
         {
             flags = VkDescriptorPoolCreateFlags.UpdateAfterBind,
             maxSets = 1,
-            poolSizeCount = 2,
+            poolSizeCount = 3,
             pPoolSizes = poolSizes,
         };
 
@@ -339,6 +348,26 @@ internal sealed unsafe class BindlessDescriptors : IDisposable
             descriptorCount = 1,
             descriptorType = VkDescriptorType.SampledImage,
             pImageInfo = &imageInfo,
+        };
+        context.Device.Api.vkUpdateDescriptorSets(1, &write, 0, null);
+    }
+
+    // Persistent user settings buffer (binding 3). Written directly by the CPU only when Config changes.
+    public void SetSettingsBuffer(GpuBuffer buffer)
+    {
+        var info = new VkDescriptorBufferInfo
+        {
+            buffer = buffer.Handle,
+            offset = 0,
+            range = ulong.MaxValue,
+        };
+        var write = new VkWriteDescriptorSet
+        {
+            dstSet = Set,
+            dstBinding = 3,
+            descriptorCount = 1,
+            descriptorType = VkDescriptorType.StorageBuffer,
+            pBufferInfo = &info,
         };
         context.Device.Api.vkUpdateDescriptorSets(1, &write, 0, null);
     }

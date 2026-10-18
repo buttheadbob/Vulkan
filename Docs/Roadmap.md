@@ -55,7 +55,7 @@ factors. `AddRuntimeModel` (mod runtime meshes, material lookup by name, replace
 adaptation formula from the shipped `CalculateExposure`, a sparse scene-luminance pass into a 1x1 exposure texture,
 Hable tonemapping with the world's white point, and world `BloomEmissiveness` (120 in the test world) multiplying
 emissive radiance, so battery/LED indicators stay bright in shadow. The test world's eye adaptation is enabled; a
-user `ExposureScale` multiplier remains until full histogram adaptation and bloom are implemented. **LCD apps are fixed and verified**: the Linux platform's
+user `ExposureScale` multiplier remains until full histogram adaptation and stock multi-scale bloom are implemented. **LCD apps are fixed and verified**: the Linux platform's
 `GetMemoryBudgetForGeneratedTextures()` reports 0, so `MySessionComponentPanels` never counted any panel as visible
 and every working screen stayed on the Online texture. A Harmony patch sets the session component's budget to
 1 GiB; the game then creates the generated textures, renders sprites/text offscreen, and swaps `ScreenArea` to them
@@ -64,9 +64,10 @@ retry while a generated target is still being created. The persistent opaque par
 place; skinned actors and transparent parts keep the direct/OIT paths, and the per-frame actor state is still
 uploaded from the CPU. **Automated tests** now work via
 `VULKAN_AUTOLOAD=<seconds>`; `VULKAN_DEBUG_LOOKAT=<model substring>` (+ `VULKAN_DEBUG_DARK=1`) frames the first
-matching actor for visual checks. Still missing by design: dynamic scene probe (the hard sun terminator on the dark
-side stays dark until it exists), shadows, and bloom (world bloom-emissiveness is applied to the material radiance,
-not as a screen-space glow yet). Never run git; the user commits.
+matching actor for visual checks. A first **HDR bloom pass** is in (half-resolution bright pass + separable blur +
+composite add; `BloomScale` slider); matching stock's multi-scale prefilter/cascaded blur remains. Still missing by
+design: dynamic scene probe (the hard sun terminator on the dark side stays dark until it exists) and shadows.
+Never run git; the user commits.
 
 **Block paints and skins are verified (2026-10-18).** Space Engineers stores a block's paint as a
 `ColorMaskHSV` **delta**, not a final colour; stock `ColorizeGray` adds
@@ -76,22 +77,22 @@ restored, the saved green world renders green (capture verified), and the user c
 in game and confirmed it displays correctly. `ChangeMaterialTexture` and `UpdateRenderEntity` updates
 that arrive before `CreateRenderEntity` are now held in pending state and applied at creation (skins
 included); the CarbonFibre skin pattern is visible. Specular/reflection remain user-tunable sliders and
-default to 0 to match stock's forward-opaque shading.
+default to 0 to match stock's forward-opaque shading. Slider values are GPU-resident in
+`GpuRenderSettings` (set 0 binding 3) and only uploaded when `Config.PropertyChanged` fires; there are no
+per-frame CPU config reads or tuning transfers.
 
 **Next tasks, in order:**
 1. **Finish the GPU-driven scene path**: persistent opaque parts, GPU LOD selection (stock hysteresis) and
    static-group buckets are in. Remaining: upload actor state only when it changes (cache the camera-relative world
    per actor instead of rebuilding every visible actor record), move skinned actors and transparent parts into GPU
    buckets, and keep the direct path only for unsupported techniques. Goal: no per-frame actor/part walk.
-2. **Bloom pass** (stock prefilter from `BloomEmissiveness`, cascaded blur, composite add) so bright indicators glow
-   instead of only reading as hot pixels.
-3. **Dynamic environment probe** (scene cubemap capture + prefilter, close/far blend) to soften the hard sunlight
+2. **Dynamic environment probe** (scene cubemap capture + prefilter, close/far blend) to soften the hard sunlight
    terminator and light interiors; then shadows.
-4. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
+3. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
    MRT pass) so TAA/FSR/GI can build on it.
-5. Remaining Phase 2: voxel cells, static/merge groups, world sprites/particles; remaining Phase 1 odds: options
+4. Remaining Phase 2: voxel cells, static/merge groups, world sprites/particles; remaining Phase 1 odds: options
    presets.
-6. When flying away, watch the `LOD histogram` in the 5-second `Scene:` log line to confirm LOD switching.
+5. When flying away, watch the `LOD histogram` in the 5-second `Scene:` log line to confirm LOD switching.
 
 **User preferences / rules (all sessions):**
 - Never run git commands. The user commits and pushes.
@@ -171,10 +172,12 @@ Pulsar client plugin, that:
 | Transparent models | Glass/holo/shield parts look up `VRageRender.MyTransparentMaterials` by material name (fallback `GlassCCW`), use the stock material color (linear), color add, light multiplier, reflectivity/fresnel/gloss and texture/gloss texture. **Weighted-blended OIT**: a second pass writes RGBA16F accumulation (`color * alpha * weight`, additive) and R16F revealage (`dst *= 1 - alpha` via `OneMinusSrcColor`) with depth test read-only/no depth write, per-material `TriangleFaceCulling`; composite resolves `accum.rgb/accum.a` over the scene with `1 - reveal`. No CPU sort. |
 | Skinning | **All GPU**: the skinned MWM buffer (64 B/vertex with bone indices/weights) is deformed by a compute pass; a second compute pass (`BonePalette.slang`) assembles the model-bone palette (bind-inverse × absolute) on the GPU. The CPU only uploads the skeleton skin transforms, the per-frame absolute transforms and the model→skeleton index map. Output is the normal 32 B static vertex layout, so the forward pass is unchanged. The game calls `Render.Draw` only for IDs reported in `MyRenderProxy.VisibleObjectsWrite`, so visible IDs of actors with `SetVisibilityUpdates` are published each frame; without this the game never sends `SetCharacterTransforms`. |
 | Material coloring | `ColorMaskHSV` is a **delta from the grey/magenta paint base**, not a final colour. Stock `ColorizeGray` adds `TextureDebugMultipliers.ColorizeHSV` (default `(0, 0.8, -0.1)`) after zeroing the texture's HSV; we do the same. `RemoveMetalnessFromColoring` is applied unless the effective material flags include `RenderFlags.MetalnessColorable` (asset-modifier skins). Pre-create colour/skin messages are kept on a pending actor and applied at creation. |
-| GPU buffers | No UBOs by design: per-frame/per-draw constants go through push constants plus host-visible transient buffers read via buffer device addresses (the modern SSBO style). Persistent device-local buffers hold model vertices/indices, instance data, textures and the skinned streams. Compute writes/reads (skinning, palette, culling) use the same BDA path. Indirect buffers are host-visible storage buffers with `Indirect` usage. Storage images/RW buffers and acceleration structures are still reserved for OIT, GI/RT. |
+| User settings | All lighting/exposure/bloom sliders live in a persistent one-element `GpuRenderSettings` storage buffer (set 0 binding 3) once per device, not in per-frame constants. `Config.PropertyChanged` only sets a dirty flag; the render thread uploads the 48-byte block when it changes. Shaders read `renderSettings[0]` (sun/ambient/specular/metalness, emissive/lights/reflection/screen, exposure/bloom). No per-frame CPU config reads or tuning transfers. |
+| GPU buffers | No UBOs by design: per-frame/per-draw constants go through push constants plus host-visible transient buffers read via buffer device addresses (the modern SSBO style). Persistent device-local buffers hold model vertices/indices, instance data, textures and the skinned streams; a small host-visible `GpuRenderSettings` storage buffer (set 0 binding 3) holds user tuning and is written only on changes. Compute writes/reads (skinning, palette, culling) use the same BDA path. Indirect buffers are host-visible storage buffers with `Indirect` usage. Storage images/RW buffers and acceleration structures are still reserved for OIT, GI/RT. |
+| Bloom | First version: half-resolution HDR bright pass (threshold 1.0, soft knee), separable 9-tap Gaussian blur, added in `Composite.slang` with a user `BloomScale` (default 0.2). Stock's multi-scale prefilter/cascaded blur and exposure-aware strength are not matched yet. |
 | GPU-driven opaque draws | Opaque, non-skinned actors (including instanced cubes and **static groups**) use a **persistent** `GpuScenePart` buffer (material + vertex/index BDAs + index range, built on actor/model/material changes), persistent per-LOD ranges, and a persistent per-actor LOD-state buffer. Per frame the CPU uploads only actor world/colour/bounds/instance state; `Scene/Culling.slang` runs one thread per actor, selects the LOD with the stock distance formula + 10% hysteresis, sphere-tests 5 normalized planes + `MaxViewDistance`, then appends one command + 184-byte draw data per part to a cull/no-cull bucket: `[counter u32][commands @64, 16 B]` followed by draw data. Static groups are expanded into one actor record per local matrix sharing the same ranges. The indirect command is **non-indexed** (`vertexCount=indexCount`); the vertex shader fetches the model index from the draw data's index buffer BDA and then the vertex. `SV_DrawIndex` selects the draw data; the fragment gets the same material through a flat draw-index varying. `push.drawData == 0` selects the direct push path, so one `Model.slang`/pipeline serves both. |
 | Asset preload | `PreloadTextures`/`PreloadModel(s)`/`PreloadMaterials` start background decodes/parses immediately (mapping TextureType to the sampling kind), so GPU buffers/images are created during the loading screen rather than on first draw. Model texture dependencies also start when each model is parsed. `UnloadTextures` frees matching entries/slots (in-flight decodes are discarded) and `DeprioritizeTextures` is a no-op (no streaming priorities). `AddRuntimeModel` builds a one-LOD GPU mesh from `MyModelData`, resolves section material names through the model-material table, and registers the name (plus a `ReplacedModel` alias). |
-| Exposure / emissive | `UpdatePostprocessSettings` is cached. `Post/Exposure.slang` samples the HDR scene on a sparse grid, averages log-luminance, applies the shipped `CalculateExposure` (`LuminanceKeyValueCendos`) and writes a 1x1 R32F exposure texture; the composite samples it and applies Hable with the world's `WhitePoint`. The 0.025 calibration was removed (it made the world ~40x too dark); a user `ExposureScale` multiplier is applied and clamped to [0.02, 4]. Emissive radiance is `albedo * (1 - metalness) * extras.y * Emissivity * BloomEmissiveness`; the test world uses `BloomEmissiveness=120`, which is what makes battery LEDs read in shadow. Full histogram eye adaptation, temporal smoothing and bloom are still missing. |
+| Exposure / emissive | `UpdatePostprocessSettings` is cached. `Post/Exposure.slang` samples the HDR scene on a sparse grid, averages log-luminance, applies the shipped `CalculateExposure` (`LuminanceKeyValueCendos`) and writes a 1x1 R32F exposure texture; the composite samples it and applies Hable with the world's `WhitePoint`. The 0.025 calibration was removed (it made the world ~40x too dark); a user `ExposureScale` multiplier is applied and clamped to [0.02, 4]. Emissive radiance is `albedo * (1 - metalness) * extras.y * Emissivity * BloomEmissiveness`; the test world uses `BloomEmissiveness=120`, which is what makes battery LEDs read in shadow. Full histogram eye adaptation, temporal smoothing and stock multi-scale bloom are still missing. |
 | LCD budget | Linux's platform renderer reports no generated-texture memory budget. `LcdMemoryBudgetPatch` sets `MySessionComponentPanels.m_memoryBudget` to 1 GiB after init; otherwise the panel manager's visible counter never reaches its threshold, `IsInRange` stays false, and every powered LCD keeps the default "Online" texture. |
 | Dynamic lights | `CreateRenderLight`/`UpdateRenderLight` are cached per ID. Each frame up to 64 point/spot lights are uploaded camera-relative (`GpuLight`, 64 B) through the transient allocator; `FrameConstants` carries the pointer/count. The game already multiplies intensity into the linear color; `MyLightComponent`'s falloff conversion and the stock hard/diffuse attenuation and spot cone are applied in `Model.slang`. Shadows, glare/flares and light culling (stock uses tiled forward) are not implemented. |
 | Git | The user does all git operations. Sessions never run git commands. |
@@ -189,6 +192,8 @@ Pulsar client plugin, that:
 | `ClientPlugin/Gui/GraphicsOptionsPatch.cs` | Postfix on `MyGuiScreenOptionsGraphics.RecreateControls`: "Vulkan Renderer" button (found by control names `GraphicsPreset` / `EnableDamageEffects`). |
 | `ClientPlugin/Testing/AutoLoadMainMenu.cs` | Harmony postfix on the main menu input: `VULKAN_AUTOLOAD=<seconds>` presses Continue Game for automated tests. |
 | `ClientPlugin/Settings/Elements/Info.cs` | Read-only label/value settings element. |
+| `ClientPlugin/Settings/Elements/Button.cs` | `ButtonAttribute` for action/method settings entries; the slider Reset buttons are created inline in `Slider.cs`, not by this attribute. |
+| `ClientPlugin/Settings/Elements/Slider.cs` | Float/int slider with four-decimal float labels and a per-slider Reset button (measured `RectangularBorderLess` button, default from `Config.Default`). |
 | `Render/RendererStatus.cs` | Which renderer runs, fallback reason, selected GPU capabilities (for the settings dialog). |
 | `Render/RenderProxyInitializePatch.cs` | Prefix on `MyRenderProxy.Initialize(ref IMyRender)`: swaps `MyDX11Render` for `VulkanRender` if selected and the probe passes. |
 | `Render/VulkanRender.cs` | `IMyRender` implementation: device lifetime, settings/resize, per-frame flow, message switch (non-GUI messages). |
@@ -205,17 +210,19 @@ Pulsar client plugin, that:
 | `Render/Vulkan/GpuMemory.cs` | Block sub-allocator (64 MB blocks, dedicated ≥ 32 MB, buffers and images in separate blocks, host-visible blocks persistently mapped, every block has DEVICE_ADDRESS flag). |
 | `Render/Vulkan/GpuBuffer.cs`, `GpuImage.cs` | Resources; `Dispose` defers destruction through `GpuContext.Release`. |
 | `Render/Vulkan/UploadQueue.cs` | Per-frame 32 MB staging rings; copies recorded at the start of the frame's command buffer; images end in ShaderReadOnlyOptimal. Render thread only. |
-| `Render/Vulkan/BindlessDescriptors.cs` | Set 0 (binding 0: up to 65536 sampled images, binding 1: 4 immutable samplers, binding 2: 16 cubemaps with a black default), the shared pipeline layout (128 B push constants, all stages), fixed texture slots White/Black/Missing/Transparent. |
+| `Render/Vulkan/BindlessDescriptors.cs` | Set 0 (binding 0: up to 65536 sampled images, binding 1: 4 immutable samplers, binding 2: 16 cubemaps with a black default, binding 3: persistent `GpuRenderSettings` storage buffer), the shared pipeline layout (128 B push constants, all stages), fixed texture slots White/Black/Missing/Transparent. |
 | `Render/Vulkan/MipGenerator.cs` | Blit-chain mip generation (uploads with `generateMips`, offscreen targets). |
 | `Render/Vulkan/GraphicsPipelineBuilder.cs` | Init-property description → graphics pipeline (dynamic rendering, shared bindless layout, dynamic viewport/scissor, no vertex input, reverse-Z depth compare by default). Use it for every new pipeline. |
 | `Render/Vulkan/TransientAllocator.cs` | `GpuContext.Transient`: per-frame linear host-visible scratch with device addresses (frame constants, per-draw data, instances). Reset in `GpuContext.BeginFrame`. |
 | `Render/Scene/SceneTargets.cs` | HDR color (R16G16B16A16_SFLOAT) + depth (D32_SFLOAT, reverse Z, cleared to 0) at the game resolution, bindless slots; recreated on resize. |
 | `Render/Scene/SkyboxPass.cs` | Depth-less fullscreen background sampling the environment cubemap along the view ray. |
-| `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, ambient, IBL slots/params, paint conversion `ColorizeHsv`, tuning), LOD coefficient. |
+| `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, ambient, IBL slots/params, paint conversion `ColorizeHsv`), LOD coefficient. |
+| `Render/Scene/GpuRenderSettings.cs` | Persistent one-element setting block: sun/ambient/specular/metalness, emissive/lights/reflection/screen, exposure/bloom. Uploaded only when `Config` changes. |
 | `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy, instance ranges/bounds, max view distance, per-actor LOD; `Revision` drives persistent part-cache rebuilds and pending pre-create colour/skin state. |
 | `Render/Scene/Frustum.cs` | Five-plane infinite-far-plane culling from the stock view-projection. |
 | `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: persistent part cache + GPU LOD/culling for opaque non-skinned actors (incl. static groups/cubes), direct path for skinned/transparent, cull-back/no-cull pipelines, bindless materials, IBL + sun shading; GPU skinning compute pre-pass; visible-object reporting (`VisibleObjectsWrite`). |
 | `Render/Scene/GpuSceneDraws.cs` | Wire-format structs for persistent parts/LOD ranges/actor state, the cull compute dispatch, and the two indirect cull/no-cull buckets. |
+| `Render/Scene/BloomPass.cs` | Half-resolution HDR bloom: bright-pass, separable blur targets, resize/slot lifetime. |
 | `Render/Scene/InstanceBuffers.cs` | GPU instance buffers for cube/generic ranges (replaced per update for frames-in-flight safety). |
 | `Render/Models/MwmLoader.cs`, `MwmMeshData.cs` | Background MWM parsing through `MyModelImporter`, all LODs, stock vertex decodes, texture path resolution. |
 | `Render/Models/ModelCache.cs` | Model path → parsed LOD data → device-local GPU buffers, parts and texture entries; LOD selection helper; `Version` bumps when a model becomes GPU-ready so `ModelPass` rebuilds its part cache. |
@@ -227,7 +234,7 @@ Pulsar client plugin, that:
 | `Render/Sprites/SpriteBatcher.cs`, `SpriteRenderer.cs`, `SpriteInstance.cs` | CPU batching (stock geometry rules) and GPU drawing (instances by device address, bindless textures). |
 | `Render/Sprites/RenderFont.cs` | Port of stock `MyRenderFont` text layout on the game's `MyFont`. |
 | `Render/Shaders/ShaderBytecode.g.cs` | Generated SPIR-V. Do not edit. |
-| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Post/Composite.slang`, `Scene/Model.slang`, `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Scene/Culling.slang` (compute), `Scene/Skinning.slang` (compute), `Scene/BonePalette.slang` (compute), `Common/SkinningCommon.slang` (shared layouts); `shaders.json` manifest. |
+| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays + `RenderSettings` storage buffer, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Post/Composite.slang`, `Scene/Model.slang`, `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Post/Bloom.slang`, `Scene/Culling.slang` (compute), `Scene/Skinning.slang` (compute), `Scene/BonePalette.slang` (compute), `Common/SkinningCommon.slang` (shared layouts); `shaders.json` manifest. |
 | `Tools/ShaderCompiler`, `Tools/VulkanSmokeTest` | Dev tools (not in `<SourceDirectories>`, never shipped). |
 
 ## Architecture
@@ -512,8 +519,9 @@ Material channels (`Content/Shaders/Geometry/Materials/Standard/Pixel.hlsl`,
 `CreateRenderCharacter` creates a `SKINNED` actor; `SetCharacterSkeleton` gives bone descriptions and the
 skeleton index map; `SetCharacterTransforms` gives `BoneAbsoluteTransforms` every frame plus decal updates
 (`MyRender11.cs:2453-2483`). Stock skinning is `matrix += bone[blendIndex] * blendWeight` for four bones
-(`Content/Shaders/Geometry/VertexTemplateBase.hlsli:244-255`). Not implemented yet: skinned models are loaded but
-skipped with one log line.
+(`Content/Shaders/Geometry/VertexTemplateBase.hlsli:244-255`). Implemented with GPU skinning: compute deformation,
+GPU bone-palette assembly, per-frame skeleton transforms and visible-object reporting; first-person material hiding
+uses the per-material visibility flags (see Decisions).
 
 ### Our Phase 2 first slice (implemented 2026-10-17)
 
@@ -522,8 +530,8 @@ ambient), `SceneActors` (create/update/remove/visibility/model change/material o
 `MwmLoader` (background parse through `MyModelImporter`, exact stock decodings, pattern scale, flat index list,
 absolute texture paths) + `ModelCache` (device-local vertex/index buffers via `UploadQueue.UploadBuffer`, parts
 with `TextureCache` entries), `TextureCache.TextureKind` (GUI sRGB+premultiply, CM/Extensions sRGB, NG/alphamask
-linear), and `ModelPass` (forward opaque, reverse-Z, sun + ambient, per-material draw data in the transient
-allocator, texture slots through the bindless set). `Shaders/Scene/Model.slang` implements the stock normal and
+linear), and `ModelPass` (forward opaque, reverse-Z, sun + ambient; persistent opaque part cache + GPU
+LOD/culling for non-skinned actors, direct path for skinned/transparent, texture slots through the bindless set). `Shaders/Scene/Model.slang` implements the stock normal and
 tangent decodes, colorize, alpha mask, GGX sun and ambient. Cube grids: `InstanceBuffers` owns one
 device-local buffer per `CreateRenderInstanceBuffer` (updated by replacing the buffer, so frames in flight never
 read swapped contents), `SetInstanceBuffer` puts the range on the actor, and the shader decodes
@@ -540,8 +548,8 @@ Physics owns the CPU, so the renderer must not grow per-frame CPU work. Rule for
 compute pass or a shader, it does; CPU is for uploads, resource lifetime and gameplay messages only.
 
 Already on the GPU: character deformation and bone-palette assembly, vertex/instance decoding, materials/IBL/
-lighting, skybox, mip generation, sprites/offscreen rendering; model/texture preloads start background work during
-the loading screen.
+lighting, skybox, mip generation, sprites/offscreen rendering, and the persistent user-settings block; model/texture
+preloads start background work during the loading screen.
 
 Remaining per-frame CPU work and its GPU replacement:
 
@@ -549,8 +557,8 @@ Remaining per-frame CPU work and its GPU replacement:
 |--------------|-----------------|
 | Actor/part enumeration, frustum + distance culling, per-draw submission | **Persistent opaque parts + GPU LOD/culling/submission done for non-skinned actors, including instanced cubes and static groups.** Still CPU: per-frame actor record upload, skinned actors and transparent parts. Next: upload actor state only when changed and move the remaining paths into GPU buckets. |
 | Transparent back-to-front sorting | **Done**: weighted-blended OIT accumulation + revealage targets; no CPU sort. |
-| Per-draw world transposes / material data packing | Still CPU: computed while writing the per-frame cull inputs; the culling compute copies them into draw data. Move with the persistent scene buffers. |
-| Per-frame transient uploads | Persistent buffers updated only on messages (create/update/remove/texture change). |
+| Per-draw world transposes / material data packing | **Material packing moved into the persistent part cache.** Actor world transposes are still computed while writing per-frame actor records (moving camera/grids); candidate for a camera-relative GPU transform. |
+| Per-frame transient uploads | Scene/world constants still upload per frame; parts, LOD ranges and user settings are persistent and update only on messages/changes. |
 | UI text layout / sprite batching | CPU by nature (font shaping), but glyphs and quads stay GPU; can be cached and uploaded on change. |
 
 The indirect path's required pieces are already in place: `shaderDrawParameters` is enabled, `SV_DrawIndex` is
@@ -654,7 +662,8 @@ Known gaps from Phase 0:
 - **Milestone:** visually feature-complete vs. stock.
 
 ### Phase 5 — Post-processing and upscaling
-- [ ] Eye adaptation, bloom, tonemapping (stock-like / ACES / AgX), CA/vignette
+- [x] First HDR bloom pass (bright pass + separable half-res blur + composite; `BloomScale` slider)
+- [~] Eye adaptation, tonemapping (stock-like / ACES / AgX), CA/vignette; full stock multi-scale bloom
 - [ ] TAA (jitter + motion vectors)
 - [ ] FSR 3 upscaling (replaces stock dynamic resolution)
 - **Milestone:** better image quality and performance than stock.
@@ -746,7 +755,7 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   checked in game. The background research on world messages/MWM/materials did not finish before the session ended;
   redo it first (Start here, task 1).
 - **2026-10-17** — Docs/status review: roadmap matches the code; `dotnet build` is clean (0 warnings/errors) and the
-  shader bytecode check passes. README is still template boilerplate. Recorded the no-subagents / no-guessing /
+  shader bytecode check passes. README was still template boilerplate at that point (now project-specific). Recorded the no-subagents / no-guessing /
   in-game-logging rules above.
 - **2026-10-17** — Phase 2 first slice. Researched the world message boundary and MWM/material formats from the
   decompiled source and shipped shaders; wrote the [World message spec](#world-message-spec). Implemented
@@ -886,8 +895,8 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   calibration (it made the whole world ~40x too dark); it uses the shipped `CalculateExposure` result with a
   user-tunable multiplier. Added "World lighting tuning" sliders to the plugin settings (Options > Graphics > Vulkan
   Renderer): Exposure, Sun, Ambient, Specular, Reflections, Metalness, Emissive, Screen and Dynamic lights, applied
-  live through `FrameConstants.tuning0/tuning1` and the exposure push constants. Defaults: Exposure 0.25, all others
-  1. Verified LCD shows the DangerZone background + text, battery LEDs stay bright, and the world is no longer crushed
+  live through `FrameConstants.tuning0/tuning1` and the exposure push constants (since superseded by the persistent
+  GPU settings buffer). Initial defaults: Exposure 0.25, all others 1. Verified LCD shows the DangerZone background + text, battery LEDs stay bright, and the world is no longer crushed
   to black. Next: collect the user's slider values to correct the stock shader math instead of compensating globally.
 - **2026-10-18** — Block paints, skins and exposure. First fixed the wash-out: our full-strength GGX sun
   specular and skybox IBL specular were added on top of stock's forward-style Lambert shading
@@ -911,4 +920,26 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   Wire-format structs and the persistent buffers are documented in `GpuSceneDraws.cs`. Verified by
   automated capture in the user's world: 297 actors, 80 instanced, 3152 cached parts, 13 total draw calls
   (2 indirect), red/green paints and CarbonFibre skin still correct, no log errors. Remaining: per-frame
-  actor-state dirty tracking, GPU buckets for skinned/transparent paths, bloom.
+  actor-state dirty tracking and GPU buckets for the skinned/transparent paths (bloom followed in the next entry).
+- **2026-10-18** — First HDR bloom pass. Added `Post/Bloom.slang` (bright pass with soft knee,
+  separable 9-tap Gaussian) and `BloomPass` (half-resolution RGBA16F ping-pong targets with bindless slots,
+  resize handling, render-graph barriers). `Composite.slang` adds the blurred bright pass before exposure/
+  tonemapping, exposed as the new `BloomScale` slider. Verified by capture in the user's world: indicator
+  LEDs, cockpit emissive bars and the LCD now have a soft halo; red/green paints and skin remain correct,
+  build/shaders clean, no log errors. Full stock multi-scale bloom filtering remains a refinement.
+- **2026-10-18** — Settings UI polish. `BloomScale` now defaults to 0.2. Float sliders display four decimal places
+  (the old one-decimal label rounded small steps to the same text), and every slider row has a **Reset** button that
+  restores that property's value from a pristine `Config.Default`. `ConfigStorage` no longer returns the
+  `Config.Default` singleton for missing/invalid files, so edits/resets cannot mutate the baseline. Reset buttons use
+  the `RectangularBorderLess` style and are sized to the measured width of "Reset" plus padding (explicit centre
+  alignment), so the default button minimum width does not apply. Verified in the settings screen by the user; live
+  config values are unchanged until the user applies/saves.
+- **2026-10-18** — User settings moved to GPU-resident storage. The exposure/bloom and all eight lighting sliders
+  now live in a persistent one-element `GpuRenderSettings` storage buffer (set 0 binding 3) created once per
+  device. `Config.PropertyChanged` sets a dirty flag; the render thread uploads the 48-byte block only when it
+  changes, and `Model.slang`, `Exposure.slang` and `Composite.slang` read `renderSettings[0]` directly. Removed the
+  per-frame `Config.Current` reads and the tuning fields/push constants from `FrameConstants`, exposure and
+  composite. Verified by capture: red/green paints, skin, LCD and bloom still render; no log errors.
+- **2026-10-18** — Final validation before hand-off: removed the temporary settings-screen test hook that caused
+  Pulsar's compiler to fail, confirmed the reset buttons use the measured `RectangularBorderLess` style, and ran
+  `dotnet build` plus `ShaderCompiler --check` (both clean). No git operations performed.
