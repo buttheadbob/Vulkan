@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using ClientPlugin.Render.Textures;
 using ClientPlugin.Render.Vulkan;
@@ -37,6 +38,8 @@ internal sealed class GuiRenderer : IDisposable
         public Color? Background;
         public Vector2 AspectRatio;
         public Bucket Sprites;
+        public int Retries;
+        public bool Warmed;
     }
 
     private readonly GpuContext context;
@@ -251,21 +254,19 @@ internal sealed class GuiRenderer : IDisposable
         var colorMask = message.ColorMask ?? Color.White;
         var isDebugFont = message.IsDebugFont;
 
-        // MyFont parses the font XML; done off the render thread like MyRender11.LoadFont
-        Task.Run(() =>
+        // Fonts and their glyph pages are loaded synchronously on the render thread. LCD apps often
+        // draw their static text once; if the pages were still loading then, that text never appeared.
+        try
         {
-            try
-            {
-                var font = new RenderFont(path, colorMask, new MyFont(path), textures);
-                fonts[id] = font;
-                if (isDebugFont)
-                    debugFont = font;
-            }
-            catch (Exception e)
-            {
-                RenderLog.Error($"Failed to load font {path}", e);
-            }
-        });
+            var font = new RenderFont(path, colorMask, new MyFont(path), textures);
+            fonts[id] = font;
+            if (isDebugFont)
+                debugFont = font;
+        }
+        catch (Exception e)
+        {
+            RenderLog.Error($"Failed to load font {path}", e);
+        }
     }
 
     private static bool SamePath(string a, string b) =>
@@ -279,12 +280,30 @@ internal sealed class GuiRenderer : IDisposable
     public unsafe void RecordOffscreen(VkCommandBuffer commands)
     {
         var count = Math.Min(jobs.Count, MaxOffscreenJobsPerFrame);
+        var keep = new List<OffscreenJob>();
         for (var i = 0; i < count; i++)
         {
             var job = jobs[i];
+            var found = textures.TryGetGenerated(job.Target, out var target);
+            if (!job.Warmed)
+            {
+                job.Warmed = true;
+                WarmJobTextures(job.Sprites);
+                keep.Add(job);
+                continue;
+            }
+
+            if (!found && ++job.Retries <= 10)
+            {
+                // The generated texture message can arrive after the first render request; keep the
+                // sprites for a few frames instead of dropping the app content permanently.
+                keep.Add(job);
+                continue;
+            }
+
             try
             {
-                if (textures.TryGetGenerated(job.Target, out var target))
+                if (found)
                     RecordOffscreenJob(commands, job, target);
             }
             finally
@@ -294,6 +313,33 @@ internal sealed class GuiRenderer : IDisposable
         }
 
         jobs.RemoveRange(0, count);
+        jobs.AddRange(keep);
+    }
+
+    // Starts loading every texture a job samples. The job itself renders on the next frame, after
+    // this frame's uploads have been recorded, so a texture first used by the job is not sampled
+    // before its upload (the stock renderer uploads immediately, our transfers are deferred).
+    private void WarmJobTextures(Bucket sprites)
+    {
+        if (sprites == null)
+            return;
+        foreach (var message in sprites.Messages)
+        {
+            switch (message)
+            {
+                case MyRenderMessageDrawSprite m:
+                    textures.Get(m.Texture, waitTillLoaded: true);
+                    textures.Get(m.MaskTexture, waitTillLoaded: true);
+                    break;
+                case MyRenderMessageDrawSpriteExt m:
+                    textures.Get(m.Texture, waitTillLoaded: true);
+                    textures.Get(m.MaskTexture, waitTillLoaded: true);
+                    break;
+                case MyRenderMessageDrawSpriteAtlas m:
+                    textures.Get(m.Texture, waitTillLoaded: true);
+                    break;
+            }
+        }
     }
 
     private unsafe void RecordOffscreenJob(VkCommandBuffer commands, OffscreenJob job, TextureCache.Entry target)

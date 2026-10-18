@@ -20,6 +20,7 @@ internal sealed class GraphicsPipelineBuilder
     public bool DepthWrite { get; init; }
     public VkCompareOp DepthCompare { get; init; } = VkCompareOp.GreaterOrEqual; // Reverse Z
     public VkPipelineColorBlendAttachmentState Blend { get; init; } = Opaque;
+    public VkPipelineColorBlendAttachmentState[] BlendStates { get; init; } // per color attachment; null = Blend for all
 
     public static readonly VkPipelineColorBlendAttachmentState Opaque = new()
     {
@@ -64,7 +65,7 @@ internal sealed class GraphicsPipelineBuilder
 
             var attachments = stackalloc VkPipelineColorBlendAttachmentState[Math.Max(1, ColorFormats.Length)];
             for (var i = 0; i < ColorFormats.Length; i++)
-                attachments[i] = Blend;
+                attachments[i] = BlendStates != null && i < BlendStates.Length ? BlendStates[i] : Blend;
             var colorBlend = new VkPipelineColorBlendStateCreateInfo { attachmentCount = (uint)ColorFormats.Length, pAttachments = attachments };
 
             var dynamicStates = stackalloc VkDynamicState[2] { VkDynamicState.Viewport, VkDynamicState.Scissor };

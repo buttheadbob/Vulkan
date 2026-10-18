@@ -5,9 +5,13 @@
   "modules": [
     { "name": "Sprite", "file": "Sprites/Sprite.slang" },
     { "name": "Composite", "file": "Post/Composite.slang" },
+    { "name": "Exposure", "file": "Post/Exposure.slang" },
+    { "name": "Bloom", "file": "Post/Bloom.slang" },
     { "name": "Model", "file": "Scene/Model.slang" },
     { "name": "Skybox", "file": "Scene/Skybox.slang" },
     { "name": "Transparent", "file": "Scene/Transparent.slang" },
-    { "name": "Skinning", "file": "Scene/Skinning.slang" }
+    { "name": "Skinning", "file": "Scene/Skinning.slang" },
+    { "name": "Culling", "file": "Scene/Culling.slang" },
+    { "name": "BonePalette", "file": "Scene/BonePalette.slang" }
   ]
 }

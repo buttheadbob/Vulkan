@@ -123,8 +123,14 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_Instan
     return output;
 }
 
+struct FragmentOutput
+{
+    float4 accum : SV_Target0;  // premultiplied by alpha * weight, additive
+    float reveal : SV_Target1;  // alpha; the reveal target blends dst *= (1 - src)
+};
+
 [shader("fragment")]
-float4 fragmentMain(VertexOutput input) : SV_Target0
+FragmentOutput fragmentMain(VertexOutput input)
 {
     DrawTransparentMaterial material = *push.material;
     FrameConstants frame = *push.frame;
@@ -166,5 +172,14 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     // Stock adds ColorAdd (including its alpha) and the reflection alpha to transparency.
     float reflectionAlpha = 0.1 * (fresnel + material.params.x) * 0.5;
     float alpha = saturate(material.color.a * texel.a + material.colorAdd.a + reflectionAlpha);
-    return float4(color, alpha);
+
+    // Weighted-blended OIT (McGuire): close/far layers get a bounded weight; the resolve pass
+    // reconstructs the average color and coverage. No per-frame sort.
+    float distanceToCamera = length(input.worldPosition);
+    float weight = alpha * clamp(0.03 / (1e-5 + pow(distanceToCamera / 200.0, 4.0)), 0.01, 3000.0);
+
+    FragmentOutput output;
+    output.accum = float4(color * weight, alpha * weight);
+    output.reveal = alpha;
+    return output;
 }

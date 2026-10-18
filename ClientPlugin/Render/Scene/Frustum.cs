@@ -1,3 +1,4 @@
+using System;
 using VRageMath;
 
 namespace ClientPlugin.Render.Scene;
@@ -36,6 +37,15 @@ internal sealed class Frustum
         }
 
         return true;
+    }
+
+    public void WritePlanes(Span<Vector4> destination)
+    {
+        for (var i = 0; i < planes.Length; i++)
+        {
+            var plane = planes[i];
+            destination[i] = new Vector4(plane.Normal, plane.D);
+        }
     }
 
     private static Vector4 Row(Matrix matrix, int index) => index switch

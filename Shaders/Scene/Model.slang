@@ -29,6 +29,8 @@ enum MaterialFlags : uint
     HasTangent = 16,
     AlphaMasked = 32,
     Instanced = 64,
+    MetalnessColorable = 128,
+    Screen = 512, // generated LCD target: never take metalness from its alpha channel
 };
 
 // Must match ClientPlugin/Render/Models/ModelCache.cs (32 bytes)
@@ -50,6 +52,29 @@ struct CubeInstance
     float4 colorMaskHsv;
 };
 
+// Per-draw data written by Scene/Culling.slang (184 bytes, instancing included). The indirect path reads everything from
+// here, so the CPU submits one draw per bucket instead of one per part.
+struct DrawData
+{
+    float4 world0;
+    float4 world1;
+    float4 world2;
+    float4 world3;
+    float4 colorMaskHsv;
+    DrawMaterial material;
+    ModelVertex* vertices;
+    uint* indices;
+    uint indexStart;
+    uint indexCount;
+    uint pad0;
+    uint pad1;
+    CubeInstance* instances;
+    uint instanceStart;
+    uint instanceCount;
+    uint pad2;
+    uint pad3;
+};
+
 // Must match ClientPlugin/Render/Scene/ModelPass.cs
 struct PushConstants
 {
@@ -63,6 +88,7 @@ struct PushConstants
     ModelVertex* vertices;
     CubeInstance* instances;
     uint instanceStart;
+    DrawData* drawData; // 0 for direct draws, bucket draw data for vkCmdDrawIndirectCount
 };
 
 // Base6Directions.GetVector order (VRage.Math), see VertexTransformations.hlsli
@@ -126,14 +152,16 @@ float3 rgbToHsv(float3 rgb)
 }
 
 // Geometry/Materials/PixelUtilsMaterials.hlsli ColorizeGray
-float3 colorizeGray(float3 texel, float3 colorMaskHsv, float coloring)
+float3 colorizeGray(float3 texel, float3 colorMaskHsv, float coloring, float3 colorizeHsv)
 {
     if (coloring <= 0.0)
         return texel;
 
+    // ColorMaskHSV is a delta from the grey/magenta paint base. Stock adds the environment's
+    // TextureDebugMultipliers.ColorizeHSV (default 0, 0.8, -0.1) before converting back to RGB.
     float3 hsv = rgbToHsv(linearToSrgb(texel));
     hsv.xy = 0;
-    float3 finalHsv = saturate(hsv + colorMaskHsv);
+    float3 finalHsv = saturate(hsv + colorMaskHsv + colorizeHsv);
     return lerp(texel, srgbToLinear(hsvToRgb(finalHsv)), coloring);
 }
 
@@ -145,22 +173,59 @@ struct VertexOutput
     float4 tangent : TEXCOORD2;
     float3 worldPosition : TEXCOORD3;
     nointerpolation float4 colorMaskHsv : TEXCOORD4;
+    nointerpolation uint drawIndex : TEXCOORD5;
 };
 
 [shader("vertex")]
-VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
+VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID,
+    uint drawIndex : SV_DrawIndex)
 {
-    ModelVertex vertex = push.vertices[vertexId];
+    DrawMaterial material;
+    ModelVertex vertex;
+    float4 world0;
+    float4 world1;
+    float4 world2;
+    float4 world3;
+    float4 colorMaskHsv;
+    CubeInstance* cubeInstances = push.instances;
+    uint cubeInstanceStart = push.instanceStart;
+
+    if (push.drawData != nullptr)
+    {
+        // GPU-driven path: the draw command is non-indexed; the culling compute supplied the model's
+        // index buffer, so fetch the index from device memory and then the vertex.
+        DrawData draw = push.drawData[drawIndex];
+        uint index = draw.indices[draw.indexStart + vertexId];
+        material = draw.material;
+        vertex = draw.vertices[index];
+        world0 = draw.world0;
+        world1 = draw.world1;
+        world2 = draw.world2;
+        world3 = draw.world3;
+        colorMaskHsv = draw.colorMaskHsv;
+        cubeInstances = draw.instances;
+        cubeInstanceStart = draw.instanceStart;
+    }
+    else
+    {
+        material = *push.material;
+        vertex = push.vertices[vertexId];
+        world0 = push.world0;
+        world1 = push.world1;
+        world2 = push.world2;
+        world3 = push.world3;
+        colorMaskHsv = push.colorMaskHsv;
+    }
+
     float4 position = vertex.position;
     float3 normal = unpackNormal(vertex.normal);
     float4 tangent = unpackTangentSign(vertex.tangent);
-    float4 colorMaskHsv = push.colorMaskHsv;
     float3x3 instanceRotation = float3x3(float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1));
 
-    if ((push.material.flags & uint(MaterialFlags.Instanced)) != 0)
+    if ((material.flags & uint(MaterialFlags.Instanced)) != 0)
     {
         // MyCubeInstanceData packed ortho matrix (Vector4.PackOrthoMatrix, VRage.Math)
-        CubeInstance instance = push.instances[push.instanceStart + instanceId];
+        CubeInstance instance = cubeInstances[cubeInstanceStart + instanceId];
         float4 packed = instance.translationAndRot;
         int dir = (int)packed.w;
         float3 forward = PACKED_DIR[dir / 6];
@@ -180,9 +245,9 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_Instan
     }
 
     // Row-vector convention: clip = mul(mul(position, world), viewProjection)
-    float4 worldPosition4 = float4(dot(position, push.world0),
-                                   dot(position, push.world1),
-                                   dot(position, push.world2),
+    float4 worldPosition4 = float4(dot(position, world0),
+                                   dot(position, world1),
+                                   dot(position, world2),
                                    1.0);
     float4 clip = float4(dot(worldPosition4, push.frame.viewProj0),
                          dot(worldPosition4, push.frame.viewProj1),
@@ -190,9 +255,9 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_Instan
                          dot(worldPosition4, push.frame.viewProj3));
 
     // MyRenderableComponent.ApplyDepthBias: added to clip z, before the perspective divide
-    clip.z += push.material.depthBias * 1e-6;
+    clip.z += material.depthBias * 1e-6;
 
-    float3x3 worldRotation = float3x3(push.world0.xyz, push.world1.xyz, push.world2.xyz);
+    float3x3 worldRotation = float3x3(world0.xyz, world1.xyz, world2.xyz);
 
     VertexOutput output;
     output.position = clip;
@@ -201,6 +266,7 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_Instan
     output.tangent = float4(normalize(mul(tangent.xyz, worldRotation)), tangent.w);
     output.worldPosition = worldPosition4.xyz;
     output.colorMaskHsv = colorMaskHsv;
+    output.drawIndex = drawIndex;
     return output;
 }
 
@@ -229,7 +295,9 @@ float visibilitySmithGGX(float nov, float nol, float alpha)
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target0
 {
-    DrawMaterial material = *push.material;
+    DrawMaterial material = push.drawData != nullptr
+        ? push.drawData[input.drawIndex].material
+        : *push.material;
     uint flags = material.flags;
 
     float4 cm = float4(1.0, 1.0, 1.0, 0.0);
@@ -250,7 +318,17 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         clip(alpha - 0.5);
     }
 
-    float3 baseColor = colorizeGray(cm.rgb, input.colorMaskHsv.xyz, extras.w);
+    float metalness = (flags & uint(MaterialFlags.Screen)) != 0
+        ? 0.0
+        : saturate(cm.w * push.frame.tuning0.w);
+    float coloring = extras.w;
+    if ((flags & uint(MaterialFlags.MetalnessColorable)) == 0)
+    {
+        // Geometry/Materials/PixelUtilsMaterials.hlsli RemoveMetalnessFromColoring
+        coloring *= saturate(1.0 - saturate(metalness - 0.4) / 0.3);
+    }
+
+    float3 baseColor = colorizeGray(cm.rgb, input.colorMaskHsv.xyz, coloring, push.frame.colorizeHsv.xyz);
     baseColor *= material.colorMulEmissive.rgb;
 
     float3 n = normalize(input.normal);
@@ -269,13 +347,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         gloss = ng.w;
     }
 
-    float metalness = cm.w;
     float ao = extras.x;
     float emissive = saturate(extras.y - 1.0 / 255.0) * material.colorMulEmissive.w;
 
     float3 toCamera = normalize(-input.worldPosition);
     float3 toSun = -normalize(push.frame.sunDirection.xyz);
-    float3 sunColor = push.frame.sunColor.rgb * push.frame.sunDirection.w;
+    float3 sunColor = push.frame.sunColor.rgb * push.frame.sunDirection.w * push.frame.tuning0.x;
 
     float nol = saturate(dot(n, toSun));
     float3 halfVector = normalize(toSun + toCamera);
@@ -289,29 +366,81 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 fresnel = fresnelSchlick(f0, voh);
     float specular = distributionGGX(noh, alpha) * visibilitySmithGGX(nov, nol, alpha);
 
-    float3 diffuse = baseColor * (1.0 - metalness) * (nol / PI);
-    float3 direct = (diffuse + fresnel * specular * nol) * sunColor;
+    // Stock forward shading (LightingModel.hlsli MainDirectionalLightEnv) is Lambert only; metalness
+    // belongs to the PBR/GBuffer path and must not darken forward albedo.
+    float3 diffuse = baseColor * (nol / PI);
+    float3 direct = (diffuse + fresnel * specular * nol * push.frame.tuning0.z) * sunColor;
 
-    // Image-based ambient: diffuse irradiance (last prefiltered mip) and rough sky reflections.
-    // Until the indirect cubemap is ready, fall back to the small neutral ambient floor.
-    float3 ambient = baseColor * push.frame.ambientColor.rgb * push.frame.ambientColor.w * ao;
+    // Dynamic point/spot lights. The game's light component already multiplies intensity into the
+    // linear color; falloff is the converted polynomial from MyLightComponent.
+    if (push.frame.lightCount != 0)
+    {
+        GpuLight* lights = push.frame.lights;
+        uint lightCount = min(push.frame.lightCount, 64u);
+        for (uint i = 0; i < lightCount; i++)
+        {
+            GpuLight light = lights[i];
+            float3 toLight = light.positionRange.xyz - input.worldPosition;
+            float distanceToLight = length(toLight);
+            float range = light.positionRange.w;
+            if (distanceToLight >= range || range <= 0.0)
+                continue;
+
+            float3 L = toLight / max(distanceToLight, 1e-4);
+            float d = distanceToLight / range;
+            float dq = d * d;
+            float attenuationHard = pow(saturate(1.0 - dq * dq), 3.0);
+            float attenuationDiffuse = 1.0 / (1.0 + light.colorFalloff.w * dq);
+
+            if (light.params.w > 0.5)
+            {
+                // Stock LightSpot.hlsl: clip when -dot(L, direction) < apertureCos
+                float cosAngle = -dot(L, normalize(light.direction.xyz));
+                float cone = saturate((cosAngle - light.params.z) / max(1.0 - light.params.z, 1e-3));
+                cone = cone * cone * (3.0 - 2.0 * cone);
+                attenuationHard *= cone;
+            }
+
+            float nolLight = saturate(dot(n, L));
+            if (attenuationHard <= 0.0 || nolLight <= 0.0)
+                continue;
+
+            float3 halfLight = normalize(L + toCamera);
+            float nohLight = saturate(dot(n, halfLight));
+            float vohLight = saturate(dot(toCamera, halfLight));
+            float specularLight = distributionGGX(nohLight, alpha) *
+                                  visibilitySmithGGX(nov, nolLight, alpha);
+            float3 fresnelLight = fresnelSchlick(f0, vohLight);
+
+            float3 lightColor = light.colorFalloff.rgb * attenuationHard * attenuationDiffuse * push.frame.tuning1.y;
+            float3 lightDiffuse = baseColor * (nolLight / PI) * light.params.y * lightColor;
+            float3 lightSpecular = fresnelLight * specularLight * nolLight *
+                                   light.params.x * lightColor;
+            direct += lightDiffuse + lightSpecular;
+        }
+    }
+
+    // Stock: shaded += albedo * emissive * BloomEmissiveness. LCD screen materials use the
+    // ScreenArea_add/CockpitScreen_add emissive channel, so the display does not depend on scene
+    // lighting. The Screen flag also forces metalness 0 (generated targets have opaque alpha).
+    float screenScale = (flags & uint(MaterialFlags.Screen)) != 0 ? push.frame.tuning1.w : 1.0;
+    float3 emissiveColor = baseColor * (1.0 - metalness) * emissive * push.frame.emissiveScale *
+                           push.frame.tuning1.x * screenScale;
+
+    // Stock forward ambient is the game's AmbientForwardPass floor (0.01 + probe clamp), not the
+    // full skybox irradiance. Using the nebula cubemap as ambient washed every albedo out to white.
+    float3 ambient = baseColor * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
+                     push.frame.tuning0.y * ao;
     float3 ambientSpecular = 0;
-    if (push.frame.iblCube != 0)
+    if (push.frame.iblCube != 0 && push.frame.tuning1.z > 0.0)
     {
         float maxIblMip = max(push.frame.skyboxParams.y - 1.0, 0.0);
-
-        float3 irradiance = iblColor(*push.frame, n, maxIblMip);
-
-        // The game's probe clamps resolved ambient to a minimum; the skybox alone can be nearly black
-        irradiance = max(irradiance, push.frame.ambientColor.rgb * push.frame.ambientColor.w);
-        ambient = baseColor * irradiance * push.frame.skyboxParams.z * ao;
-
         float3 reflection = reflect(-toCamera, n);
         float3 prefiltered = iblColor(*push.frame, reflection, (1.0 - gloss) * maxIblMip);
         float2 brdf = sampleTexture(push.frame.brdfLut, SamplerSlot.LinearClamp,
                                     float2(gloss, nov)).rg;
-        ambientSpecular = prefiltered * (f0 * brdf.x + brdf.y) * push.frame.skyboxParams.w * ao;
+        ambientSpecular = prefiltered * (f0 * brdf.x + brdf.y) * push.frame.skyboxParams.w * ao *
+                          push.frame.tuning1.z;
     }
-
-    return float4(direct + ambient + ambientSpecular + baseColor * emissive, 1.0);
+    return float4(direct + ambient + ambientSpecular + emissiveColor, 1.0);
 }

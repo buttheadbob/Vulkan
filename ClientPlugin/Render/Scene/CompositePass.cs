@@ -9,15 +9,18 @@ namespace ClientPlugin.Render.Scene;
 // Draws the HDR scene color onto the backbuffer (inside the backbuffer's rendering pass)
 internal sealed unsafe class CompositePass : IDisposable
 {
-    // Placeholder exposure until eye adaptation (Phase 5). The game's sun intensity is ~50, so an unmodified
-    // HDR scene would clip everything lit to white.
-    private const float DefaultExposure = 0.03f;
+
 
     [StructLayout(LayoutKind.Sequential)]
     private struct PushConstants
     {
         public uint SceneTexture;
-        public float Exposure;
+        public uint OitAccum;
+        public uint OitReveal;
+        public uint ExposureTexture;
+        public uint BloomTexture;
+        public float BloomStrength;
+        public float WhitePoint;
     }
 
     private readonly GpuContext context;
@@ -35,7 +38,8 @@ internal sealed unsafe class CompositePass : IDisposable
         }.Build(context, "composite");
     }
 
-    public void Record(VkCommandBuffer commands, SceneTargets targets, VkExtent2D backbuffer)
+    public void Record(VkCommandBuffer commands, SceneTargets targets, VkExtent2D backbuffer,
+        uint exposureTexture, uint bloomTexture, float bloomStrength, float whitePoint)
     {
         var api = context.Device.Api;
         api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics, pipeline);
@@ -46,7 +50,16 @@ internal sealed unsafe class CompositePass : IDisposable
         api.vkCmdSetViewport(commands, 0, 1, &viewport);
         api.vkCmdSetScissor(commands, 0, 1, &scissor);
 
-        var push = new PushConstants { SceneTexture = targets.ColorSlot, Exposure = DefaultExposure };
+        var push = new PushConstants
+        {
+            SceneTexture = targets.ColorSlot,
+            OitAccum = targets.OitAccumSlot,
+            OitReveal = targets.OitRevealSlot,
+            ExposureTexture = exposureTexture,
+            BloomTexture = bloomTexture,
+            BloomStrength = bloomStrength,
+            WhitePoint = whitePoint,
+        };
         api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All, 0, (uint)sizeof(PushConstants), &push);
         api.vkCmdDraw(commands, 3, 1, 0, 0);
     }

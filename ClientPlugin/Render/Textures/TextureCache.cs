@@ -55,6 +55,7 @@ internal sealed class TextureCache : IDisposable
         // Generated textures (CreateGeneratedTexture): created by the game, written by uploads or offscreen sprite rendering
         public bool IsGenerated;
         public volatile bool GeneratedReady;
+        public volatile bool Unloaded;
 
         public Entry(string name, string path = null, TextureKind kind = TextureKind.Gui)
         {
@@ -203,6 +204,7 @@ internal sealed class TextureCache : IDisposable
         var image = GpuImage.Create2D(context, (uint)width, (uint)height, mips, 1, format,
             VkImageUsageFlags.Sampled | VkImageUsageFlags.TransferDst | VkImageUsageFlags.TransferSrc | VkImageUsageFlags.ColorAttachment);
 
+        RenderLog.Info($"Generated texture: {name} {width}x{height} {type} mips {generateMipmaps} ready {immediatelyReady}");
         var entry = new Entry(name)
         {
             IsGenerated = true,
@@ -306,8 +308,11 @@ internal sealed class TextureCache : IDisposable
     {
         lock (entry)
         {
-            if (entry.Status != State.Decoded)
+            if (entry.Status != State.Decoded || entry.Unloaded)
+            {
+                entry.Pending = null;
                 return;
+            }
 
             var data = entry.Pending;
             entry.Pending = null;
@@ -439,6 +444,45 @@ internal sealed class TextureCache : IDisposable
                 },
             ],
         };
+    }
+
+    // Render thread: UnloadTextures message. Frees the bindless slot and image for every entry that
+    // refers to the file (all sampling kinds share the same path). In-flight decodes are marked and
+    // discarded when they finish; the GPU objects are released after the frames still using them.
+    public int Unload(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return 0;
+
+        var count = 0;
+        foreach (var pair in entries)
+        {
+            var entry = pair.Value;
+            if (entry.IsGenerated || entry.Unloaded)
+                continue;
+            if (!string.Equals(entry.Path, path, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(entry.Name, path, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            entry.Unloaded = true;
+            if (!entries.TryRemove(pair.Key, out _))
+                continue;
+
+            entry.Image?.Dispose();
+            entry.Image = null;
+            if (entry.Status == State.Ready)
+            {
+                if (entry.IsCube)
+                    context.Bindless.FreeCubeSlot(entry.CubeSlot);
+                else
+                    context.Bindless.FreeTextureSlot(entry.Slot);
+                entry.Status = State.Failed;
+            }
+
+            count++;
+        }
+
+        return count;
     }
 
     public void Dispose()

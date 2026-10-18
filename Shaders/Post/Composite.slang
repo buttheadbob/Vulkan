@@ -1,12 +1,16 @@
 // Brings the HDR scene to the swapchain: fullscreen triangle, exposure and tonemapping.
-// Fixed exposure is a placeholder until eye adaptation arrives with the rest of post-processing (Phase 5).
 
 import Common.Bindless;
 
 struct PushConstants
 {
     uint sceneTexture;      // Bindless slot of the HDR scene color
-    float exposure;         // Linear multiplier applied before tonemapping
+    uint oitAccum;          // Bindless slot of the OIT accumulation target
+    uint oitReveal;         // Bindless slot of the OIT revealage target
+    uint exposureTexture;   // Bindless slot of the 1x1 auto-exposure target
+    uint bloomTexture;      // Bindless slot of the blurred HDR bloom target
+    float bloomStrength;    // plugin setting: 0 disables bloom
+    float whitePoint;       // Hable tonemapping white point
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> push;
@@ -28,20 +32,51 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID)
     return output;
 }
 
-// Narkowicz ACES filmic curve, good enough as the placeholder tonemapper
-float3 aces(float3 x)
+// Shipped Postprocess/Tonemapping/Filters.hlsli: ToneMapFilmic_Hable
+float hableCurve(float x)
 {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+    const float A = 0.15;
+    const float B = 0.50;
+    const float C = 0.10;
+    const float D = 0.20;
+    const float E = 0.02;
+    const float F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 hableCurve3(float3 x)
+{
+    const float A = 0.15;
+    const float B = 0.50;
+    const float C = 0.10;
+    const float D = 0.20;
+    const float E = 0.02;
+    const float F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 hable(float3 x, float whitePoint)
+{
+    float whiteScale = 1.0 / hableCurve(max(whitePoint, 0.01));
+    return hableCurve3(x) * whiteScale;
 }
 
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target0
 {
     float3 color = sampleTexture(push.sceneTexture, SamplerSlot.PointClamp, input.uv).rgb;
-    return float4(aces(color * push.exposure), 1);
+
+    // Order-independent transparency: accum holds premultiplied color/alpha sums, reveal is the
+    // remaining visibility of the opaque scene.
+    float4 accum = sampleTexture(push.oitAccum, SamplerSlot.PointClamp, input.uv);
+    float reveal = saturate(sampleTexture(push.oitReveal, SamplerSlot.PointClamp, input.uv).r);
+    float3 oitColor = accum.rgb / max(accum.a, 1e-4);
+    float oitAlpha = 1.0 - reveal;
+    color = color * (1.0 - oitAlpha) + oitColor * oitAlpha;
+
+    float3 bloom = sampleTexture(push.bloomTexture, SamplerSlot.LinearClamp, input.uv).rgb;
+    color += bloom * push.bloomStrength;
+
+    float exposure = sampleTexture(push.exposureTexture, SamplerSlot.PointClamp, float2(0.5, 0.5)).r;
+    return float4(saturate(hable(color * exposure, push.whitePoint)), 1);
 }

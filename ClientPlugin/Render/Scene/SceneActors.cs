@@ -62,18 +62,31 @@ internal sealed class SceneActor
     // GPU skinning: skeleton description, per-frame absolute bone transforms, and the model-bone palette
     public MySkeletonBoneDescription[] SkeletonBones;
     public int[] SkeletonIndices;
-    public Matrix[] BoneTransforms;
-    public Matrix[] SkinPalette;
-    public ulong SkinnedVertexAddress; // this frame's compute output
+    public Matrix[] SkinTransforms;     // per skeleton bone, uploaded once on skeleton change
+    public uint[] SkeletonIndexUInts;   // model bone -> skeleton bone (GPU buffer source)
+    public Matrix[] BoneTransforms;     // per skeleton bone, per frame
+    public ulong SkinnedVertexAddress;  // this frame's compute output
 }
 
 // Actors by render object ID. The game owns lifetime; messages mutate this on the render thread only.
 internal sealed class SceneActors
 {
+    private sealed class PendingActor
+    {
+        public Vector3? ColorMaskHsv;
+        public Vector3? ColorMul;
+        public Dictionary<string, MyTextureChange> TextureChanges;
+    }
+
     private readonly Dictionary<uint, SceneActor> actors = new();
+    private readonly Dictionary<uint, PendingActor> pending = new();
     private readonly HashSet<uint> reportedMissingTransforms = new();
+    private long revision;
 
     public int Count => actors.Count;
+
+    // Bumped on any change that affects persistent part/material data or the actor list.
+    public long Revision => revision;
 
     public int InstancedCount
     {
@@ -107,8 +120,10 @@ internal sealed class SceneActors
             DepthBias = message.DepthBias,
             MaxViewDistance = message.MaxViewDistance,
         };
+        ApplyPending(actor);
 
         actors[message.ID] = actor;
+        revision++;
     }
 
     public void CreateCharacter(MyRenderMessageCreateRenderCharacter message)
@@ -123,6 +138,8 @@ internal sealed class SceneActors
             Visible = (message.Flags & RenderFlags.Visible) != 0,
             ColorMaskHsv = message.ColorMaskHSV ?? Vector3.Zero,
         };
+        ApplyPending(actors[message.ID]);
+        revision++;
     }
 
     public void CreateStaticGroup(MyRenderMessageCreateStaticGroup message)
@@ -137,6 +154,7 @@ internal sealed class SceneActors
             StaticMatrices = message.LocalMatrices,
             Visible = true,
         };
+        revision++;
     }
 
     public void CreateManualCullObject(MyRenderMessageCreateManualCullObject message)
@@ -160,6 +178,33 @@ internal sealed class SceneActors
     }
 
     public SceneActor Find(uint id) => actors.TryGetValue(id, out var actor) ? actor : null;
+
+    // Color/skin updates can arrive before CreateRenderEntity. Stock keeps them on the render object
+    // and applies them when the object appears; dropping them leaves the block uncoloured/unskinned.
+    private void ApplyPending(SceneActor actor)
+    {
+        if (!pending.TryGetValue(actor.Id, out var state))
+            return;
+
+        pending.Remove(actor.Id);
+        if (state.ColorMaskHsv.HasValue)
+            actor.ColorMaskHsv = state.ColorMaskHsv.Value;
+        if (state.ColorMul.HasValue)
+            actor.ColorMul = state.ColorMul.Value;
+        if (state.TextureChanges != null)
+        {
+            actor.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in state.TextureChanges)
+                actor.TextureChanges[pair.Key] = pair.Value;
+        }
+    }
+
+    private PendingActor PendingFor(uint id)
+    {
+        if (!pending.TryGetValue(id, out var state))
+            pending[id] = state = new PendingActor();
+        return state;
+    }
 
     // Manual cull objects move; their children (characters, optionally grid cells) are drawn
     // relative to them. Depth-limited against malformed/cyclic hierarchies.
@@ -197,12 +242,20 @@ internal sealed class SceneActors
     {
         var actor = Find(message.ID);
         if (actor == null)
+        {
+            var state = PendingFor(message.ID);
+            if (message.ColorMaskHSV.HasValue)
+                state.ColorMaskHsv = message.ColorMaskHSV.Value;
+            if (message.DiffuseColor.HasValue)
+                state.ColorMul = message.DiffuseColor.Value.ToVector3();
             return;
+        }
 
         if (message.ColorMaskHSV.HasValue)
             actor.ColorMaskHsv = message.ColorMaskHSV.Value;
         if (message.DiffuseColor.HasValue)
             actor.ColorMul = message.DiffuseColor.Value.ToVector3();
+        revision++;
     }
 
     public void SetModelProperties(MyRenderMessageUpdateModelProperties message)
@@ -220,6 +273,7 @@ internal sealed class SceneActors
                 actor.ColorMul = message.DiffuseColor.Value.ToVector3();
             if (message.Emissivity.HasValue)
                 actor.Emissivity = message.Emissivity.Value;
+            revision++;
             return;
         }
 
@@ -234,6 +288,7 @@ internal sealed class SceneActors
             material.ColorMul = message.DiffuseColor.Value.ToVector3();
         if (message.Emissivity.HasValue)
             material.Emissivity = message.Emissivity.Value;
+        revision++;
     }
 
     public void SetColorEmissivity(MyRenderMessageUpdateColorEmissivity message)
@@ -249,6 +304,7 @@ internal sealed class SceneActors
 
         material.ColorMul = message.DiffuseColor.ToVector3();
         material.Emissivity = message.Emissivity;
+        revision++;
     }
 
     public void SetVisibilityUpdates(uint id, bool state)
@@ -270,7 +326,17 @@ internal sealed class SceneActors
         actor.SkeletonIndices = message.SkeletonIndices == null
             ? []
             : (int[])message.SkeletonIndices.Clone();
-        actor.SkinPalette = new Matrix[actor.SkeletonIndices.Length];
+
+        actor.SkinTransforms = new Matrix[actor.SkeletonBones.Length];
+        for (var i = 0; i < actor.SkeletonBones.Length; i++)
+            actor.SkinTransforms[i] = actor.SkeletonBones[i].SkinTransform;
+
+        actor.SkeletonIndexUInts = new uint[actor.SkeletonIndices.Length];
+        for (var i = 0; i < actor.SkeletonIndices.Length; i++)
+            actor.SkeletonIndexUInts[i] = actor.SkeletonIndices[i] >= 0
+                ? (uint)actor.SkeletonIndices[i]
+                : uint.MaxValue;
+
         RenderLog.Info($"Character skeleton {message.CharacterID}: {actor.SkeletonBones.Length} bones, " +
                        $"{actor.SkeletonIndices.Length} skin indices");
     }
@@ -314,17 +380,32 @@ internal sealed class SceneActors
     {
         var actor = Find(message.RenderObjectID);
         if (actor == null)
+        {
+            var state = PendingFor(message.RenderObjectID);
+            if (message.Changes == null)
+            {
+                state.TextureChanges = null;
+                return;
+            }
+
+            state.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in message.Changes)
+                state.TextureChanges[pair.Key.String] = pair.Value;
+            revision++;
             return;
+        }
 
         if (message.Changes == null)
         {
             actor.TextureChanges = null;
+            revision++;
             return;
         }
 
         var changes = actor.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in message.Changes)
             changes[pair.Key.String] = pair.Value;
+        revision++;
     }
 
     public static RenderFlags GetMaterialFlags(SceneActor actor, string materialName)
@@ -354,17 +435,26 @@ internal sealed class SceneActors
 
         actor.Model = message.Model;
         actor.Scale = message.Scale != 0f ? message.Scale : 1f;
+        revision++;
     }
 
     public void Remove(uint id)
     {
-        actors.Remove(id);
+        pending.Remove(id);
+        if (!actors.Remove(id))
+            return;
         foreach (var actor in actors.Values)
         {
             if (actor.ParentId == id)
                 actor.ParentId = 0;
         }
+        revision++;
     }
 
-    public void Clear() => actors.Clear();
+    public void Clear()
+    {
+        actors.Clear();
+        pending.Clear();
+        revision++;
+    }
 }

@@ -42,6 +42,8 @@ public sealed class VulkanRender : IMyRender
     private GuiRenderer gui;
     private FrameCapture capture;
     private SceneTargets sceneTargets;
+    private ExposurePass exposurePass;
+    private BloomPass bloomPass;
     private SkyboxPass skyboxPass;
     private CompositePass composite;
     private VkFormat compositeFormat;
@@ -53,6 +55,12 @@ public sealed class VulkanRender : IMyRender
 
     private readonly CameraState camera = new();
     private readonly SceneActors actors = new();
+    private readonly SceneLights sceneLights = new();
+    private MyPostprocessSettings postprocessSettings = MyPostprocessSettings.Default;
+    private readonly string debugLookAtModel = Environment.GetEnvironmentVariable("VULKAN_DEBUG_LOOKAT");
+    private readonly bool debugLookAtDark = Environment.GetEnvironmentVariable("VULKAN_DEBUG_DARK") == "1";
+    private bool reportedDebugLookAt;
+    private string postprocessStatus = "";
     private MyEnvironmentData environment;
     private bool hasEnvironment;
     private int sceneFrameCounter;
@@ -144,6 +152,8 @@ public sealed class VulkanRender : IMyRender
             gui = new GuiRenderer(gpu, textures, () => messages.FrameId);
             capture = FrameCapture.FromEnvironment(gpu);
             sceneTargets = new SceneTargets(gpu);
+            exposurePass = new ExposurePass(gpu);
+            bloomPass = new BloomPass(gpu);
             skyboxPass = new SkyboxPass(gpu);
 
             settings = requested;
@@ -190,6 +200,9 @@ public sealed class VulkanRender : IMyRender
 
         composite?.Dispose();
         composite = null;
+
+        bloomPass?.Dispose();
+        bloomPass = null;
 
         skyboxPass?.Dispose();
         skyboxPass = null;
@@ -292,6 +305,44 @@ public sealed class VulkanRender : IMyRender
 
     #endregion
 
+    // Development/test helper for visual verification without user input: VULKAN_DEBUG_LOOKAT=<model
+    // substring> frames the first matching actor from the sunlit (or VULKAN_DEBUG_DARK=1 shadowed) side.
+    private void ApplyDebugCamera()
+    {
+        if (string.IsNullOrEmpty(debugLookAtModel) || !hasEnvironment)
+            return;
+
+        foreach (var actor in actors.All)
+        {
+            if (actor.Model == null || !actor.Model.Contains(debugLookAtModel, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var model = models.Get(actor.Model);
+            if (model == null)
+                continue;
+
+            var world = actors.GetWorldMatrix(actor);
+            var localCenter = (model.Bounds.Min + model.Bounds.Max) * 0.5f;
+            var center = (Vector3D)Vector3.Transform(localCenter, (Matrix)world);
+            var sun = (Vector3)environment.EnvironmentLight.SunLightDirection;
+            if (sun.LengthSquared() < 1e-6f)
+                sun = new Vector3(0.4f, 0.8f, 0.2f);
+            sun.Normalize();
+            var direction = debugLookAtDark ? sun : -sun;
+            var eye = center + (Vector3D)direction * 9.0 + Vector3D.Up * 1.5;
+            camera.SetDebugLookAt(eye, center, BackBufferResolution);
+
+            if (!reportedDebugLookAt)
+            {
+                reportedDebugLookAt = true;
+                RenderLog.Info($"Debug camera: model '{actor.Model}' actor {actor.Id}, eye {eye}, target {center}, " +
+                               $"side {(debugLookAtDark ? "dark" : "sun")}");
+            }
+
+            return;
+        }
+    }
+
     #region Frame
 
     public void Draw(bool draw = true)
@@ -322,12 +373,18 @@ public sealed class VulkanRender : IMyRender
 
         textures.ProcessDecoded();
         models.ProcessReady();
+        ApplyDebugCamera();
 
         var commands = frameLoop.Commands;
         gpu.Uploads.Record(commands);
         gui.RecordOffscreen(commands);
         if (drawScene)
             RecordScene(commands);
+        if (drawScene)
+        {
+            exposurePass.Record(commands, sceneTargets.ColorSlot, postprocessSettings);
+            bloomPass.Record(commands, sceneTargets.ColorSlot, sceneTargets.Extent);
+        }
         RecordFrame(commands);
         frameLoop.EndFrame();
     }
@@ -379,8 +436,9 @@ public sealed class VulkanRender : IMyRender
         if (sceneReady)
         {
             frameConstants = PrepareFrameConstants(environment);
-            // Compute skinning must run outside the dynamic rendering pass
+            // Compute skinning and GPU culling must run outside the dynamic rendering pass
             modelPass.RecordSkinning(commands, camera, loddingSettings, actors);
+            modelPass.RecordPrepare(commands, frameLoop.FrameSlot, camera, loddingSettings, actors);
         }
 
         api.vkCmdBeginRendering(commands, &renderingInfo);
@@ -392,6 +450,91 @@ public sealed class VulkanRender : IMyRender
         }
 
         api.vkCmdEndRendering(commands);
+
+        // Transparent pass into the order-independent OIT targets (same depth, read-only).
+        if (sceneReady)
+        {
+            var depthBarrier = new VkImageMemoryBarrier2
+            {
+                srcStageMask = VkPipelineStageFlags2.LateFragmentTests | VkPipelineStageFlags2.EarlyFragmentTests,
+                srcAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
+                dstStageMask = VkPipelineStageFlags2.EarlyFragmentTests | VkPipelineStageFlags2.LateFragmentTests,
+                dstAccessMask = VkAccessFlags2.DepthStencilAttachmentRead | VkAccessFlags2.DepthStencilAttachmentWrite,
+                oldLayout = VkImageLayout.DepthAttachmentOptimal,
+                newLayout = VkImageLayout.DepthAttachmentOptimal,
+                image = sceneTargets.Depth.Handle,
+                subresourceRange = sceneTargets.Depth.FullRange,
+                srcQueueFamilyIndex = uint.MaxValue,
+                dstQueueFamilyIndex = uint.MaxValue,
+            };
+            var depthDependency = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &depthBarrier };
+            api.vkCmdPipelineBarrier2(commands, &depthDependency);
+
+            frameLoop.Barrier(sceneTargets.OitAccum.Handle, sceneTargets.OitAccum.FullRange,
+                sceneTargets.OitAccumLayout == VkImageLayout.Undefined ? VkPipelineStageFlags2.None : VkPipelineStageFlags2.FragmentShader,
+                sceneTargets.OitAccumLayout == VkImageLayout.Undefined ? VkAccessFlags2.None : VkAccessFlags2.ShaderSampledRead,
+                sceneTargets.OitAccumLayout,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal);
+            frameLoop.Barrier(sceneTargets.OitReveal.Handle, sceneTargets.OitReveal.FullRange,
+                sceneTargets.OitRevealLayout == VkImageLayout.Undefined ? VkPipelineStageFlags2.None : VkPipelineStageFlags2.FragmentShader,
+                sceneTargets.OitRevealLayout == VkImageLayout.Undefined ? VkAccessFlags2.None : VkAccessFlags2.ShaderSampledRead,
+                sceneTargets.OitRevealLayout,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal);
+            sceneTargets.OitAccumLayout = VkImageLayout.ColorAttachmentOptimal;
+            sceneTargets.OitRevealLayout = VkImageLayout.ColorAttachmentOptimal;
+
+            var oitAttachments = stackalloc VkRenderingAttachmentInfo[2];
+            oitAttachments[0] = new VkRenderingAttachmentInfo
+            {
+                imageView = sceneTargets.OitAccum.View,
+                imageLayout = VkImageLayout.ColorAttachmentOptimal,
+                loadOp = VkAttachmentLoadOp.Clear,
+                storeOp = VkAttachmentStoreOp.Store,
+                clearValue = new VkClearValue { color = new VkClearColorValue(0f, 0f, 0f, 0f) },
+            };
+            oitAttachments[1] = new VkRenderingAttachmentInfo
+            {
+                imageView = sceneTargets.OitReveal.View,
+                imageLayout = VkImageLayout.ColorAttachmentOptimal,
+                loadOp = VkAttachmentLoadOp.Clear,
+                storeOp = VkAttachmentStoreOp.Store,
+                clearValue = new VkClearValue { color = new VkClearColorValue(1f, 0f, 0f, 0f) },
+            };
+            var oitDepth = new VkRenderingAttachmentInfo
+            {
+                imageView = sceneTargets.Depth.View,
+                imageLayout = VkImageLayout.DepthAttachmentOptimal,
+                loadOp = VkAttachmentLoadOp.Load,
+                storeOp = VkAttachmentStoreOp.Store,
+            };
+            var oitInfo = new VkRenderingInfo
+            {
+                renderArea = new VkRect2D(0, 0, extent.width, extent.height),
+                layerCount = 1,
+                colorAttachmentCount = 2,
+                pColorAttachments = oitAttachments,
+                pDepthAttachment = &oitDepth,
+            };
+
+            api.vkCmdBeginRendering(commands, &oitInfo);
+            lastDrawnActors += modelPass.RecordTransparent(commands, sceneTargets, frameConstants);
+            api.vkCmdEndRendering(commands);
+
+            frameLoop.Barrier(sceneTargets.OitAccum.Handle, sceneTargets.OitAccum.FullRange,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead,
+                VkImageLayout.ShaderReadOnlyOptimal);
+            frameLoop.Barrier(sceneTargets.OitReveal.Handle, sceneTargets.OitReveal.FullRange,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead,
+                VkImageLayout.ShaderReadOnlyOptimal);
+            sceneTargets.OitAccumLayout = VkImageLayout.ShaderReadOnlyOptimal;
+            sceneTargets.OitRevealLayout = VkImageLayout.ShaderReadOnlyOptimal;
+        }
 
         if (++sceneFrameCounter % 300 == 0)
         {
@@ -405,7 +548,8 @@ public sealed class VulkanRender : IMyRender
             }
 
             RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced, {skinned} skinned), " +
-                           $"{lastDrawnActors} draws, {lastCulledActors} culled, " +
+                           $"{lastDrawnActors} draws, {lastCulledActors} culled, gpu {modelPass.GpuPartCount} parts, " +
+                           $"{sceneLights.LastCount} lights, " +
                            $"LOD histogram [{string.Join(",", lods.ToArray())}], " +
                            $"instance buffers {instanceBuffers.Count} ({instanceBuffers.TotalInstances} instances), " +
                            $"camera {camera.HasValue}, environment {hasEnvironment}");
@@ -452,11 +596,29 @@ public sealed class VulkanRender : IMyRender
             RenderLog.Info($"Environment textures: {status}");
         }
 
+        var constants = camera.BuildFrameConstants(environment, skyboxSlot, iblSlot, brdfSlot, iblMips);
+        constants.EmissiveScale = postprocessSettings.Data.BloomEmissiveness;
+        var lightData = sceneLights.Build(gpu, camera.Position);
+        constants.Lights = lightData.Address;
+        constants.LightCount = lightData.Count;
+
         var allocation = gpu.Transient.Allocate<FrameConstants>();
-        allocation.As<FrameConstants>() = camera.BuildFrameConstants(environment,
-            skyboxSlot, iblSlot, brdfSlot, iblMips);
+        allocation.As<FrameConstants>() = constants;
 
         return allocation.Address;
+    }
+
+    // Stock Extensions.ToFileTextureEnum priority: Alphamask, ColorMetal, Extensions, NormalGloss,
+    // then the GUI/particle kinds. Particles and GUI-without-premultiply are plain sRGB here.
+    private static TextureCache.TextureKind TextureKindOf(TextureType type)
+    {
+        if ((type & TextureType.AlphaMask) != 0) return TextureCache.TextureKind.Alphamask;
+        if ((type & TextureType.ColorMetal) != 0) return TextureCache.TextureKind.ColorMetal;
+        if ((type & TextureType.Extensions) != 0) return TextureCache.TextureKind.Extensions;
+        if ((type & TextureType.NormalGloss) != 0) return TextureCache.TextureKind.NormalGloss;
+        if ((type & TextureType.CubeMap) != 0) return TextureCache.TextureKind.Skybox;
+        if ((type & TextureType.GUI) != 0) return TextureCache.TextureKind.Gui;
+        return TextureCache.TextureKind.ColorMetal;
     }
 
     private static string NormalizeAssetPath(string path) =>
@@ -509,7 +671,8 @@ public sealed class VulkanRender : IMyRender
                 compositeFormat = swapchain.Format;
             }
 
-            composite.Record(commands, sceneTargets, extent);
+            composite.Record(commands, sceneTargets, extent, exposurePass.Slot, bloomPass.Slot,
+                Config.Current.BloomScale, postprocessSettings.Data.WhitePoint);
         }
 
         gui.RecordMain(commands, swapchain.Format, BackBufferResolution, extent);
@@ -553,6 +716,76 @@ public sealed class VulkanRender : IMyRender
 
         switch (message.MessageType)
         {
+            // The game preloads block/mod assets during the loading screen. Starting the background
+            // decode/parse here lets the GPU-side creation happen before the world becomes interactive.
+            case MyRenderMessageEnum.PreloadTextures:
+            {
+                var m = (MyRenderMessagePreloadTextures)message;
+                var kind = TextureKindOf(m.TextureType);
+                foreach (var file in m.Files)
+                    textures.Get(NormalizeAssetPath(file), waitTillLoaded: false, kind);
+                RenderLog.Info($"Preload: {m.Files.Count} textures as {kind}");
+                break;
+            }
+
+            case MyRenderMessageEnum.PreloadModels:
+            {
+                var m = (MyRenderMessagePreloadModels)message;
+                foreach (var model in m.Models)
+                    models?.StartLoading(model);
+                RenderLog.Info($"Preload: {m.Models.Count} models");
+                break;
+            }
+
+            case MyRenderMessageEnum.PreloadModel:
+                models?.StartLoading(((MyRenderMessagePreloadModel)message).Name);
+                break;
+
+            case MyRenderMessageEnum.PreloadMaterials:
+                models?.StartLoading(((MyRenderMessagePreloadMaterials)message).Name);
+                break;
+
+            case MyRenderMessageEnum.CreateRenderLight:
+                sceneLights.Create(((MyRenderMessageCreateRenderLight)message).ID);
+                break;
+
+            case MyRenderMessageEnum.UpdatePostprocessSettings:
+            {
+                var m = (MyRenderMessageUpdatePostprocessSettings)message;
+                postprocessSettings = m.Settings;
+                var d = m.Settings.Data;
+                var status = $"constant {d.ConstantLuminance}, exposure {d.LuminanceExposure}, white {d.WhitePoint}, " +
+                             $"bloom emissiveness {d.BloomEmissiveness}, eye adaptation {m.Settings.EnableEyeAdaptation}";
+                if (status != postprocessStatus)
+                {
+                    postprocessStatus = status;
+                    RenderLog.Info($"Postprocess: {status}");
+                }
+                break;
+            }
+
+            case MyRenderMessageEnum.UpdateRenderLight:
+                sceneLights.Update(((MyRenderMessageUpdateRenderLight)message).Data);
+                break;
+
+            case MyRenderMessageEnum.AddRuntimeModel:
+                models?.AddRuntime((MyRenderMessageAddRuntimeModel)message);
+                break;
+
+            case MyRenderMessageEnum.UnloadTextures:
+            {
+                var m = (MyRenderMessageUnloadTextures)message;
+                var count = 0;
+                foreach (var file in m.Files)
+                    count += textures.Unload(NormalizeAssetPath(file));
+                RenderLog.Info($"UnloadTextures: {count} of {m.Files.Count} resolved");
+                break;
+            }
+
+            case MyRenderMessageEnum.DeprioritizeTextures:
+                // No streaming priority: all textures use one unified cache; nothing to do.
+                break;
+
             case MyRenderMessageEnum.CreateGeneratedTexture:
             {
                 var m = (MyRenderMessageCreateGeneratedTexture)message;
@@ -698,8 +931,11 @@ public sealed class VulkanRender : IMyRender
                 break;
 
             case MyRenderMessageEnum.ChangeMaterialTexture:
-                actors.ChangeMaterialTexture((MyRenderMessageChangeMaterialTexture)message);
+            {
+                var m = (MyRenderMessageChangeMaterialTexture)message;
+                actors.ChangeMaterialTexture(m);
                 break;
+            }
 
             case MyRenderMessageEnum.UpdateColorEmissivity:
                 actors.SetColorEmissivity((MyRenderMessageUpdateColorEmissivity)message);

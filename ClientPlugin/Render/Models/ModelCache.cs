@@ -7,10 +7,12 @@ using System.Threading.Tasks;
 using ClientPlugin.Render.Textures;
 using ClientPlugin.Render.Vulkan;
 using Vortice.Vulkan;
+using VRage.Import;
 using VRage.Utils;
 using VRageMath;
 using VRageRender;
 using VRageRender.Import;
+using VRageRender.Messages;
 
 namespace ClientPlugin.Render.Models;
 
@@ -156,7 +158,13 @@ internal sealed class ModelCache : IDisposable
     private readonly GpuContext context;
     private readonly TextureCache textures;
     private readonly Dictionary<string, Entry> entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, GpuModel> aliases = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, MwmPartData> materialParts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<Entry> decoded = new();
+    private int version;
+
+    // Incremented whenever a model becomes GPU-ready; ModelPass rebuilds its persistent parts then.
+    public int Version => version;
 
     public ModelCache(GpuContext context, TextureCache textures)
     {
@@ -173,6 +181,10 @@ internal sealed class ModelCache : IDisposable
         Entry entry;
         lock (entries)
         {
+            // AddRuntimeModel replacement: the actor references the replaced model name.
+            if (aliases.TryGetValue(model, out var runtime))
+                return runtime;
+
             if (!entries.TryGetValue(model, out entry))
             {
                 entry = new Entry { Model = model };
@@ -260,6 +272,7 @@ internal sealed class ModelCache : IDisposable
             Bounds = bounds,
         };
         entry.State = LoadState.Ready;
+        version++;
 
         var distances = data.Distances.Count > 0 ? ", switch at " + string.Join(", ", data.Distances) : "";
         var transparent = new List<string>();
@@ -272,12 +285,22 @@ internal sealed class ModelCache : IDisposable
         var skinned = lods[0].Skinned ? $", skinned {lods[0].VertexStride} B/vertex" : "";
         RenderLog.Info($"Model loaded: {entry.Model} ({lods.Count} LODs, LOD0 {lods[0].Parts.Length} parts{distances}{skinned})" +
                        (transparent.Count > 0 ? "; transparent: " + string.Join(", ", transparent) : ""));
+
     }
 
     private GpuLod CreateLod(string model, MwmMeshData data)
     {
         if (data.Positions.Length == 0 || data.Indices.Length == 0)
             return null;
+
+        // Runtime models (AddRuntimeModel) reference materials by name only. Stock resolves them
+        // through MyMeshMaterials1, which is populated while asset models load; keep the same
+        // name -> material/template mapping here.
+        foreach (var partSource in data.Parts)
+        {
+            if (!string.IsNullOrEmpty(partSource.MaterialName))
+                materialParts.TryAdd(partSource.MaterialName, partSource);
+        }
 
         var skinned = data.Skinned && data.BoneIndices != null && data.BoneWeights != null &&
                       data.BoneIndices.Length == data.Positions.Length &&
@@ -380,6 +403,145 @@ internal sealed class ModelCache : IDisposable
         };
     }
 
+    // Render thread: AddRuntimeModel (mods/physics meshes). The mesh may replace an existing model
+    // name; stock keeps a remap table, mirrored here as an alias checked by Get().
+    public void AddRuntime(MyRenderMessageAddRuntimeModel message)
+    {
+        if (string.IsNullOrEmpty(message.Name) || message.ModelData.Positions.Count == 0)
+            return;
+
+        lock (entries)
+        {
+            if (entries.ContainsKey(message.Name) || aliases.ContainsKey(message.Name))
+                return;
+        }
+
+        var source = message.ModelData;
+        var count = source.Positions.Count;
+        var indices = new uint[source.Indices.Count];
+        for (var i = 0; i < indices.Length; i++)
+            indices[i] = (uint)Math.Max(0, source.Indices[i]);
+
+        var positions = new Vector4[count];
+        var texcoords = new Vector2[count];
+        var normals = new uint[count];
+        var tangents = new uint[count];
+        var hasTangents = source.Tangents.Count == count;
+        var up = new Vector3(0, 0, 1);
+        var defaultNormal = VF_Packer.PackNormalB4(ref up);
+        for (var i = 0; i < count; i++)
+        {
+            positions[i] = new Vector4(source.Positions[i], 1f);
+            texcoords[i] = i < source.TexCoords.Count ? source.TexCoords[i] : Vector2.Zero;
+
+            var normal = i < source.Normals.Count ? source.Normals[i] : up;
+            normals[i] = VF_Packer.PackNormalB4(ref normal).PackedValue;
+            if (hasTangents)
+            {
+                // MyVertexFormatTexcoordNormalTangentTexindices packs with w = 1
+                var tangentW = new Vector4(source.Tangents[i], 1f);
+                tangents[i] = VF_Packer.PackTangentSignB4(ref tangentW).PackedValue;
+            }
+            else
+            {
+                tangents[i] = defaultNormal.PackedValue;
+            }
+        }
+
+        var parts = new List<MwmPartData>(source.Sections.Count);
+        foreach (var section in source.Sections)
+        {
+            var material = ResolveRuntimeMaterial(section.MaterialName);
+            parts.Add(new MwmPartData
+            {
+                Technique = material?.Technique ?? MyMeshDrawTechnique.MESH,
+                MaterialName = section.MaterialName ?? "",
+                IndexStart = section.IndexStart,
+                IndexCount = section.TriCount * 3,
+                ColorMetal = material?.ColorMetal,
+                NormalGloss = material?.NormalGloss,
+                Extensions = material?.Extensions,
+                Alphamask = material?.Alphamask,
+                GlassCCW = material?.GlassCCW ?? "",
+            });
+        }
+
+        if (parts.Count == 0)
+        {
+            parts.Add(new MwmPartData
+            {
+                Technique = MyMeshDrawTechnique.MESH,
+                MaterialName = "",
+                IndexStart = 0,
+                IndexCount = indices.Length,
+            });
+        }
+
+        var bounds = source.AABB;
+        if (bounds.Min.X > bounds.Max.X)
+            bounds = MwmLoader.ComputeBounds(positions);
+
+        var data = new MwmMeshData
+        {
+            Positions = positions,
+            Texcoords = texcoords,
+            Normals = normals,
+            Tangents = tangents,
+            Indices = indices,
+            Parts = parts,
+            Bounds = bounds,
+            HasTangents = hasTangents,
+        };
+
+        var lod = CreateLod(message.Name, data);
+        if (lod == null)
+        {
+            RenderLog.Warning($"Runtime model {message.Name} has no usable geometry");
+            return;
+        }
+
+        var gpu = new GpuModel
+        {
+            Name = message.Name,
+            Lods = [lod],
+            LodDistances = [],
+            Bounds = bounds,
+        };
+
+        lock (entries)
+        {
+            entries[message.Name] = new Entry
+            {
+                Model = message.Name,
+                State = LoadState.Ready,
+                Gpu = gpu,
+            };
+
+            if (!string.IsNullOrEmpty(message.ReplacedModel))
+                aliases[message.ReplacedModel] = gpu;
+        }
+
+        RenderLog.Info($"Runtime model added: {message.Name} ({count} vertices, {indices.Length / 3} triangles, " +
+                       $"{parts.Count} sections" +
+                       (string.IsNullOrEmpty(message.ReplacedModel) ? "" : $", replaces {message.ReplacedModel}") + ")");
+    }
+
+    private MwmPartData ResolveRuntimeMaterial(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+            return null;
+
+        if (materialParts.TryGetValue(name, out var material))
+            return material;
+
+        // MyPhysicsMesh strips the path before the material name
+        var slash = name.LastIndexOf('/');
+        if (slash >= 0 && materialParts.TryGetValue(name[(slash + 1)..], out material))
+            return material;
+
+        return null;
+    }
+
     private static uint PackBoneIndices(Vector4I indices) =>
         (uint)(indices.X & 0xFF)
         | ((uint)(indices.Y & 0xFF) << 8)
@@ -398,6 +560,8 @@ internal sealed class ModelCache : IDisposable
             foreach (var entry in entries.Values)
                 entry.Gpu?.Dispose();
             entries.Clear();
+            aliases.Clear();
+            materialParts.Clear();
         }
 
         decoded.Clear();

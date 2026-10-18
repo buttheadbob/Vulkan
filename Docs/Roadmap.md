@@ -7,7 +7,7 @@
 
 ## Start here
 
-**Current state (2026-10-17 session):** Phase 0 and Phase 1 done (menus, HUD, text, Vulkan settings dialog all
+**Current state (2026-10-18 session):** Phase 0 and Phase 1 done (menus, HUD, text, Vulkan settings dialog all
 verified by the user; world load/save/reload works). Phase 2 first slice is implemented, builds clean and is
 **verified in game by frame capture**: camera + environment state, actor registry, background MWM loader (LOD0),
 texture kinds (model CM/Extensions sRGB, normal maps and alphamasks linear), forward opaque model pass with sun +
@@ -34,22 +34,64 @@ per-actor bone palette (skin transforms built from `SetCharacterSkeleton` + `Set
 normal static vertex layout; the forward pass is unchanged. The critical missing link was **visibility output**:
 the game only calls `Render.Draw()` (and thus sends `SetCharacterTransforms`) for IDs in
 `MyRenderProxy.VisibleObjectsWrite`, so `ModelPass` now reports every visible actor with `SetVisibilityUpdates`.
-The character appears and animates; a skinning position bug (dropped bone translations from row 3) was fixed and
-needs a final pose check. **Cockpit/LCD texture changes** (`ChangeMaterialTexture` + generated offscreen textures +
-per-material Visible flags) are implemented; need an inside-cockpit check. **Automated tests** now work via
-`VULKAN_AUTOLOAD=<seconds>`. Still missing by design: dynamic lights, dynamic scene probe (the hard sun terminator
-on the dark side stays dark until it exists), shadows, eye adaptation. Never run git; the user commits.
+The character appears and is correctly posed/animates; the skinning position bug (dropped bone translations from
+row 3) is fixed. The bone palette is now also assembled on the GPU (`Scene/BonePalette.slang`); only the small
+input arrays are uploaded. `MetalnessColorable` now controls stock's metalness-based coloring reduction. **Cockpit/
+LCD texture changes** (`ChangeMaterialTexture` + generated offscreen textures +
+per-material Visible flags) are implemented; need an inside-cockpit check. **GPU-driven opaque rendering is in**:
+opaque non-skinned actors (including instanced cubes and static groups) are cached as **persistent part records**
+(material, vertex/index addresses, index range) and **LOD ranges**; the per-frame upload is only actor world/colour/
+bounds/visibility state. `Scene/Culling.slang` selects the LOD on the GPU with the stock distance formula and 10%
+hysteresis (per-actor LOD state lives in a persistent buffer), frustum/view-distance-culls the actor, then appends
+one indirect command + per-draw data per part into cull/no-cull buckets. The CPU issues two
+`vkCmdDrawIndirectCount` calls instead of one draw per part (captured scene: 3152 cached parts, 13 total draw calls,
+2 indirect). Instanced cube actors use the same buckets (the command carries the instance count and the draw data
+carries the instance pointer/range). Skinned actors and transparent parts keep the direct/OIT paths. **OIT is implemented**: transparent parts render order-independently into RGBA16F accumulation +
+R16F revealage targets (depth read-only), and the composite resolves them over the opaque HDR color; the CPU sort is
+gone. **Dynamic point/spot lights are implemented**: `CreateRenderLight`/`UpdateRenderLight` feed a bounded (64)
+camera-relative light buffer; the forward shader applies the stock attenuation/cone formulas and gloss/diffuse
+factors. `AddRuntimeModel` (mod runtime meshes, material lookup by name, replacement alias), `UnloadTextures` and
+`DeprioritizeTextures` are handled too. **Exposure now follows the game's postprocess settings**: the constant/eye-
+adaptation formula from the shipped `CalculateExposure`, a sparse scene-luminance pass into a 1x1 exposure texture,
+Hable tonemapping with the world's white point, and world `BloomEmissiveness` (120 in the test world) multiplying
+emissive radiance, so battery/LED indicators stay bright in shadow. The test world's eye adaptation is enabled; a
+user `ExposureScale` multiplier remains until full histogram adaptation and bloom are implemented. **LCD apps are fixed and verified**: the Linux platform's
+`GetMemoryBudgetForGeneratedTextures()` reports 0, so `MySessionComponentPanels` never counted any panel as visible
+and every working screen stayed on the Online texture. A Harmony patch sets the session component's budget to
+1 GiB; the game then creates the generated textures, renders sprites/text offscreen, and swaps `ScreenArea` to them
+(verified: "This Is A Test" text and the cockpit script screens). Fonts now load synchronously and offscreen jobs
+retry while a generated target is still being created. The persistent opaque part cache and GPU LOD selection are in
+place; skinned actors and transparent parts keep the direct/OIT paths, and the per-frame actor state is still
+uploaded from the CPU. **Automated tests** now work via
+`VULKAN_AUTOLOAD=<seconds>`; `VULKAN_DEBUG_LOOKAT=<model substring>` (+ `VULKAN_DEBUG_DARK=1`) frames the first
+matching actor for visual checks. Still missing by design: dynamic scene probe (the hard sun terminator on the dark
+side stays dark until it exists), shadows, and bloom (world bloom-emissiveness is applied to the material radiance,
+not as a screen-space glow yet). Never run git; the user commits.
+
+**Block paints and skins are verified (2026-10-18).** Space Engineers stores a block's paint as a
+`ColorMaskHSV` **delta**, not a final colour; stock `ColorizeGray` adds
+`TextureDebugMultipliers.ColorizeHSV = (0, 0.8, -0.1)` before converting HSV back to RGB. Our shader
+had omitted that conversion, so the user's applied colours collapsed to grey. With the stock conversion
+restored, the saved green world renders green (capture verified), and the user changed a battery to red
+in game and confirmed it displays correctly. `ChangeMaterialTexture` and `UpdateRenderEntity` updates
+that arrive before `CreateRenderEntity` are now held in pending state and applied at creation (skins
+included); the CarbonFibre skin pattern is visible. Specular/reflection remain user-tunable sliders and
+default to 0 to match stock's forward-opaque shading.
 
 **Next tasks, in order:**
-1. **Verify GPU skinning/pose in third person and first person** (head materials hidden, body posed, no distortion)
-   and the cockpit screens inside a cockpit (battery/panels). Fix any remaining bone-mapping issues.
-2. **Dynamic environment probe** (scene cubemap capture + prefilter, close/far blend) to soften the hard sunlight
-   terminator and light interiors, then dynamic lights (`CreateRenderLight`/`UpdateRenderLight`), shadows.
-3. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
+1. **Finish the GPU-driven scene path**: persistent opaque parts, GPU LOD selection (stock hysteresis) and
+   static-group buckets are in. Remaining: upload actor state only when it changes (cache the camera-relative world
+   per actor instead of rebuilding every visible actor record), move skinned actors and transparent parts into GPU
+   buckets, and keep the direct path only for unsupported techniques. Goal: no per-frame actor/part walk.
+2. **Bloom pass** (stock prefilter from `BloomEmissiveness`, cascaded blur, composite add) so bright indicators glow
+   instead of only reading as hot pixels.
+3. **Dynamic environment probe** (scene cubemap capture + prefilter, close/far blend) to soften the hard sunlight
+   terminator and light interiors; then shadows.
+4. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
    MRT pass) so TAA/FSR/GI can build on it.
-4. Remaining Phase 2: voxel cells, static/merge groups; remaining Phase 1 odds: texture load/unload messages,
-   options presets.
-5. When flying away, watch the `LOD histogram` in the 5-second `Scene:` log line to confirm LOD switching.
+5. Remaining Phase 2: voxel cells, static/merge groups, world sprites/particles; remaining Phase 1 odds: options
+   presets.
+6. When flying away, watch the `LOD histogram` in the 5-second `Scene:` log line to confirm LOD switching.
 
 **User preferences / rules (all sessions):**
 - Never run git commands. The user commits and pushes.
@@ -125,9 +167,16 @@ Pulsar client plugin, that:
 | Root namespace | `ClientPlugin` (template default). LinuxCompat also uses `ClientPlugin.*`; no clash (different assemblies), but look its types up by full name. |
 | Monitor selection | The game's "Video Adapter" is an adapter+output pair (`MyAdapterInfo.OutputName`/`DesktopBounds`); SE stores its index (`VideoAdapter`). We forward `AdapterOrdinal` changes (not only window-mode changes) and select the SDL display whose bounds/name matches, via `SDL_SetWindowPosition(SDL_WINDOWPOS_CENTERED_DISPLAY(id), …)`: SDL records it as the pending fullscreen display even on Wayland, where moving a toplevel is refused. Done on LinuxCompat's SDL thread through reflection on `SdlRenderThread.Dispatch`. |
 | Winding / culling | D3D's default front face is **clockwise** (`FrontCounterClockwise=false`). Our projection negates `M22` for Vulkan, which cancels Vulkan's opposite framebuffer Y direction, so final screen-space winding stays clockwise: model pipelines use `FrontFace.Clockwise` + `CullMode.Back` (or `None` for `NoBackFaceCulling`). Pipelines that do not follow this will show holes/inside-out geometry. |
-| Image-based lighting | Static first pass: `BackgroundCube.dds` is the depth-less background; `BackgroundCubeIndirect.dds` (10 prefiltered mips) gives diffuse irradiance (last mip) and roughness-based reflections; `ambient_brdf.dds` (R16G16F, linear) gives the split-sum BRDF. Cubemaps use their own bindless array (set 0, binding 2); sampling follows stock `ApplySkyboxOrientation`. The dynamic scene probe (stock `MyEnvironmentProbe`), far/near probe blending and eye adaptation come later. |
-| Transparent models | Glass/holo/shield parts look up `VRageRender.MyTransparentMaterials` by material name (fallback `GlassCCW`), use the stock material color (premultiplied linear), color add, light multiplier, reflectivity/fresnel/gloss and texture/gloss texture. Drawn after opaque with depth test read-only, no depth write, premultiplied-alpha blending, back-to-front sorting, and per-material `TriangleFaceCulling`. OIT, dithering and per-instance sorting are not implemented yet. |
-| Skinning | **GPU compute deformation**, no CPU vertex work: the skinned MWM buffer (64 B/vertex with bone indices/weights) is deformed by a compute pass using a per-actor bone palette (bind-inverse × absolute, ~81 matrices assembled per frame on the CPU) into the normal 32 B static vertex layout; the forward pass is unchanged. The game calls `Render.Draw` only for IDs reported in `MyRenderProxy.VisibleObjectsWrite`, so visible IDs of actors with `SetVisibilityUpdates` are published each frame; without this the game never sends `SetCharacterTransforms`. |
+| Image-based lighting | Static first pass: `BackgroundCube.dds` is the depth-less background; `BackgroundCubeIndirect.dds` (10 prefiltered mips) gives diffuse irradiance (last mip) and roughness-based reflections; `ambient_brdf.dds` (R16G16F, linear) gives the split-sum BRDF. Cubemaps use their own bindless array (set 0, binding 2); sampling follows stock `ApplySkyboxOrientation`. The dynamic scene probe (stock `MyEnvironmentProbe`), far/near probe blending and full histogram eye adaptation come later; a simple 1x1 exposure pass and Hable tonemapping are in place. |
+| Transparent models | Glass/holo/shield parts look up `VRageRender.MyTransparentMaterials` by material name (fallback `GlassCCW`), use the stock material color (linear), color add, light multiplier, reflectivity/fresnel/gloss and texture/gloss texture. **Weighted-blended OIT**: a second pass writes RGBA16F accumulation (`color * alpha * weight`, additive) and R16F revealage (`dst *= 1 - alpha` via `OneMinusSrcColor`) with depth test read-only/no depth write, per-material `TriangleFaceCulling`; composite resolves `accum.rgb/accum.a` over the scene with `1 - reveal`. No CPU sort. |
+| Skinning | **All GPU**: the skinned MWM buffer (64 B/vertex with bone indices/weights) is deformed by a compute pass; a second compute pass (`BonePalette.slang`) assembles the model-bone palette (bind-inverse × absolute) on the GPU. The CPU only uploads the skeleton skin transforms, the per-frame absolute transforms and the model→skeleton index map. Output is the normal 32 B static vertex layout, so the forward pass is unchanged. The game calls `Render.Draw` only for IDs reported in `MyRenderProxy.VisibleObjectsWrite`, so visible IDs of actors with `SetVisibilityUpdates` are published each frame; without this the game never sends `SetCharacterTransforms`. |
+| Material coloring | `ColorMaskHSV` is a **delta from the grey/magenta paint base**, not a final colour. Stock `ColorizeGray` adds `TextureDebugMultipliers.ColorizeHSV` (default `(0, 0.8, -0.1)`) after zeroing the texture's HSV; we do the same. `RemoveMetalnessFromColoring` is applied unless the effective material flags include `RenderFlags.MetalnessColorable` (asset-modifier skins). Pre-create colour/skin messages are kept on a pending actor and applied at creation. |
+| GPU buffers | No UBOs by design: per-frame/per-draw constants go through push constants plus host-visible transient buffers read via buffer device addresses (the modern SSBO style). Persistent device-local buffers hold model vertices/indices, instance data, textures and the skinned streams. Compute writes/reads (skinning, palette, culling) use the same BDA path. Indirect buffers are host-visible storage buffers with `Indirect` usage. Storage images/RW buffers and acceleration structures are still reserved for OIT, GI/RT. |
+| GPU-driven opaque draws | Opaque, non-skinned actors (including instanced cubes and **static groups**) use a **persistent** `GpuScenePart` buffer (material + vertex/index BDAs + index range, built on actor/model/material changes), persistent per-LOD ranges, and a persistent per-actor LOD-state buffer. Per frame the CPU uploads only actor world/colour/bounds/instance state; `Scene/Culling.slang` runs one thread per actor, selects the LOD with the stock distance formula + 10% hysteresis, sphere-tests 5 normalized planes + `MaxViewDistance`, then appends one command + 184-byte draw data per part to a cull/no-cull bucket: `[counter u32][commands @64, 16 B]` followed by draw data. Static groups are expanded into one actor record per local matrix sharing the same ranges. The indirect command is **non-indexed** (`vertexCount=indexCount`); the vertex shader fetches the model index from the draw data's index buffer BDA and then the vertex. `SV_DrawIndex` selects the draw data; the fragment gets the same material through a flat draw-index varying. `push.drawData == 0` selects the direct push path, so one `Model.slang`/pipeline serves both. |
+| Asset preload | `PreloadTextures`/`PreloadModel(s)`/`PreloadMaterials` start background decodes/parses immediately (mapping TextureType to the sampling kind), so GPU buffers/images are created during the loading screen rather than on first draw. Model texture dependencies also start when each model is parsed. `UnloadTextures` frees matching entries/slots (in-flight decodes are discarded) and `DeprioritizeTextures` is a no-op (no streaming priorities). `AddRuntimeModel` builds a one-LOD GPU mesh from `MyModelData`, resolves section material names through the model-material table, and registers the name (plus a `ReplacedModel` alias). |
+| Exposure / emissive | `UpdatePostprocessSettings` is cached. `Post/Exposure.slang` samples the HDR scene on a sparse grid, averages log-luminance, applies the shipped `CalculateExposure` (`LuminanceKeyValueCendos`) and writes a 1x1 R32F exposure texture; the composite samples it and applies Hable with the world's `WhitePoint`. The 0.025 calibration was removed (it made the world ~40x too dark); a user `ExposureScale` multiplier is applied and clamped to [0.02, 4]. Emissive radiance is `albedo * (1 - metalness) * extras.y * Emissivity * BloomEmissiveness`; the test world uses `BloomEmissiveness=120`, which is what makes battery LEDs read in shadow. Full histogram eye adaptation, temporal smoothing and bloom are still missing. |
+| LCD budget | Linux's platform renderer reports no generated-texture memory budget. `LcdMemoryBudgetPatch` sets `MySessionComponentPanels.m_memoryBudget` to 1 GiB after init; otherwise the panel manager's visible counter never reaches its threshold, `IsInRange` stays false, and every powered LCD keeps the default "Online" texture. |
+| Dynamic lights | `CreateRenderLight`/`UpdateRenderLight` are cached per ID. Each frame up to 64 point/spot lights are uploaded camera-relative (`GpuLight`, 64 B) through the transient allocator; `FrameConstants` carries the pointer/count. The game already multiplies intensity into the linear color; `MyLightComponent`'s falloff conversion and the stock hard/diffuse attenuation and spot cone are applied in `Model.slang`. Shadows, glare/flares and light culling (stock uses tiled forward) are not implemented. |
 | Git | The user does all git operations. Sessions never run git commands. |
 
 ## Our code map
@@ -162,14 +211,15 @@ Pulsar client plugin, that:
 | `Render/Vulkan/TransientAllocator.cs` | `GpuContext.Transient`: per-frame linear host-visible scratch with device addresses (frame constants, per-draw data, instances). Reset in `GpuContext.BeginFrame`. |
 | `Render/Scene/SceneTargets.cs` | HDR color (R16G16B16A16_SFLOAT) + depth (D32_SFLOAT, reverse Z, cleared to 0) at the game resolution, bindless slots; recreated on resize. |
 | `Render/Scene/SkyboxPass.cs` | Depth-less fullscreen background sampling the environment cubemap along the view ray. |
-| `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, IBL slots/params), LOD coefficient. |
-| `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy, instance ranges/bounds, max view distance, per-actor LOD. |
+| `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, ambient, IBL slots/params, paint conversion `ColorizeHsv`, tuning), LOD coefficient. |
+| `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy, instance ranges/bounds, max view distance, per-actor LOD; `Revision` drives persistent part-cache rebuilds and pending pre-create colour/skin state. |
 | `Render/Scene/Frustum.cs` | Five-plane infinite-far-plane culling from the stock view-projection. |
-| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: LOD choice, frustum/distance culling, cull-back and no-cull pipelines, bindless materials, IBL + sun shading, cube instancing; GPU skinning compute pre-pass; visible-object reporting for the game (`VisibleObjectsWrite`). |
+| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: persistent part cache + GPU LOD/culling for opaque non-skinned actors (incl. static groups/cubes), direct path for skinned/transparent, cull-back/no-cull pipelines, bindless materials, IBL + sun shading; GPU skinning compute pre-pass; visible-object reporting (`VisibleObjectsWrite`). |
+| `Render/Scene/GpuSceneDraws.cs` | Wire-format structs for persistent parts/LOD ranges/actor state, the cull compute dispatch, and the two indirect cull/no-cull buckets. |
 | `Render/Scene/InstanceBuffers.cs` | GPU instance buffers for cube/generic ranges (replaced per update for frames-in-flight safety). |
 | `Render/Models/MwmLoader.cs`, `MwmMeshData.cs` | Background MWM parsing through `MyModelImporter`, all LODs, stock vertex decodes, texture path resolution. |
-| `Render/Models/ModelCache.cs` | Model path → parsed LOD data → device-local GPU buffers, parts and texture entries; LOD selection helper. |
-| `Render/Scene/CompositePass.cs` | Fullscreen triangle: scene color → backbuffer (fixed-exposure ACES placeholder). |
+| `Render/Models/ModelCache.cs` | Model path → parsed LOD data → device-local GPU buffers, parts and texture entries; LOD selection helper; `Version` bumps when a model becomes GPU-ready so `ModelPass` rebuilds its part cache. |
+| `Render/Scene/CompositePass.cs` | Fullscreen triangle: HDR scene + OIT resolve → ACES/Hable backbuffer using the exposure texture. |
 | `Render/Vulkan/ShaderModule.cs`, `VkNames.cs`, `DeviceCapabilities.cs` | Helpers. |
 | `Render/Textures/DdsLoader.cs`, `TextureData.cs` | DDS → upload layout (DX10, FourCC, masks, palette; conversions to RGBA8 where Vulkan has no format). |
 | `Render/Textures/TextureCache.cs` | Name → texture; async decode, render-thread finish/upload, sRGB + GUI premultiply like stock, size/loaded queries. |
@@ -177,7 +227,7 @@ Pulsar client plugin, that:
 | `Render/Sprites/SpriteBatcher.cs`, `SpriteRenderer.cs`, `SpriteInstance.cs` | CPU batching (stock geometry rules) and GPU drawing (instances by device address, bindless textures). |
 | `Render/Sprites/RenderFont.cs` | Port of stock `MyRenderFont` text layout on the game's `MyFont`. |
 | `Render/Shaders/ShaderBytecode.g.cs` | Generated SPIR-V. Do not edit. |
-| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Post/Composite.slang`, `Scene/Model.slang`, `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Scene/Skinning.slang` (compute); `shaders.json` manifest. |
+| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Post/Composite.slang`, `Scene/Model.slang`, `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Scene/Culling.slang` (compute), `Scene/Skinning.slang` (compute), `Scene/BonePalette.slang` (compute), `Common/SkinningCommon.slang` (shared layouts); `shaders.json` manifest. |
 | `Tools/ShaderCompiler`, `Tools/VulkanSmokeTest` | Dev tools (not in `<SourceDirectories>`, never shipped). |
 
 ## Architecture
@@ -292,7 +342,7 @@ out in the UI with a reason.
 
 ## Next task details
 
-(Both tasks below are implemented — offscreen targets are marked [~] until an LCD is seen working in a world. Kept as
+(Both tasks below are implemented and verified — LCD offscreen targets are [x] after the cockpit screen test. Kept as
 reference for the stock behaviour.)
 
 ### Offscreen sprite targets and generated textures
@@ -369,8 +419,10 @@ Stock processing: `VRage.Render11/VRageRender/MyRender11.cs:1825` and `:1844-189
 - `RenderFlags` (`VRage.Render/VRageRender/RenderFlags.cs`): `Visible=0x10`, `Near=0x40`,
   `SkipInMainView=0x400`, `SkipInForward=0x20000`, `NoBackFaceCulling=0x200`, `CastShadows=8`,
   `DistanceFade=0x4000`, etc. Our main pass skips `SkipInMainView | SkipInForward`; `Visible` gates drawing.
-- `ColorMaskHSV` is passed to the shader **as HSV delta**, unchanged (`ColorFromMask` at `MyRender11.cs:2398`
-  returns its argument). The shader adds it to the texture HSV (`ColorizeGray`).
+- `ColorMaskHSV` is passed to the shader **as an HSV delta**, unchanged (`ColorFromMask` at
+  `MyRender11.cs:2398` returns its argument). `ColorizeGray` adds it to the grey texture HSV **and then
+  adds stock's `TextureDebugMultipliers.ColorizeHSV` default `(0, 0.8, -0.1)`** before converting back
+  to RGB; omitting that last term makes default/painted masks render grey.
 - `UpdateRenderEntity.DiffuseColor` is not applied to entities by stock Render11 (only debris/instances use their
   own data); `UpdateModelProperties.DiffuseColor`/`Emissivity` are per material. Default emissivity is 1
   (`VRage.Render11.Scene.Components/MyModelProperties.cs:8`). Our actor registry applies these as color/emissive
@@ -478,9 +530,31 @@ read swapped contents), `SetInstanceBuffer` puts the range on the actor, and the
 `MyCubeInstanceData`'s packed ortho matrix and per-instance HSV. Verified by frame capture (18 instances).
 Generic (`MyInstanceData`) buffers are stored but not drawn yet.
 
-Not implemented yet: generic instancing (world-environment sectors), voxels, LOD selection, frustum culling,
-skinning, transparency, shadows, G-buffer/motion vectors, skybox, eye adaptation (a fixed-exposure ACES tonemap
-placeholder is in `CompositePass`).
+Not implemented in that first slice (later added): generic instancing (world-environment sectors), voxels,
+LOD selection, frustum culling, skinning, transparency, shadows, G-buffer/motion vectors, skybox, eye adaptation
+(a fixed-exposure ACES tonemap placeholder was in `CompositePass`).
+
+## CPU-to-GPU migration
+
+Physics owns the CPU, so the renderer must not grow per-frame CPU work. Rule for new features: if it can run in a
+compute pass or a shader, it does; CPU is for uploads, resource lifetime and gameplay messages only.
+
+Already on the GPU: character deformation and bone-palette assembly, vertex/instance decoding, materials/IBL/
+lighting, skybox, mip generation, sprites/offscreen rendering; model/texture preloads start background work during
+the loading screen.
+
+Remaining per-frame CPU work and its GPU replacement:
+
+| CPU work now | GPU replacement |
+|--------------|-----------------|
+| Actor/part enumeration, frustum + distance culling, per-draw submission | **Persistent opaque parts + GPU LOD/culling/submission done for non-skinned actors, including instanced cubes and static groups.** Still CPU: per-frame actor record upload, skinned actors and transparent parts. Next: upload actor state only when changed and move the remaining paths into GPU buckets. |
+| Transparent back-to-front sorting | **Done**: weighted-blended OIT accumulation + revealage targets; no CPU sort. |
+| Per-draw world transposes / material data packing | Still CPU: computed while writing the per-frame cull inputs; the culling compute copies them into draw data. Move with the persistent scene buffers. |
+| Per-frame transient uploads | Persistent buffers updated only on messages (create/update/remove/texture change). |
+| UI text layout / sprite batching | CPU by nature (font shaping), but glyphs and quads stay GPU; can be cached and uploaded on change. |
+
+The indirect path's required pieces are already in place: `shaderDrawParameters` is enabled, `SV_DrawIndex` is
+supported by Slang, bindless + BDA is used everywhere, and compute pipelines/barriers exist from skinning.
 
 ## Phases
 
@@ -518,15 +592,16 @@ Known gaps from Phase 0:
 - [x] Verified in game by frame capture: Graphics Options screen and main menu correct, including downloaded
       PNG/JPG news banners (2026-10-17)
 - [x] User's interactive check: menus work (2026-10-17)
-- [~] Offscreen sprite targets + generated textures: `TextureCache.CreateGenerated/ResetGenerated/DestroyGenerated`
+- [x] Offscreen sprite targets + generated textures: `TextureCache.CreateGenerated/ResetGenerated/DestroyGenerated`
       (RGBA → R8G8B8A8_SRGB, RGBA_Linear → UNORM, Alphamask → R8; optional full mip chain via `MipGenerator` blits),
       `GuiRenderer` keeps offscreen sprite messages per target (AddRef, newest message batch wins, like
       `MySpritesManager`), `RenderOffscreenTexture` queues a job (max 16 per frame), recorded before the main pass:
       clear to linearized background, sprites with `SpriteBlend.PremultipliedColorOnly` in `size * AspectRatio`
-      coordinates, then mips; `GeneratedReady` drives `IsTextureLoaded`. `SpriteRenderer` now caches pipelines per
+      coordinates, then mips; `GeneratedReady` drives `IsTextureLoaded`. `SpriteRenderer` caches pipelines per
       (format, blend) and allocates instances linearly per frame. `UploadQueue` uses dedicated staging outside an
-      open frame. Builds and the menu still renders; not exercised yet (LCDs need a loaded world).
-- [ ] Texture messages: PreloadTextures, UnloadTexture(s), DeprioritizeTextures
+      open frame. Verified by the cockpit LCD in the user's world (DangerZone background + text).
+- [x] Preload messages: PreloadTextures, PreloadModel(s), PreloadMaterials (background start, GPU work during load)
+- [ ] Texture messages: UnloadTexture(s), DeprioritizeTextures
 - [x] World load / save / reload on Vulkan works (user, 2026-10-17): HUD, menus and "World loaded" text show,
       no errors in the log; the game does not block on render outputs we do not send yet
 - [ ] Video: stubbed (`IsVideoValid` false; the menu shows its static background). Real playback in Phase 7
@@ -544,17 +619,21 @@ Known gaps from Phase 0:
       `TransientAllocator`, `DrawScene` handling (scene drawn only on frames with `DrawScene`)
 - [x] World message spec written into this roadmap (see [World message spec](#world-message-spec))
 - [x] Camera, frame constants, reverse-Z infinite projection, camera-relative world matrices
-- [x] Frustum culling, `MaxViewDistance`, LOD selection (all LODs loaded, stock distances + hysteresis)
+- [x] Frustum culling, `MaxViewDistance`, LOD selection (all LODs loaded, stock distances + hysteresis);
+      opaque LOD selection now runs in the culling compute over persistent part ranges
 - [x] Back-face culling matching D3D (clockwise front faces; `NoBackFaceCulling` uses a no-cull pipeline)
 - [x] Actors/render entities, MWM meshes, cube-grid instancing, static groups
-- [x] Materials (standard + alpha-masked) on bindless textures, stock decodes and colorize
+- [x] Materials (standard + alpha-masked) on bindless textures, stock decodes and colorize;
+      block paints and skins verified in game (green capture, user red-paint confirmation)
 - [~] Transparent models (glass, holo, shield): implemented with `MyTransparentMaterials`, premultiplied blend,
       depth read-only, back-to-front sorting; visual verification pending
 - [ ] Triplanar materials, decals and OIT/dithering
-- [~] Skinned characters: GPU compute deformation, skeleton/transforms, visibility output; character appears and
-      animates, final pose/head verification pending
+- [x] Skinned characters: GPU compute deformation, GPU bone palette, skeleton/transforms, visibility output;
+      character appears correctly posed and animates (third-person capture). First-person head hiding uses the
+      game's per-material visibility flags.
 - [ ] Voxel cells (consume game-meshed clipmap data), voxel materials; `ClipmapsReady` output
 - [ ] G-buffer **including motion vectors** (needed later for TAA/FSR/GI); forward sun lighting is done
+- [x] Persistent opaque part/material ranges + GPU LOD selection incl. static groups (first GPU-scene slice)
 - [ ] Frame graph + pipeline cache
 - **Milestone:** load a world; grids, characters and planets render.
 
@@ -562,13 +641,13 @@ Known gaps from Phase 0:
 - [~] PBR lighting (GGX, energy-conserving), sun + static skybox IBL (done); dynamic scene probe and eye
       adaptation still open
 - [ ] Cascaded shadow maps (+ PCSS option, contact shadows), spot shadow pool
-- [ ] Clustered point/spot lights (`CreateRenderLight` messages are ignored today)
+- [~] Dynamic point/spot lights (`CreateRenderLight`/`UpdateRenderLight` implemented; clustered light culling later)
 - [ ] Dynamic environment probe + prefiltering (scene capture, close/far blend), SSR
 - [ ] SSAO / GTAO
 - **Milestone:** lighting at least equal to stock.
 
 ### Phase 4 — Transparency and effects
-- [ ] Billboards, weighted OIT, transparent models (+ decals on glass)
+- [x] Weighted OIT and transparent models (glass); [ ] billboards, screen-space decals, foliage
 - [ ] GPU particles
 - [ ] Atmosphere scattering, clouds, fog
 - [ ] Screen-space decals, foliage, highlights/outlines
@@ -739,3 +818,97 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   Continue Game via a Harmony postfix. Verified: auto-load + frame capture fully automatic; character appears and
   animates in third person; build and shaders clean. Remaining: final pose/head verification, cockpit screen
   verification, dynamic probe/lights, G-buffer.
+- **2026-10-17** — More work moved to the GPU. Split the skinning shaders into `Common/SkinningCommon.slang`,
+  `Scene/Skinning.slang` and `Scene/BonePalette.slang`: the model-bone palette (bind-inverse × absolute) is now
+  assembled by a compute pass instead of the CPU; only skin transforms, per-frame absolute transforms and the
+  model→skeleton index map are uploaded. Added the stock `RemoveMetalnessFromColoring` rule unless the effective
+  material flags include `RenderFlags.MetalnessColorable` (asset-modifier skins). Verified with an automated
+  run: character correctly posed next to the cockpit, 1 skinned actor, no errors, build and shaders clean.
+  Remaining GPU moves: GPU-driven culling/LOD with indirect draws and OIT (next, architectural).
+- **2026-10-18** — LCD fix (root cause found). `MySessionComponentPanels.IsInRange` needs a panel to stay in the
+  texture-memory budget for several ticks; the Linux platform's `GetMemoryBudgetForGeneratedTextures()` returns 0,
+  so the budget was empty and every working LCD stayed on the default "Online" texture (no `CreateGeneratedTexture`
+  was ever sent). Added `Patches/LcdMemoryBudgetPatch.cs` to set the component's `m_memoryBudget` to 1 GiB. Verified
+  in the user's saved cockpit: the large LCD now renders its `DrawSpriteAtlas` grid and "This Is A Test" text, the
+  cockpit `ScreenArea`s create 256/512 px generated textures, and `Offscreen` jobs report the expected sprite counts.
+  Also removed the temporary out-of-range diagnostic. Build/shaders clean.
+- **2026-10-18** — Proper emissive exposure. The user reported battery LEDs visible only in sunlight. Stock's
+  `PixelStage.hlsli` adds `albedo * emissive * Post.BloomEmissiveness`; the test world sets `BloomEmissiveness=120`
+  with eye adaptation on, `LuminanceExposure=0`, `WhitePoint=11.2`. `Model.slang` now multiplies emissive by that
+  world setting (and `(1-metalness)`), and `Post/Exposure.slang` implements the shipped `CalculateExposure` over a
+  sparse log-luminance average into a 1x1 R32F texture; the composite applies it with Hable and the world white
+  point. A calibration factor (0.025, clamped) compensates for the LDR skybox until full histogram adaptation/bloom.
+  Verified with the user's battery camera and `VULKAN_DEBUG_LOOKAT=BatteryLarge`: both faces' green bars stay bright
+  on the unlit side; scene remains dark. Also made font loading synchronous and offscreen targets retry when a
+  generated texture is not yet created. LCD repro remains blocked: the saved world's cockpit screens log
+  `Screen texture ... -> offline` and produce no generated textures. Build/shaders clean.
+- **2026-10-17** — OIT, dynamic lights, runtime models, texture unloading. Transparent parts now render into
+  RGBA16F accumulation + R16F revealage targets through a dedicated pass (depth load/read-only, no writes) using
+  weighted-blended OIT; the composite resolves them over the HDR scene, so the CPU back-to-front sort is gone.
+  Added `CreateRenderLight`/`UpdateRenderLight`: a per-frame camera-relative `GpuLight` buffer (max 64) in
+  `FrameConstants`, stock falloff/attenuation/spot-cone math, and point/spot diffuse+GGX specular in `Model.slang`;
+  the cockpit light housing now shows a clear highlight. Implemented `AddRuntimeModel` (builds a one-LOD
+  `GpuModel` from `MyModelData`, packs normals/tangents, resolves material names through a model-material table,
+  supports the `ReplacedModel` alias) and `UnloadTextures`/`DeprioritizeTextures` (free slots/images, discard
+  in-flight decodes). Verified by automated capture: scene still renders, OIT glass path clean, 12 draw calls,
+  36 GPU parts, new light highlight visible, no errors. Build and shaders clean. Next: persistent scene data +
+  GPU LOD.
+- **2026-10-17** — GPU-driven opaque culling and indirect draws. Added `Scene/Culling.slang`,
+  `Scene/GpuSceneDraws.cs` and indirect support to `Scene/Model.slang`: simple actors (no instances, no static
+  groups, not skinned) are written to a per-frame host-visible `CullInput` buffer, a compute pass frustum- and
+  view-distance-culls them and atomically appends commands + 184 B draw data into two buckets (cull/no-cull), and
+  the CPU submits two `vkCmdDrawIndirectCount` calls. The command/input carry the instance count and the draw data the instance buffer address/range, so cube instances share the same path. Draws are non-indexed (`vertexCount = indexCount`) and the
+  vertex shader fetches the real index through the draw data's buffer device address, so no global index buffer is
+  needed; `SV_DrawIndex` + a flat varying select the draw data in both stages, and `push.drawData == 0` keeps the
+  direct path for skinned/static-group actors. Actors without static-group matrices (including instanced
+  cubes) are now fully recorded in `RecordPrepare`
+  (opaque -> GPU buckets, transparent -> OIT list) and skipped by `Record`, removing the duplicate per-frame walk;
+  the scene log now prints the GPU part count. Instanced cube actors were added to the same path (commands carry
+  instance counts, draw data carries the instance pointer/range); the cockpit scene has no visible instanced
+  opaque parts to exercise it. Verified by automated capture: cockpit renders identically, 36 GPU parts, 12 total
+  draw calls (2 indirect), transparent cockpit glass still correct, no errors. LOD selection and material packing
+  remain CPU-side; next is persistent scene data + GPU LOD.
+- **2026-10-17** — Asset preloading and buffer-strategy review. `PreloadTextures` (mapped to the correct sampling
+  kind via `TextureType`), `PreloadModel(s)` and `PreloadMaterials` now start background decodes/parses during the
+  loading screen, so GPU buffers/images are created before the world becomes interactive; model texture
+  dependencies already start when a model is parsed. Verified: the test world requested one preload (skybox),
+  which loaded; no errors. Reviewed GPU buffer use: no UBOs by design (push constants + host-visible transient
+  buffers read via BDAs), persistent device-local model/index/instance/texture buffers, and compute BDA buffers
+  for skinning/palette. Storage images/RW buffers and indirect/acceleration structures remain for GPU-driven
+  culling, OIT and GI/RT. Remaining: unload/deprioritize messages, `AddRuntimeModel` (mod runtime meshes).
+- **2026-10-18** — LCD offscreen content and live lighting tuning. Root cause of the missing background sprite: the
+  game's offscreen job was rendered in the same frame its `DrawSpriteAtlas` texture was first decoded, but our transfer
+  uploads are recorded before `RecordOffscreen`; the sprite sampled the not-yet-uploaded image once and the target was
+  never redrawn. Offscreen jobs now warm every sampled texture and defer rendering by one frame
+  (`GuiRenderer.WarmJobTextures`), so DangerZone/text/font pages are uploaded before the target is rendered. Also fixed
+  the `Screen` material flag mismatch (C# 512 vs shader 256): generated LCD targets now force metalness 0 and use the
+  ScreenArea/CockpitScreen add-map emissive. Debug dump/target/quads removed. Auto-exposure no longer uses the 0.025
+  calibration (it made the whole world ~40x too dark); it uses the shipped `CalculateExposure` result with a
+  user-tunable multiplier. Added "World lighting tuning" sliders to the plugin settings (Options > Graphics > Vulkan
+  Renderer): Exposure, Sun, Ambient, Specular, Reflections, Metalness, Emissive, Screen and Dynamic lights, applied
+  live through `FrameConstants.tuning0/tuning1` and the exposure push constants. Defaults: Exposure 0.25, all others
+  1. Verified LCD shows the DangerZone background + text, battery LEDs stay bright, and the world is no longer crushed
+  to black. Next: collect the user's slider values to correct the stock shader math instead of compensating globally.
+- **2026-10-18** — Block paints, skins and exposure. First fixed the wash-out: our full-strength GGX sun
+  specular and skybox IBL specular were added on top of stock's forward-style Lambert shading
+  (`MainDirectionalLightEnv` has neither), so specular/reflection default to 0 (still tunable).
+  Exposure was then found to make the remaining albedo saturate; the old 0.025 calibration was removed
+  in favour of the shipped `CalculateExposure` plus a user multiplier. The user's battery still looked
+  grey, but the save's `ColorMaskHSV` was not "default grey": it is a delta. Stock `ColorizeGray` adds
+  `TextureDebugMultipliers.ColorizeHSV` default `(0, 0.8, -0.1)`; we had omitted it, so the applied
+  green collapsed to grey. Added the stock conversion. Also added pending pre-create state for
+  `UpdateRenderEntity` and `ChangeMaterialTexture`, so paints/skins arriving before
+  `CreateRenderEntity` are not dropped. Verified by capture (saved green battery/cockpit/grid with the
+  CarbonFibre skin pattern) and by the user changing a battery to red in game. Temporary texture/model
+  change logging removed. Next: persistent scene/part data + GPU LOD.
+- **2026-10-18** — Persistent GPU scene data and GPU LOD. Opaque non-skinned actors are now cached as
+  persistent `GpuScenePart` records (material, vertex/index BDAs, index range) with one `GpuLodRange` per
+  LOD and a persistent per-actor LOD-state buffer; the cache is rebuilt only when `SceneActors.Revision`
+  or `ModelCache.Version` changes. Per frame the CPU uploads only actor world/colour/bounds/instance
+  state. `Scene/Culling.slang` now runs one thread per actor, selects the LOD with the stock distance
+  formula and 10% hysteresis on the GPU, culls, and appends one draw per part. Static groups are expanded
+  into one actor record per local matrix sharing the cached ranges; instanced cubes use the same path.
+  Wire-format structs and the persistent buffers are documented in `GpuSceneDraws.cs`. Verified by
+  automated capture in the user's world: 297 actors, 80 instanced, 3152 cached parts, 13 total draw calls
+  (2 indirect), red/green paints and CarbonFibre skin still correct, no log errors. Remaining: per-frame
+  actor-state dirty tracking, GPU buckets for skinned/transparent paths, bloom.

@@ -2,37 +2,7 @@
 // per-actor bone palette. Runs as a compute pass before the scene rendering pass; the forward shaders
 // then read the output exactly like any other ModelVertex buffer.
 
-// Must match ClientPlugin/Render/Models/ModelCache.cs (64 bytes)
-struct SkinnedVertex
-{
-    float4 position;
-    float4 boneWeights;
-    float2 texcoord;
-    uint normal;
-    uint tangent;
-    uint boneIndices;    // four bytes
-    uint pad0;
-    uint pad1;
-    uint pad2;
-};
-
-// Must match ClientPlugin/Render/Models/ModelCache.cs (32 bytes)
-struct StaticVertex
-{
-    float4 position;
-    float2 texcoord;
-    uint normal;
-    uint tangent;
-};
-
-// Four rows of a row-vector XNA matrix
-struct BoneMatrix
-{
-    float4 row0;
-    float4 row1;
-    float4 row2;
-    float4 row3;
-};
+import Common.SkinningCommon;
 
 // Must match ClientPlugin/Render/Scene/ModelPass.cs
 struct PushConstants

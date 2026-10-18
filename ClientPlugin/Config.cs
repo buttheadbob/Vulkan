@@ -20,6 +20,16 @@ public class Config : INotifyPropertyChanged
 
     private RendererKind renderer = RendererKind.Vulkan;
     private bool validation = false;
+    private float exposureScale = 0.12f;
+    private float sunScale = 1f;
+    private float ambientScale = 1f;
+    private float specularScale = 0f;
+    private float reflectionScale = 0f;
+    private float metalnessScale = 1f;
+    private float emissiveScale = 1f;
+    private float screenScale = 4f;
+    private float lightScale = 1f;
+    private float bloomScale = 1f;
 
     #endregion
 
@@ -52,6 +62,78 @@ public class Config : INotifyPropertyChanged
     {
         get => validation;
         set => SetField(ref validation, value);
+    }
+
+    [Separator("World lighting tuning")]
+
+    [Slider(0.05f, 2f, 0.01f, label: "Exposure", description: "Auto-exposure multiplier. Raise if the world is too dark; lower if it is overexposed.")]
+    public float ExposureScale
+    {
+        get => exposureScale;
+        set => SetField(ref exposureScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Sun", description: "Direct sunlight intensity (diffuse + specular).")]
+    public float SunScale
+    {
+        get => sunScale;
+        set => SetField(ref sunScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Ambient", description: "Diffuse ambient/IBL irradiance on blocks.")]
+    public float AmbientScale
+    {
+        get => ambientScale;
+        set => SetField(ref ambientScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Specular", description: "Direct sun highlights on blocks.")]
+    public float SpecularScale
+    {
+        get => specularScale;
+        set => SetField(ref specularScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Reflections", description: "Image-based specular reflections from the skybox.")]
+    public float ReflectionScale
+    {
+        get => reflectionScale;
+        set => SetField(ref reflectionScale, value);
+    }
+
+    [Slider(0f, 2f, 0.01f, label: "Metalness", description: "Scales the ColorMetal alpha metalness on block materials.")]
+    public float MetalnessScale
+    {
+        get => metalnessScale;
+        set => SetField(ref metalnessScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Emissive", description: "Scales emissive maps (indicators, lights) after BloomEmissiveness.")]
+    public float EmissiveScale
+    {
+        get => emissiveScale;
+        set => SetField(ref emissiveScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Screen", description: "Additional emissive multiplier for generated LCD/cockpit screens only.")]
+    public float ScreenScale
+    {
+        get => screenScale;
+        set => SetField(ref screenScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Dynamic lights", description: "Point/spot light intensity on blocks.")]
+    public float LightScale
+    {
+        get => lightScale;
+        set => SetField(ref lightScale, value);
+    }
+
+    [Slider(0f, 4f, 0.05f, label: "Bloom", description: "HDR bloom strength for emissive indicators, screens and stars.")]
+    public float BloomScale
+    {
+        get => bloomScale;
+        set => SetField(ref bloomScale, value);
     }
 
     #endregion

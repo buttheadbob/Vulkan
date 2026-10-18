@@ -222,7 +222,7 @@ internal static class MwmLoader
     private static string Texture(MyMaterialDescriptor descriptor, string key) =>
         descriptor != null && descriptor.Textures.TryGetValue(key, out var value) ? value : "";
 
-    private static BoundingBox ComputeBounds(Vector4[] positions)
+    internal static BoundingBox ComputeBounds(Vector4[] positions)
     {
         var min = new Vector3(float.MaxValue);
         var max = new Vector3(float.MinValue);

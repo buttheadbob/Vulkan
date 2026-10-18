@@ -34,7 +34,7 @@ internal sealed class RenderFont
         foreach (var (id, bitmap) in font.BitmapInfoById)
         {
             var name = System.IO.Path.Combine(font.FontDirectory, bitmap.strFilename);
-            pages[id] = textures.Get(name, waitTillLoaded: false);
+            pages[id] = textures.Get(name, waitTillLoaded: true);
 
             // MyRenderFont: raw RGBA pages are premultiplied on load, "FontDataPA" pages are authored premultiplied
             premultipliedAlpha |= bitmap.strFilename.Contains("FontDataPA")

@@ -25,6 +25,9 @@ internal struct FrameConstants
     // rgb: linear fallback ambient, w: factor (used until the IBL cubemap is ready)
     public Vector4 AmbientColor;
 
+    // MyEnvironmentData.TextureMultipliers.ColorizeHSV: stock's paint-mask conversion (default 0, 0.8, -0.1)
+    public Vector4 ColorizeHsv;
+
     // Inverse of the Y-flipped view-projection, transposed rows (skybox view rays)
     public Vector4 InvViewProjection0;
     public Vector4 InvViewProjection1;
@@ -44,6 +47,21 @@ internal struct FrameConstants
     public uint IblCube;
     public uint BrdfLut;
     public uint Pad;
+
+    // Dynamic lights (0 when none): array of GpuLight, count capped at SceneLights.MaxLights
+    public ulong Lights;
+    public uint LightCount;
+    public uint Pad2;
+
+    // MyPostprocessSettings.Data.BloomEmissiveness: the game makes indicator materials much
+    // brighter than 1 (the test world uses 120)
+    public float EmissiveScale;
+    public uint Pad3;
+
+    // x: sun, y: ambient, z: direct specular, w: metalness scale
+    public Vector4 Tuning0;
+    // x: emissive, y: dynamic lights, z: IBL reflection, w: generated screen
+    public Vector4 Tuning1;
 }
 
 // Camera from MyRenderMessageSetCameraViewMatrix, plus the stock projection and camera-relative setup.
@@ -106,6 +124,22 @@ internal sealed class CameraState
         HasValue = true;
     }
 
+    // Development/test helper: override the game camera to frame a single model. Keeps the current
+    // FOV/near/far so the result matches normal rendering.
+    public void SetDebugLookAt(Vector3D eye, Vector3D target, Vector2I resolution)
+    {
+        var fov = FovH > 0f ? FovH : 1.2f;
+        var message = new MyRenderMessageSetCameraViewMatrix
+        {
+            ViewMatrix = MatrixD.CreateLookAt(eye, target, Vector3D.Up),
+            FOV = fov,
+            NearPlane = Near > 0f ? Near : 0.05f,
+            FarPlane = Far > 0f ? Far : 15000f,
+            CameraPosition = eye,
+        };
+        Set(message, resolution);
+    }
+
     // VRage.Math/VRageMath/Matrix.cs:1984
     private static Matrix CreatePerspectiveFovRhInfiniteComplementary(float fieldOfView, float aspectRatio, float nearPlaneDistance)
     {
@@ -151,6 +185,7 @@ internal sealed class CameraState
             SunDirection = new Vector4(sunDirection, light.SunDiffuseFactor),
             SunColor = new Vector4(sun, light.SunSpecularFactor),
             AmbientColor = new Vector4(1f, 1f, 1f, ambient * light.AmbientDiffuseFactor),
+            ColorizeHsv = environment.TextureMultipliers.ColorizeHSV,
 
             InvViewProjection0 = new Vector4(invViewProjection.M11, invViewProjection.M12, invViewProjection.M13, invViewProjection.M14),
             InvViewProjection1 = new Vector4(invViewProjection.M21, invViewProjection.M22, invViewProjection.M23, invViewProjection.M24),
@@ -167,6 +202,10 @@ internal sealed class CameraState
             SkyboxCube = skyboxCube,
             IblCube = iblCube,
             BrdfLut = brdfLut,
+            Tuning0 = new Vector4(Config.Current.SunScale, Config.Current.AmbientScale,
+                Config.Current.SpecularScale, Config.Current.MetalnessScale),
+            Tuning1 = new Vector4(Config.Current.EmissiveScale, Config.Current.LightScale,
+                Config.Current.ReflectionScale, Config.Current.ScreenScale),
         };
     }
 }
