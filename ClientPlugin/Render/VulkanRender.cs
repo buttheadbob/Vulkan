@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -10,6 +11,7 @@ using ClientPlugin.Render.Scene;
 using ClientPlugin.Render.Sprites;
 using ClientPlugin.Render.Textures;
 using ClientPlugin.Render.Vulkan;
+using ClientPlugin.Testing;
 using ClientPlugin.Settings;
 using Vortice.Vulkan;
 using VRage;
@@ -72,6 +74,13 @@ public sealed class VulkanRender : IMyRender
     private int lastCulledActors;
     private MyNewLoddingSettings loddingSettings = new();
     private readonly HashSet<MyRenderMessageEnum> reported = new();
+    private readonly Stopwatch frameClock = Stopwatch.StartNew();
+    private readonly Stopwatch frameLimitClock = Stopwatch.StartNew();
+    private double nextFrameTime;
+    private double lastFrameTime;
+    private double frameMilliseconds;
+    private double rawFrameMilliseconds;
+    private double framesPerSecond;
 
     // Set by the DrawScene message of the frame being drawn (MyRender11.m_drawScene): without it only the GUI is shown
     private bool drawScene;
@@ -363,14 +372,23 @@ public sealed class VulkanRender : IMyRender
         // The frame slot must be free (fence waited) before messages run: texture uploads issued while
         // processing them are written into this slot's staging memory.
         var frameStarted = false;
+        var workStart = 0L;
         if (draw && frameLoop != null)
         {
+            LimitFrameRate();
             if (frameLoop.SwapchainOutdated)
                 RecreateSwapchain();
 
             frameStarted = frameLoop.TryBeginFrame();
             if (frameStarted)
             {
+                var now = frameClock.Elapsed.TotalSeconds;
+                var delta = now - lastFrameTime;
+                lastFrameTime = now;
+                if (delta > 0 && delta < 1)
+                    framesPerSecond = framesPerSecond * 0.9 + (1 / delta) * 0.1;
+
+                workStart = Stopwatch.GetTimestamp();
                 gpu.BeginFrame(frameLoop.FrameSlot);
                 gui.BeginFrame(frameLoop.FrameSlot);
                 drawScene = false;
@@ -383,6 +401,9 @@ public sealed class VulkanRender : IMyRender
 
         if (!frameStarted)
             return;
+
+        if (drawScene)
+            TestNotification.ShowIfRequested();
 
         textures.ProcessDecoded();
         models.ProcessReady();
@@ -403,8 +424,67 @@ public sealed class VulkanRender : IMyRender
             exposurePass.Record(commands, sceneTargets.ColorSlot, postprocessSettings);
             bloomPass.Record(commands, sceneTargets.ColorSlot, sceneTargets.Extent);
         }
+        var counters = modelPass?.Diagnostics ?? default;
+        gui.SetDiagnostics(new DiagnosticsStats
+        {
+            Visible = Config.Current.Diagnostics,
+            FrameMilliseconds = frameMilliseconds,
+            RawFrameMilliseconds = rawFrameMilliseconds,
+            Fps = framesPerSecond,
+            Triangles = counters.Triangles,
+            Parts = counters.Parts,
+            Instances = counters.Instances,
+            Culled = counters.CulledActors,
+            DrawnActors = lastDrawnActors,
+            CulledActors = lastCulledActors,
+            GpuParts = modelPass?.GpuPartCount ?? 0,
+            DirectTriangles = modelPass?.LastDirectTriangles ?? 0,
+            TextRuns = gui.GpuTextRuns,
+            TextGlyphs = gui.GpuTextGlyphs,
+            GpuMemoryBytes = gpu.Memory.DeviceLocalAllocatedBytes,
+            GpuMemoryTotalBytes = gpu.Memory.DeviceLocalTotalBytes,
+        });
+        // GPU text layout must run outside the backbuffer rendering pass, after all runs are queued.
+        gui.RecordTextLayout(commands);
         RecordFrame(commands);
         frameLoop.EndFrame();
+        var workMs = (Stopwatch.GetTimestamp() - workStart) * 1000.0 / Stopwatch.Frequency;
+        rawFrameMilliseconds = workMs;
+        frameMilliseconds = frameMilliseconds * 0.9 + workMs * 0.1;
+    }
+
+    private void LimitFrameRate()
+    {
+        var fps = Config.Current.FrameLimit switch
+        {
+            FrameLimitKind.Fps30 => 30.0,
+            FrameLimitKind.Fps60 => 60.0,
+            FrameLimitKind.Fps120 => 120.0,
+            FrameLimitKind.Fps240 => 240.0,
+            _ => 0.0,
+        };
+        if (fps <= 0)
+        {
+            nextFrameTime = 0;
+            return;
+        }
+
+        var now = frameLimitClock.Elapsed.TotalSeconds;
+        if (nextFrameTime == 0 || nextFrameTime < now - 1)
+            nextFrameTime = now;
+        nextFrameTime += 1.0 / fps;
+
+        if (nextFrameTime <= now)
+        {
+            nextFrameTime = now + 1.0 / fps;
+            return;
+        }
+
+        var wait = nextFrameTime - now;
+        if (wait > 0.0015)
+            Thread.Sleep((int)((wait - 0.001) * 1000));
+        while (frameLimitClock.Elapsed.TotalSeconds < nextFrameTime)
+            Thread.SpinWait(100);
     }
 
     // The 3D scene into the HDR targets. No geometry yet: clears to the space background.
@@ -973,6 +1053,14 @@ public sealed class VulkanRender : IMyRender
             case MyRenderMessageEnum.ChangeMaterialTexture:
             {
                 var m = (MyRenderMessageChangeMaterialTexture)message;
+                if (m.Changes != null)
+                {
+                    foreach (var pair in m.Changes)
+                    {
+                        RenderLog.Info($"Texture change actor {m.RenderObjectID}, '{pair.Key.String}': " +
+                                       $"cm '{pair.Value.ColorMetalFileName}', ng '{pair.Value.NormalGlossFileName}'");
+                    }
+                }
                 actors.ChangeMaterialTexture(m);
                 break;
             }

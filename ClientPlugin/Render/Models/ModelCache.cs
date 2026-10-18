@@ -46,18 +46,21 @@ internal struct SkinnedVertex
 
 internal sealed class GpuLod : IDisposable
 {
-    public GpuBuffer Vertices;
+    public GpuBuffer Vertices;         // static 32 B stream (always present)
+    public GpuBuffer SkinnedVertices;  // 64 B skinning input stream, null when the model has no blend data
     public GpuBuffer Indices;
     public ModelPart[] Parts;
     public BoundingBox Bounds;
     public bool HasTangents;
-    public bool Skinned;
+    public bool Skinned;               // has a skinned input stream
+    public bool HasSkinnedParts;       // at least one part uses a skinning technique
     public uint VertexCount;
     public int VertexStride;
 
     public void Dispose()
     {
         Vertices?.Dispose();
+        SkinnedVertices?.Dispose();
         Indices?.Dispose();
     }
 }
@@ -285,6 +288,14 @@ internal sealed class ModelCache : IDisposable
         var skinned = lods[0].Skinned ? $", skinned {lods[0].VertexStride} B/vertex" : "";
         RenderLog.Info($"Model loaded: {entry.Model} ({lods.Count} LODs, LOD0 {lods[0].Parts.Length} parts{distances}{skinned})" +
                        (transparent.Count > 0 ? "; transparent: " + string.Join(", ", transparent) : ""));
+        if (entry.Model.Contains("Cockpit", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var part in lods[0].Parts)
+            {
+                RenderLog.Info($"Cockpit part '{part.MaterialName}' ({part.IndexCount} idx, {part.Technique}): " +
+                               $"cm '{part.ColorMetal?.Path}', ng '{part.NormalGloss?.Path}', ext '{part.Extensions?.Path}'");
+            }
+        }
 
     }
 
@@ -306,9 +317,29 @@ internal sealed class ModelCache : IDisposable
                       data.BoneIndices.Length == data.Positions.Length &&
                       data.BoneWeights.Length == data.Positions.Length;
         var vertexCount = data.Positions.Length;
-        byte[] vertexBytes;
         var stride = 32;
 
+        // Always build the static stream: MESH parts of a model with blend data (armor plates) are
+        // rendered in bind pose and must not require a skeleton.
+        var staticVertices = new ModelVertex[vertexCount];
+        for (var i = 0; i < staticVertices.Length; i++)
+        {
+            staticVertices[i] = new ModelVertex
+            {
+                Position = data.Positions[i],
+                Texcoord = data.Texcoords[i],
+                Normal = data.Normals[i],
+                Tangent = data.Tangents[i],
+            };
+        }
+
+        var vertexBytes = MemoryMarshal.AsBytes(new ReadOnlySpan<ModelVertex>(staticVertices)).ToArray();
+        var vertexBuffer = GpuBuffer.Create(context, (ulong)vertexBytes.Length,
+            VkBufferUsageFlags.VertexBuffer | VkBufferUsageFlags.TransferDst, hostVisible: false);
+        vertexBuffer.DebugName = $"{model} vertices";
+        context.Uploads.UploadBuffer(vertexBuffer, vertexBytes);
+
+        GpuBuffer skinnedBuffer = null;
         if (skinned)
         {
             var vertices = new SkinnedVertex[vertexCount];
@@ -325,36 +356,19 @@ internal sealed class ModelCache : IDisposable
                 };
             }
 
-            vertexBytes = MemoryMarshal.AsBytes(new ReadOnlySpan<SkinnedVertex>(vertices)).ToArray();
+            var skinnedBytes = MemoryMarshal.AsBytes(new ReadOnlySpan<SkinnedVertex>(vertices)).ToArray();
+            skinnedBuffer = GpuBuffer.Create(context, (ulong)skinnedBytes.Length,
+                VkBufferUsageFlags.VertexBuffer | VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst,
+                hostVisible: false);
+            context.Uploads.UploadBuffer(skinnedBuffer, skinnedBytes);
             stride = 64;
-        }
-        else
-        {
-            var vertices = new ModelVertex[vertexCount];
-            for (var i = 0; i < vertices.Length; i++)
-            {
-                vertices[i] = new ModelVertex
-                {
-                    Position = data.Positions[i],
-                    Texcoord = data.Texcoords[i],
-                    Normal = data.Normals[i],
-                    Tangent = data.Tangents[i],
-                };
-            }
-
-            vertexBytes = MemoryMarshal.AsBytes(new ReadOnlySpan<ModelVertex>(vertices)).ToArray();
         }
 
         var indexBytes = MemoryMarshal.AsBytes(new ReadOnlySpan<uint>(data.Indices)).ToArray();
 
-        var vertexUsage = VkBufferUsageFlags.VertexBuffer | VkBufferUsageFlags.TransferDst;
-        if (skinned)
-            vertexUsage |= VkBufferUsageFlags.StorageBuffer; // read by the skinning compute pass
-        var vertexBuffer = GpuBuffer.Create(context, (ulong)vertexBytes.Length, vertexUsage, hostVisible: false);
-        context.Uploads.UploadBuffer(vertexBuffer, vertexBytes);
-
         var indexBuffer = GpuBuffer.Create(context, (ulong)indexBytes.Length,
             VkBufferUsageFlags.IndexBuffer | VkBufferUsageFlags.TransferDst, hostVisible: false);
+        indexBuffer.DebugName = $"{model} indices";
         context.Uploads.UploadBuffer(indexBuffer, indexBytes);
 
         var parts = new ModelPart[data.Parts.Count];
@@ -390,14 +404,26 @@ internal sealed class ModelCache : IDisposable
                 waitTillLoaded: false, TextureCache.TextureKind.NormalGloss);
         }
 
+        var hasSkinnedParts = false;
+        foreach (var part in parts)
+        {
+            if (MeshTechniques.IsSkinned(part.Technique))
+            {
+                hasSkinnedParts = true;
+                break;
+            }
+        }
+
         return new GpuLod
         {
             Vertices = vertexBuffer,
+            SkinnedVertices = skinnedBuffer,
             Indices = indexBuffer,
             Parts = parts,
             Bounds = data.Bounds,
             HasTangents = data.HasTangents,
             Skinned = skinned,
+            HasSkinnedParts = hasSkinnedParts,
             VertexCount = (uint)vertexCount,
             VertexStride = stride,
         };

@@ -46,6 +46,8 @@ internal sealed class GuiRenderer : IDisposable
     private readonly TextureCache textures;
     private readonly Func<int> messageFrameId;
     private readonly SpriteRenderer spriteRenderer;
+    private readonly GpuTextRenderer gpuText;
+    private readonly DiagnosticsOverlay diagnostics = new();
     private readonly SpriteBatcher mainBatcher = new();
     private readonly SpriteBatcher offscreenBatcher = new();
     private readonly Dictionary<string, Bucket> buckets = new();
@@ -53,6 +55,7 @@ internal sealed class GuiRenderer : IDisposable
     private readonly ConcurrentDictionary<int, RenderFont> fonts = new();
     private readonly Stopwatch time = Stopwatch.StartNew();
     private volatile RenderFont debugFont;
+    private int debugFontId = -1;
     private float mainViewportScale = 1f;
 
     public GuiRenderer(GpuContext context, TextureCache textures, Func<int> messageFrameId)
@@ -61,6 +64,7 @@ internal sealed class GuiRenderer : IDisposable
         this.textures = textures;
         this.messageFrameId = messageFrameId;
         spriteRenderer = new SpriteRenderer(context);
+        gpuText = new GpuTextRenderer(context, spriteRenderer);
     }
 
     // Called once per drawn frame before the messages are processed
@@ -68,6 +72,7 @@ internal sealed class GuiRenderer : IDisposable
     {
         mainBatcher.Clear();
         spriteRenderer.BeginFrame(frameSlot);
+        gpuText.BeginFrame(frameSlot);
     }
 
     #region Messages
@@ -89,11 +94,47 @@ internal sealed class GuiRenderer : IDisposable
                 QueueOffscreen((MyRenderMessageRenderOffscreenTexture)message);
                 return true;
 
+            case MyRenderMessageEnum.DrawString:
+            {
+                var text = (MyRenderMessageDrawString)message;
+                if (text.TargetTexture == null || text.TargetTexture == DefaultTarget)
+                {
+                    var font = GetFont(text.FontIndex);
+                    if (font != null && gpuText.AddString(text.FontIndex, font, text.Text, text.ScreenCoord,
+                            text.ScreenScale, text.ColorMask, text.IgnoreBounds, text.ScreenMaxWidth,
+                            MyRenderTextAlignmentEnum.Align_Left, 0))
+                        return true;
+                }
+
+                if (text.TargetTexture == null || text.TargetTexture == DefaultTarget)
+                    AddSprite(mainBatcher, text);
+                else
+                    KeepOffscreenMessage(text);
+                return true;
+            }
+
+            case MyRenderMessageEnum.DrawStringAligned:
+            {
+                var text = (MyRenderMessageDrawStringAligned)message;
+                if (text.TargetTexture == null || text.TargetTexture == DefaultTarget)
+                {
+                    var font = GetFont(text.FontIndex);
+                    if (font != null && gpuText.AddString(text.FontIndex, font, text.Text, text.ScreenCoord,
+                            text.ScreenScale, text.ColorMask, text.IgnoreBounds, text.ScreenMaxWidth,
+                            text.Alignment, text.TextureWidthInPx))
+                        return true;
+                }
+
+                if (text.TargetTexture == null || text.TargetTexture == DefaultTarget)
+                    AddSprite(mainBatcher, text);
+                else
+                    KeepOffscreenMessage(text);
+                return true;
+            }
+
             case MyRenderMessageEnum.DrawSprite:
             case MyRenderMessageEnum.DrawSpriteExt:
             case MyRenderMessageEnum.DrawSpriteAtlas:
-            case MyRenderMessageEnum.DrawString:
-            case MyRenderMessageEnum.DrawStringAligned:
             case MyRenderMessageEnum.SpriteScissorPush:
             case MyRenderMessageEnum.SpriteScissorPop:
                 var sprite = (MySpriteDrawRenderMessage)message;
@@ -261,7 +302,11 @@ internal sealed class GuiRenderer : IDisposable
             var font = new RenderFont(path, colorMask, new MyFont(path), textures);
             fonts[id] = font;
             if (isDebugFont)
+            {
                 debugFont = font;
+                debugFontId = id;
+            }
+            gpuText.CreateFont(id, font);
         }
         catch (Exception e)
         {
@@ -445,6 +490,24 @@ internal sealed class GuiRenderer : IDisposable
         api.vkCmdPipelineBarrier2(commands, &dependency);
     }
 
+    // Records the GPU text layout dispatch. Must run before the dynamic rendering pass.
+    public void RecordTextLayout(VkCommandBuffer commands) => gpuText.Prepare(commands);
+
+    public void SetDiagnostics(DiagnosticsStats stats)
+    {
+        diagnostics.Draw(mainBatcher, debugFont, stats, (text, position, scale) =>
+        {
+            if (debugFont != null && debugFontId >= 0 &&
+                gpuText.AddString(debugFontId, debugFont, text, position, scale, Color.White, true, 0,
+                    MyRenderTextAlignmentEnum.Align_Left, 0))
+                return;
+            debugFont?.DrawString(mainBatcher, position, Color.White, text, scale, true, double.MaxValue);
+        });
+    }
+
+    public int GpuTextRuns => gpuText.LastRunCount;
+    public int GpuTextGlyphs => gpuText.LastGlyphCount;
+
     // Records the screen GUI into the active dynamic rendering pass, over the whole framebuffer
     public void RecordMain(VkCommandBuffer commands, VkFormat targetFormat, Vector2I resolution, VkExtent2D framebuffer)
     {
@@ -456,6 +519,9 @@ internal sealed class GuiRenderer : IDisposable
             framebuffer.height * mainViewportScale);
 
         spriteRenderer.Record(commands, mainBatcher, targetFormat, SpriteBlend.Premultiplied,
+            new Vector2(resolution.X, resolution.Y), framebuffer, bound, full);
+        // Draw GPU-laid-out text after the CPU sprite batch.
+        gpuText.RecordDraw(commands, targetFormat, SpriteBlend.Premultiplied,
             new Vector2(resolution.X, resolution.Y), framebuffer, bound, full);
     }
 

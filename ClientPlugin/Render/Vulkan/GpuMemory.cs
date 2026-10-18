@@ -55,6 +55,8 @@ internal sealed unsafe class GpuMemory : IDisposable
     private readonly object sync = new();
 
     public ulong AllocatedBytes { get; private set; }
+    public ulong DeviceLocalAllocatedBytes { get; private set; }
+    public ulong DeviceLocalTotalBytes { get; }
 
     public GpuMemory(VulkanInstance instance, VulkanDevice device)
     {
@@ -62,6 +64,12 @@ internal sealed unsafe class GpuMemory : IDisposable
         VkPhysicalDeviceMemoryProperties memoryProperties;
         instance.Api.vkGetPhysicalDeviceMemoryProperties(device.PhysicalDevice, &memoryProperties);
         properties = memoryProperties;
+        for (var i = 0; i < properties.memoryHeapCount; i++)
+        {
+            var heap = properties.memoryHeaps[(int)i];
+            if ((heap.flags & VkMemoryHeapFlags.DeviceLocal) != 0)
+                DeviceLocalTotalBytes += heap.size;
+        }
     }
 
     // linear: true for buffers and linear images, false for optimally tiled images
@@ -216,6 +224,8 @@ internal sealed unsafe class GpuMemory : IDisposable
         block.Free.Add((0, size));
         blocks.Add(block);
         AllocatedBytes += size;
+        if (IsDeviceLocal(memoryType))
+            DeviceLocalAllocatedBytes += size;
         return block;
     }
 
@@ -227,6 +237,14 @@ internal sealed unsafe class GpuMemory : IDisposable
         device.Api.vkFreeMemory(block.Memory, null);
         blocks.Remove(block);
         AllocatedBytes -= block.Size;
+        if (IsDeviceLocal(block.MemoryType))
+            DeviceLocalAllocatedBytes -= block.Size;
+    }
+
+    private bool IsDeviceLocal(uint memoryType)
+    {
+        var heapIndex = properties.memoryTypes[(int)memoryType].heapIndex;
+        return (properties.memoryHeaps[(int)heapIndex].flags & VkMemoryHeapFlags.DeviceLocal) != 0;
     }
 
     private int CountBlocksLike(Block block)

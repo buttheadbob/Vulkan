@@ -76,6 +76,7 @@ internal struct CullParams
     public uint Pad0;
     public ulong Bucket0;
     public ulong Bucket1;
+    public ulong Diagnostics;
 }
 
 // Must match Shaders/Scene/Culling.slang and Scene/Model.slang (184 bytes)
@@ -128,14 +129,20 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
 
     private readonly GpuContext context;
     private readonly GpuBuffer[,] bucketBuffers = new GpuBuffer[FrameLoop.FramesInFlight, 2];
+    private readonly GpuBuffer[] diagnosticsBuffers = new GpuBuffer[FrameLoop.FramesInFlight];
     private readonly int[] capacities = new int[FrameLoop.FramesInFlight];
     private readonly VkPipeline pipeline;
     private int slot;
+
+    public GpuDiagnosticsCounters Counters { get; private set; }
 
     public GpuSceneDraws(GpuContext context)
     {
         this.context = context;
         pipeline = BuildPipeline(context);
+        for (var i = 0; i < diagnosticsBuffers.Length; i++)
+            diagnosticsBuffers[i] = GpuBuffer.Create(context, (ulong)sizeof(GpuDiagnosticsCounters),
+                VkBufferUsageFlags.StorageBuffer, hostVisible: true);
     }
 
     private static VkPipeline BuildPipeline(GpuContext context)
@@ -171,6 +178,9 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
     public void Begin(int frameSlot, int maxDraws)
     {
         slot = frameSlot;
+        // The fence for this slot was waited on, so the previous use's counters are complete.
+        Counters = *(GpuDiagnosticsCounters*)diagnosticsBuffers[slot].Mapped;
+        *(GpuDiagnosticsCounters*)diagnosticsBuffers[slot].Mapped = default;
         EnsureCapacity(maxDraws);
         for (var bucket = 0; bucket < 2; bucket++)
             *(uint*)bucketBuffers[slot, bucket].Mapped = 0;
@@ -235,6 +245,7 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
             MaxParts = (uint)capacities[slot],
             Bucket0 = bucketBuffers[slot, 0].DeviceAddress,
             Bucket1 = bucketBuffers[slot, 1].DeviceAddress,
+            Diagnostics = diagnosticsBuffers[slot].DeviceAddress,
         };
         var paramsAllocation = context.Transient.Allocate<CullParams>();
         paramsAllocation.As<CullParams>() = parameters;
@@ -287,6 +298,8 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
         context.Release(() => api.vkDestroyPipeline(handle, null));
 
         foreach (var buffer in bucketBuffers)
+            buffer?.Dispose();
+        foreach (var buffer in diagnosticsBuffers)
             buffer?.Dispose();
     }
 }

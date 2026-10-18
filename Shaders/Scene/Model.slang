@@ -30,6 +30,7 @@ enum MaterialFlags : uint
     AlphaMasked = 32,
     Instanced = 64,
     MetalnessColorable = 128,
+    Decal = 256, // static decal cutout: nudge the clip-space depth like stock VertexStage
     Screen = 512, // generated LCD target: never take metalness from its alpha channel
 };
 
@@ -232,13 +233,14 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_Instan
         float3 up = PACKED_DIR[dir - (dir / 6) * 6];
         float3 right = cross(up, -forward);
 
-        // Row-vector cube matrix, as VertexTransformations.hlsli translation_rotation_matrix
-        float4 row0 = float4(right, 0.0);
-        float4 row1 = float4(up, 0.0);
-        float4 row2 = float4(-forward, 0.0);
-        position = float4(dot(position, row0), dot(position, row1), dot(position, row2), 1.0);
-
+        // Row-vector cube matrix, as VertexTransformations.hlsli translation_rotation_matrix.
+        // HLSL/Slang mul(rowVector, matrix) uses the matrix columns; using dot(position, row)
+        // here would apply the transpose. The packed matrix has a translation row, added after
+        // the rotation.
         instanceRotation = float3x3(right, up, -forward);
+        float3 translation = packed.xyz;
+        position = float4(mul(position.xyz, instanceRotation) + translation, 1.0);
+
         normal = mul(normal, instanceRotation);
         tangent.xyz = mul(tangent.xyz, instanceRotation);
         colorMaskHsv = float4(instance.colorMaskHsv.xyz, 0.0);
@@ -256,6 +258,11 @@ VertexOutput vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_Instan
 
     // MyRenderableComponent.ApplyDepthBias: added to clip z, before the perspective divide
     clip.z += material.depthBias * 1e-6;
+
+    // Geometry/Passes/GBuffer/VertexStage.hlsli: static decals are pushed slightly towards the
+    // viewer in clip space so they win the depth test against the surface they are applied to.
+    if ((material.flags & uint(MaterialFlags.Decal)) != 0)
+        clip.z += 0.0001;
 
     float3x3 worldRotation = float3x3(world0.xyz, world1.xyz, world2.xyz);
 
@@ -290,6 +297,41 @@ float visibilitySmithGGX(float nov, float nol, float alpha)
     float gv = nol * sqrt(nov * nov * (1.0 - a2) + a2);
     float gl = nov * sqrt(nol * nol * (1.0 - a2) + a2);
     return 0.5 / max(gv + gl, 1e-4);
+}
+
+// Geometry/PixelUtils.hlsli PixelTangentSpace (derivative tangent basis)
+float3x3 pixelTangentSpace(float3 normal, float3 position, float2 uv)
+{
+    float3 dpx = ddx(position);
+    float3 dpy = ddy(position);
+    float2 duvx = ddx(uv);
+    float2 duvy = ddy(uv);
+
+    float3 dpxPerp = cross(normal, dpx);
+    float3 dpyPerp = cross(dpy, normal);
+    float3 t = dpyPerp * duvx.x + dpxPerp * duvy.x;
+    float3 b = dpyPerp * duvx.y + dpxPerp * duvy.y;
+    float invMax = rsqrt(max(dot(t, t), dot(b, b)));
+    return float3x3(t * invMax, b * invMax, normal);
+}
+
+// Lighting/Brdf.hlsli ToksvigGloss: narrow normal-map detail also narrows the highlight.
+float roughnessToSpecular(float roughness)
+{
+    return max(2.0 / max(roughness * roughness, 1e-6) - 2.0, 0.0);
+}
+
+float specularToGloss(float specular)
+{
+    return 1.0 - sqrt(2.0 / (specular + 2.0));
+}
+
+float toksvigGloss(float gloss, float normalLength)
+{
+    float specular = roughnessToSpecular(max(1.0 - gloss, 0.001));
+    float ft = normalLength / lerp(specular, 1.0, normalLength);
+    ft = max(ft, 0.001);
+    return specularToGloss(ft * specular);
 }
 
 [shader("fragment")]
@@ -330,21 +372,22 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
     float3 baseColor = colorizeGray(cm.rgb, input.colorMaskHsv.xyz, coloring, push.frame.colorizeHsv.xyz);
     baseColor *= material.colorMulEmissive.rgb;
+    // Stock SurfaceAlbedo: metals do not contribute diffuse, only their F0 does.
+    float3 albedo = baseColor * (1.0 - metalness);
 
     float3 n = normalize(input.normal);
     float gloss = 0.5;
     if ((flags & uint(MaterialFlags.HasNormalGloss)) != 0)
     {
         float3 normalMap = ng.xyz * 2.0 - 1.0;
-        normalMap.y *= -1.0; // Geometry/PixelUtils.hlsli adjust_normalmap_precomputed_tangents
-        if ((flags & uint(MaterialFlags.HasTangent)) != 0)
-        {
-            float3 t = input.tangent.xyz;
-            float3 b = cross(t, n) * input.tangent.w;
-            n = normalize(float3(dot(normalMap, t), dot(normalMap, b), dot(normalMap, n)));
-        }
+        // Geometry/PixelUtils.hlsli NormalBuildTangent. Rebuild the tangent basis from the
+        // screen-space UV derivatives instead of trusting per-vertex tangents: the cockpit's
+        // mirrored UV halves otherwise receive opposite bitangents and shade as two panels.
+        normalMap.x *= -1.0;
+        float normalLength = length(normalMap);
+        n = normalize(mul(normalMap, pixelTangentSpace(n, input.worldPosition, input.uv)));
 
-        gloss = ng.w;
+        gloss = toksvigGloss(ng.w, min(normalLength, 1.0));
     }
 
     float ao = extras.x;
@@ -366,9 +409,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 fresnel = fresnelSchlick(f0, voh);
     float specular = distributionGGX(noh, alpha) * visibilitySmithGGX(nov, nol, alpha);
 
-    // Stock forward shading (LightingModel.hlsli MainDirectionalLightEnv) is Lambert only; metalness
-    // belongs to the PBR/GBuffer path and must not darken forward albedo.
-    float3 diffuse = baseColor * (nol / PI);
+    float3 diffuse = albedo * (nol / PI);
     float3 direct = (diffuse + fresnel * specular * nol * renderSettings[0].tuning0.z) * sunColor;
 
     // Dynamic point/spot lights. The game's light component already multiplies intensity into the
@@ -413,7 +454,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
             float3 fresnelLight = fresnelSchlick(f0, vohLight);
 
             float3 lightColor = light.colorFalloff.rgb * attenuationHard * attenuationDiffuse * renderSettings[0].tuning1.y;
-            float3 lightDiffuse = baseColor * (nolLight / PI) * light.params.y * lightColor;
+            float3 lightDiffuse = albedo * (nolLight / PI) * light.params.y * lightColor;
             float3 lightSpecular = fresnelLight * specularLight * nolLight *
                                    light.params.x * lightColor;
             direct += lightDiffuse + lightSpecular;
@@ -424,12 +465,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     // ScreenArea_add/CockpitScreen_add emissive channel, so the display does not depend on scene
     // lighting. The Screen flag also forces metalness 0 (generated targets have opaque alpha).
     float screenScale = (flags & uint(MaterialFlags.Screen)) != 0 ? renderSettings[0].tuning1.w : 1.0;
-    float3 emissiveColor = baseColor * (1.0 - metalness) * emissive * push.frame.emissiveScale *
+    float3 emissiveColor = albedo * emissive * push.frame.emissiveScale *
                            renderSettings[0].tuning1.x * screenScale;
 
     // Stock forward ambient is the game's AmbientForwardPass floor (0.01 + probe clamp), not the
     // full skybox irradiance. Using the nebula cubemap as ambient washed every albedo out to white.
-    float3 ambient = baseColor * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
+    float3 ambient = albedo * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
                      renderSettings[0].tuning0.y * ao;
     float3 ambientSpecular = 0;
     if (push.frame.iblCube != 0 && renderSettings[0].tuning1.z > 0.0)

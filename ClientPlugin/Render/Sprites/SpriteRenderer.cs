@@ -107,6 +107,37 @@ internal sealed unsafe class SpriteRenderer : IDisposable
         }
     }
 
+    // Draws instances that were generated on the GPU (text glyphs). The buffer already contains
+    // SpriteInstance records; no CPU copy is made.
+    public void RecordGpuInstances(VkCommandBuffer commands, VkFormat targetFormat, SpriteBlend blend,
+        Vector2 coordinateSize, VkExtent2D framebuffer, MyViewport boundViewport, MyViewport fullViewport,
+        ulong instances, uint instanceCount, bool ignoreBounds)
+    {
+        if (instanceCount == 0)
+            return;
+
+        var api = context.Device.Api;
+        api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics, GetPipeline(targetFormat, blend));
+        context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
+
+        var viewport = ignoreBounds ? fullViewport : boundViewport;
+        var vkViewport = new VkViewport(viewport.OffsetX, viewport.OffsetY, viewport.Width, viewport.Height, 0, 1);
+        api.vkCmdSetViewport(commands, 0, 1, &vkViewport);
+        var scissor = new VkRect2D(0, 0, framebuffer.width, framebuffer.height);
+        api.vkCmdSetScissor(commands, 0, 1, &scissor);
+
+        var push = new SpritePushConstants
+        {
+            Instances = instances,
+            TargetOffset = new Vector2(-1, -1),
+            TargetSize = new Vector2(2, 2),
+            InvResolution = new Vector2(1f / coordinateSize.X, 1f / coordinateSize.Y),
+        };
+        api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
+            0, (uint)sizeof(SpritePushConstants), &push);
+        api.vkCmdDraw(commands, 4, instanceCount, 0, 0);
+    }
+
     // Linear allocation from this frame's instance buffer. When it is full a larger one replaces it; the old one
     // stays alive until the frame has finished (deferred release), so already recorded draws remain valid.
     private GpuBuffer Allocate(ulong bytes, out ulong offset)

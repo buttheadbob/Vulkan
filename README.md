@@ -15,8 +15,9 @@ Implemented and verified in game:
 - Camera, environment, MWM models, cube-grid instancing, static groups (generic instance buffers
   are stored but not drawn yet).
 - Pure alpha-masked and transparent materials, weighted OIT, GPU skinning.
-- Stock forward opaque shading with colorization: block paints and skins work (`ColorMaskHSV` is a
-  paint delta plus the stock `ColorizeHSV` conversion).
+- Stock material/color pipeline with colorization: block paints and skins work (`ColorMaskHSV` is a
+  paint delta plus the stock `ColorizeHSV` conversion); derivative tangent normal mapping and Toksvig
+  gloss are in place.
 - Cube instance buffers (generic instance buffers are stored but not drawn yet), per-actor LOD
   selection, frustum/view-distance culling.
 - GPU-driven opaque rendering: persistent part/material/LOD ranges, GPU LOD selection with stock
@@ -24,9 +25,13 @@ Implemented and verified in game:
 - Static skybox IBL, dynamic point/spot lights, offscreen LCD/cockpit screens.
 - Auto-exposure from the game's postprocess settings, Hable tonemapping, first HDR bloom pass, and
   live lighting/exposure/bloom sliders. Slider values are GPU-resident and updated only when changed.
+- GPU text layout for HUD, chat, notifications and diagnostics; a 60 s diagnostics overlay with
+  frame-generation time, GPU counts, GPU memory and a rolling graph; frame limits (30/60/120/240/unlimited).
 
-Still open (see the roadmap for the full plan): voxel cells/planets, shadows, dynamic environment
-probe, SSAO/GTAO, billboards/particles, TAA/FSR 3, HDR output, video playback, Windows test pass.
+Known rendering gaps (see the roadmap): exposure/specular/reflection calibration against stock and the
+missing dynamic scene probe (shadowed faces are too dark). `DECAL_CUTOUT` paneling/decals are now rendered;
+blended and projected decals are not. Still open: voxel cells/planets, shadows, dynamic environment probe,
+SSAO/GTAO, billboards/particles, TAA/FSR 3, HDR output, video playback, Windows test pass.
 
 ## Requirements
 
@@ -59,11 +64,13 @@ cd ~/.local/share/PulsarRelease
 ```
 
 The plugin configuration is in `~/.config/SpaceEngineers/Storage/Vulkan.cfg` (renderer choice,
-validation, lighting/exposure/bloom tuning). The in-game **Graphics > Vulkan Renderer** screen edits
-the same settings.
+validation, frame limit, diagnostics overlay, lighting/exposure/bloom tuning). The in-game
+**Graphics > Vulkan Renderer** screen edits the same settings.
 
 For automated visual checks, the renderer supports `VULKAN_AUTOLOAD=<seconds>`,
-`VULKAN_SCREENSHOT=/path.png` and `VULKAN_SCREENSHOT_DELAY=<seconds>`; see the roadmap.
+`VULKAN_SCREENSHOT=/path.png`, `VULKAN_SCREENSHOT_DELAY=<seconds>` and a long-duration test
+notification via `VULKAN_NOTIFICATION=<text>` with optional `VULKAN_NOTIFICATION_MS` (default 60000);
+see the roadmap.
 
 ## Documentation
 

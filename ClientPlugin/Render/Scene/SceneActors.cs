@@ -76,6 +76,13 @@ internal sealed class SceneActors
         public Vector3? ColorMaskHsv;
         public Vector3? ColorMul;
         public Dictionary<string, MyTextureChange> TextureChanges;
+        public uint? ParentId;
+        public Matrix? LocalMatrix;
+        public MatrixD? WorldMatrix;
+        public BoundingBox? LocalAabb;
+        public uint? InstanceBufferId;
+        public int? InstanceStart;
+        public int? InstanceCount;
     }
 
     private readonly Dictionary<uint, SceneActor> actors = new();
@@ -154,6 +161,7 @@ internal sealed class SceneActors
             StaticMatrices = message.LocalMatrices,
             Visible = true,
         };
+        ApplyPending(actors[message.ID]);
         revision++;
     }
 
@@ -165,16 +173,25 @@ internal sealed class SceneActors
             WorldMatrix = message.WorldMatrix,
             Visible = true,
         };
+        ApplyPending(actors[message.ID]);
     }
 
     public void SetParentCullObject(MyRenderMessageSetParentCullObject message)
     {
         var child = Find(message.ID);
         if (child == null)
+        {
+            // Parenting can be sent before the object is created (large blueprints arrive as a
+            // burst of state changes). Keep it and apply it at creation.
+            var state = PendingFor(message.ID);
+            state.ParentId = message.CullObjectID;
+            state.LocalMatrix = message.ChildToParent;
             return;
+        }
 
         child.ParentId = message.CullObjectID;
-        child.LocalMatrix = message.ChildToParent ?? Matrix.Identity;
+        if (message.ChildToParent.HasValue)
+            child.LocalMatrix = message.ChildToParent.Value;
     }
 
     public SceneActor Find(uint id) => actors.TryGetValue(id, out var actor) ? actor : null;
@@ -191,6 +208,20 @@ internal sealed class SceneActors
             actor.ColorMaskHsv = state.ColorMaskHsv.Value;
         if (state.ColorMul.HasValue)
             actor.ColorMul = state.ColorMul.Value;
+        if (state.ParentId.HasValue)
+            actor.ParentId = state.ParentId.Value;
+        if (state.LocalMatrix.HasValue)
+            actor.LocalMatrix = state.LocalMatrix.Value;
+        if (state.WorldMatrix.HasValue)
+            actor.WorldMatrix = state.WorldMatrix.Value;
+        if (state.LocalAabb.HasValue)
+            actor.LocalAabb = state.LocalAabb.Value;
+        if (state.InstanceBufferId.HasValue)
+            actor.InstanceBufferId = state.InstanceBufferId.Value;
+        if (state.InstanceStart.HasValue)
+            actor.InstanceStart = state.InstanceStart.Value;
+        if (state.InstanceCount.HasValue)
+            actor.InstanceCount = state.InstanceCount.Value;
         if (state.TextureChanges != null)
         {
             actor.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
@@ -222,10 +253,23 @@ internal sealed class SceneActors
     {
         var actor = Find(message.ID);
         if (actor == null)
+        {
+            var state = PendingFor(message.ID);
+            if (message.Data.HasWorldMatrix)
+                state.WorldMatrix = message.Data.WorldMatrix;
+            if (message.Data.HasLocalMatrix)
+                state.LocalMatrix = message.Data.LocalMatrix;
+            if (message.Data.HasLocalAABB)
+                state.LocalAabb = message.Data.LocalAABB;
             return;
+        }
 
+        // The relative transform (set by SetParentCullObject / a pending local update) is what
+        // places subparts; world updates continue to drive the cull-object root and the character.
         if (message.Data.HasWorldMatrix)
             actor.WorldMatrix = message.Data.WorldMatrix;
+        if (message.Data.HasLocalAABB)
+            actor.LocalAabb = message.Data.LocalAABB;
     }
 
     public void SetVisible(uint id, bool visible, bool near)
@@ -339,6 +383,9 @@ internal sealed class SceneActors
 
         RenderLog.Info($"Character skeleton {message.CharacterID}: {actor.SkeletonBones.Length} bones, " +
                        $"{actor.SkeletonIndices.Length} skin indices");
+        // The GPU part cache must drop this actor once it has a skeleton and move it to the
+        // direct skinned path.
+        revision++;
     }
 
     public void SetCharacterTransforms(MyRenderMessageSetCharacterTransforms message)
@@ -367,7 +414,15 @@ internal sealed class SceneActors
     {
         var actor = Find(message.ID);
         if (actor == null)
+        {
+            // New grid cells can send the instance range before the render entity exists.
+            var state = PendingFor(message.ID);
+            state.InstanceBufferId = message.InstanceBufferId;
+            state.InstanceStart = message.InstanceStart;
+            state.InstanceCount = message.InstanceCount;
+            state.LocalAabb = message.LocalAabb;
             return;
+        }
 
         actor.InstanceBufferId = message.InstanceBufferId;
         actor.InstanceStart = message.InstanceStart;

@@ -25,6 +25,13 @@ internal sealed class RenderFont
 
     public string Path { get; }
 
+    internal MyFont GameFont => font;
+    internal IReadOnlyDictionary<int, TextureCache.Entry> PageEntries => pages;
+    internal Color FontColorMask => colorMask;
+
+    internal bool IsPagePremultiplied(int bitmapId) =>
+        pages.TryGetValue(bitmapId, out var page) && IsPremultiplied(page);
+
     public RenderFont(string path, Color colorMask, MyFont font, TextureCache textures)
     {
         Path = path;

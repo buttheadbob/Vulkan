@@ -67,7 +67,7 @@ struct LodRange
     uint count;
 };
 
-// Must match CullParams (32 bytes)
+// Must match CullParams (64 bytes)
 struct CullParams
 {
     float lodCoefficient;
@@ -82,6 +82,20 @@ struct CullParams
     uint pad0;
     uint64_t bucket0;
     uint64_t bucket1;
+    uint64_t diagnostics;
+};
+
+// Must match GpuDiagnosticsCounters (32 bytes); written with atomics from this pass.
+struct GpuDiagnostics
+{
+    uint triangles;
+    uint parts;
+    uint instances;
+    uint visibleActors;
+    uint culledActors;
+    uint pad0;
+    uint pad1;
+    uint pad2;
 };
 
 // Must match Scene/Model.slang (32 bytes of bones, packed ortho matrix, key color)
@@ -202,17 +216,24 @@ void main(uint3 threadId : SV_DispatchThreadID)
     SceneActor actor = push.actors[index];
     float3 center = actor.bounds.xyz;
     float radius = actor.bounds.w;
+    GpuDiagnostics* diag = (GpuDiagnostics*)params.diagnostics;
 
     if ((actor.flags & 2u) == 0 && actor.maxViewDistance < 3.4e38
         && length(center) - radius > actor.maxViewDistance)
+    {
+        InterlockedAdd(diag->culledActors, 1u);
         return;
+    }
 
     [unroll]
     for (uint i = 0; i < 5; i++)
     {
         float4 plane = push.planes[i];
         if (dot(plane.xyz, center) + plane.w < -radius)
+        {
+            InterlockedAdd(diag->culledActors, 1u);
             return;
+        }
     }
 
     uint lod = selectLod(actor, params);
@@ -220,6 +241,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     if (range.count == 0)
         return;
 
+    InterlockedAdd(diag->visibleActors, 1u);
     uint64_t base = (actor.flags & 1u) != 0 ? params.bucket1 : params.bucket0;
     uint* counter = (uint*)base;
     DrawCommand* commands = (DrawCommand*)(base + CommandOffset);
@@ -232,9 +254,14 @@ void main(uint3 threadId : SV_DispatchThreadID)
         uint slot;
         InterlockedAdd(counter[0], 1, slot);
 
+        uint instanceCount = max(actor.instanceCount, 1u);
+        InterlockedAdd(diag->triangles, (part.indexCount / 3u) * instanceCount);
+        InterlockedAdd(diag->parts, 1u);
+        InterlockedAdd(diag->instances, instanceCount);
+
         DrawCommand command;
         command.vertexCount = part.indexCount;
-        command.instanceCount = max(actor.instanceCount, 1u);
+        command.instanceCount = instanceCount;
         command.firstVertex = 0;
         command.firstInstance = 0;
         commands[slot] = command;

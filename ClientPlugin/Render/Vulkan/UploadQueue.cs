@@ -129,14 +129,35 @@ internal sealed unsafe class UploadQueue : IDisposable
     public void Record(VkCommandBuffer commands)
     {
         frameOpen = false;
-        if (pending.Count == 0 && pendingBuffers.Count == 0)
-            return;
+        RecordBuffers(commands);
 
-        var api = context.Device.Api;
-        RecordBuffers(api, commands);
+        // Destinations may have been replaced/freed after the upload was queued (instance buffers are
+        // recreated on every range update, generated textures on resize). Recording a copy to a disposed
+        // buffer/image passes a null handle to the driver, so drop those uploads instead.
+        var kept = 0;
+        var dropped = 0;
+        for (var i = 0; i < pending.Count; i++)
+        {
+            var upload = pending[i];
+            if (upload.Image.IsDisposed)
+            {
+                upload.OwnedStaging?.Dispose();
+                dropped++;
+                continue;
+            }
+
+            pending[kept++] = upload;
+        }
+
+        if (kept < pending.Count)
+            pending.RemoveRange(kept, pending.Count - kept);
+        if (dropped > 0)
+            RenderLog.Warning($"Dropped {dropped} image upload(s) whose destination was replaced or removed");
+
         if (pending.Count == 0)
             return;
 
+        var api = context.Device.Api;
         var barriers = new VkImageMemoryBarrier2[pending.Count];
 
         for (var i = 0; i < pending.Count; i++)
@@ -194,11 +215,34 @@ internal sealed unsafe class UploadQueue : IDisposable
     }
 
     // Copies vertex/index and other buffers, then makes them readable by every graphics stage
-    private void RecordBuffers(VkDeviceApi api, VkCommandBuffer commands)
+    private void RecordBuffers(VkCommandBuffer commands)
     {
         if (pendingBuffers.Count == 0)
             return;
 
+        var kept = 0;
+        var dropped = 0;
+        for (var i = 0; i < pendingBuffers.Count; i++)
+        {
+            var upload = pendingBuffers[i];
+            if (upload.Destination.IsDisposed)
+            {
+                upload.OwnedStaging?.Dispose();
+                dropped++;
+                continue;
+            }
+
+            pendingBuffers[kept++] = upload;
+        }
+
+        if (kept < pendingBuffers.Count)
+            pendingBuffers.RemoveRange(kept, pendingBuffers.Count - kept);
+        if (dropped > 0)
+            RenderLog.Warning($"Dropped {dropped} buffer upload(s) whose destination was replaced or removed");
+        if (pendingBuffers.Count == 0)
+            return;
+
+        var api = context.Device.Api;
         foreach (var upload in pendingBuffers)
         {
             fixed (VkBufferCopy* regions = upload.Regions)

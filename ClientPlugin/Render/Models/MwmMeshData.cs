@@ -41,3 +41,10 @@ internal sealed class MwmPartData
     // Glass materials can carry a separate CCW material name (MyMaterialDescriptor.GlassCCW)
     public string GlassCCW;
 }
+
+internal static class MeshTechniques
+{
+    // Techniques that consume the skinned vertex stream and need a bone palette.
+    public static bool IsSkinned(MyMeshDrawTechnique technique) =>
+        technique is MyMeshDrawTechnique.SKINNED or MyMeshDrawTechnique.MESH_INSTANCED_SKINNED;
+}

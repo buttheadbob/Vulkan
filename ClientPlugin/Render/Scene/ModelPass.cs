@@ -36,6 +36,7 @@ internal struct DrawMaterial
     public const uint AlphaMasked = 1 << 5;
     public const uint Instanced = 1 << 6;
     public const uint MetalnessColorable = 1 << 7;
+    public const uint Decal = 1 << 8;
     public const uint Screen = 1 << 9;
 
     public const uint Size = 48;
@@ -310,7 +311,7 @@ internal sealed unsafe class ModelPass : IDisposable
             var worldD = actors.GetWorldMatrix(actor);
             var distance = (float)(worldD.Translation - camera.Position).Length();
             var lod = SelectLod(model, distance, actor.Scale, camera, settings, ref actor.Lod);
-            if (!lod.Skinned || lod.VertexCount == 0)
+            if (!lod.Skinned || lod.SkinnedVertices == null || lod.VertexCount == 0)
                 continue;
 
             var skinTransforms = actor.SkinTransforms;
@@ -318,7 +319,10 @@ internal sealed unsafe class ModelPass : IDisposable
             var transforms = actor.BoneTransforms;
             if (skinTransforms == null || indexUInts == null || transforms == null || indexUInts.Length == 0)
             {
-                if (reportedSkinning.Add(actor.Id))
+                // Armor plates carry blend data but have no skeleton: they render from the static
+                // stream through the GPU path. Only complain about a model that really has SKINNED
+                // parts and is missing its skeleton.
+                if (lod.HasSkinnedParts && reportedSkinning.Add(actor.Id))
                     RenderLog.Info($"Skinning: {model.Name} actor {actor.Id} has no skeleton data yet " +
                                    $"(skin transforms {skinTransforms?.Length ?? 0}, " +
                                    $"indices {indexUInts?.Length ?? 0}, transforms {transforms?.Length ?? 0})");
@@ -378,7 +382,7 @@ internal sealed unsafe class ModelPass : IDisposable
                 World1 = new Vector4(worldT.M21, worldT.M22, worldT.M23, worldT.M24),
                 World2 = new Vector4(worldT.M31, worldT.M32, worldT.M33, worldT.M34),
                 World3 = new Vector4(worldT.M41, worldT.M42, worldT.M43, worldT.M44),
-                Input = lod.Vertices.DeviceAddress,
+                Input = lod.SkinnedVertices.DeviceAddress,
                 Output = outputAllocation.Address,
                 Bones = paletteAllocation.Address,
                 VertexCount = lod.VertexCount,
@@ -415,6 +419,8 @@ internal sealed unsafe class ModelPass : IDisposable
     }
 
     public int GpuPartCount => cachedPartCount;
+    public GpuDiagnosticsCounters Diagnostics => gpuDraws.Counters;
+    public uint LastDirectTriangles { get; private set; }
 
     // Rebuilds the persistent opaque parts when actors/models/materials change. The per-frame path then
     // uploads only actor world/colour/visibility state; the GPU selects the LOD and appends part draws.
@@ -435,10 +441,13 @@ internal sealed unsafe class ModelPass : IDisposable
             if (model == null || model.LodCount == 0)
                 continue;
 
+            // A model with blend data needs the skinned path when the actor actually has a skeleton
+            // (characters). Without skeleton data (armor plates) its MESH parts render statically.
             var skinned = false;
             foreach (var lod in model.Lods)
                 skinned |= lod.Skinned;
-            if (skinned)
+            var hasSkeleton = actor.SkinTransforms != null && actor.SkeletonIndexUInts != null;
+            if (skinned && hasSkeleton)
                 continue;
 
             var rangeBase = (uint)cachedRanges.Count;
@@ -471,10 +480,11 @@ internal sealed unsafe class ModelPass : IDisposable
                         continue;
 
                     ResolveTextures(actor, part, out var cm, out var ng, out var ext, out var alpha);
+                    var material = BuildMaterial(actor, part, lod, actor.HasInstances, cm, ng, ext, alpha,
+                        (materialFlags & RenderFlags.MetalnessColorable) != 0);
                     cachedParts.Add(new GpuScenePart
                     {
-                        Material = BuildMaterial(actor, part, lod, actor.HasInstances, cm, ng, ext, alpha,
-                            (materialFlags & RenderFlags.MetalnessColorable) != 0),
+                        Material = material,
                         Vertices = lod.Vertices.DeviceAddress,
                         Indices = lod.Indices.DeviceAddress,
                         IndexStart = (uint)part.IndexStart,
@@ -697,6 +707,7 @@ internal sealed unsafe class ModelPass : IDisposable
 
         var draws = 0;
         culled = 0;
+        LastDirectTriangles = 0;
 
         // GPU-driven opaque buckets: the culling compute already appended the visible parts, so the
         // CPU issues one indirect draw per bucket (cull/no-cull) instead of one per part.
@@ -805,17 +816,6 @@ internal sealed unsafe class ModelPass : IDisposable
                 var matrix = staticCount == 1 ? world : BuildStaticWorld(actor, camera.Position, instance);
                 var colorMask = new Vector4(actor.ColorMaskHsv, 0);
 
-                // The skinning compute pass already applied the entity world matrix
-                var drawMatrix = matrix;
-                var verticesAddress = lodModel.Vertices.DeviceAddress;
-                if (lodModel.Skinned)
-                {
-                    if (actor.SkinnedVertexAddress == 0)
-                        continue;
-                    drawMatrix = Matrix.Identity;
-                    verticesAddress = actor.SkinnedVertexAddress;
-                }
-
                 foreach (var part in lodModel.Parts)
                 {
                     if (part.IndexCount == 0)
@@ -825,6 +825,18 @@ internal sealed unsafe class ModelPass : IDisposable
                     var materialFlags = SceneActors.GetMaterialFlags(actor, part.MaterialName);
                     if ((materialFlags & RenderFlags.Visible) == 0)
                         continue;
+
+                    // The skinning compute pass already applied the entity world matrix; a skinned
+                    // model with a skeleton uses the deformed stream for all of its parts (the stock
+                    // astronaut's parts are MESH too). Without skeleton data the static stream is
+                    // used instead (armor plates).
+                    var drawMatrix = matrix;
+                    var verticesAddress = lodModel.Vertices.DeviceAddress;
+                    if (lodModel.Skinned && actor.SkinnedVertexAddress != 0)
+                    {
+                        drawMatrix = Matrix.Identity;
+                        verticesAddress = actor.SkinnedVertexAddress;
+                    }
 
                     if (part.Technique.IsTransparent())
                     {
@@ -875,6 +887,7 @@ internal sealed unsafe class ModelPass : IDisposable
                         0, (uint)sizeof(ModelPushConstants), &push);
                     api.vkCmdDrawIndexed(commands, (uint)part.IndexCount, (uint)instanceCount,
                         (uint)part.IndexStart, 0, 0);
+                    LastDirectTriangles += (uint)(part.IndexCount / 3 * instanceCount);
                     draws++;
                 }
             }
@@ -1063,8 +1076,12 @@ internal sealed unsafe class ModelPass : IDisposable
         if (extensions != null) flags |= DrawMaterial.HasExtensions;
         if (alphamask != null) flags |= DrawMaterial.HasAlphamask;
         if (lod.HasTangents) flags |= DrawMaterial.HasTangent;
-        if (part.Technique is MyMeshDrawTechnique.ALPHA_MASKED or MyMeshDrawTechnique.ALPHA_MASKED_SINGLE_SIDED)
+        if (part.Technique is MyMeshDrawTechnique.ALPHA_MASKED
+            or MyMeshDrawTechnique.ALPHA_MASKED_SINGLE_SIDED
+            or MyMeshDrawTechnique.DECAL_CUTOUT)
             flags |= DrawMaterial.AlphaMasked;
+        if (part.Technique == MyMeshDrawTechnique.DECAL_CUTOUT)
+            flags |= DrawMaterial.Decal;
         if (instanced)
             flags |= DrawMaterial.Instanced;
         if (metalnessColorable)
@@ -1102,6 +1119,7 @@ internal sealed unsafe class ModelPass : IDisposable
         technique is MyMeshDrawTechnique.MESH
             or MyMeshDrawTechnique.ALPHA_MASKED
             or MyMeshDrawTechnique.ALPHA_MASKED_SINGLE_SIDED
+            or MyMeshDrawTechnique.DECAL_CUTOUT
             or MyMeshDrawTechnique.MESH_INSTANCED
             or MyMeshDrawTechnique.MESH_INSTANCED_GENERIC;
 

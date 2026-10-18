@@ -11,6 +11,8 @@ internal sealed unsafe class GpuBuffer : IDisposable
     public VkBuffer Handle { get; private set; }
     public GpuAllocation Allocation { get; private set; }
     public ulong Size { get; }
+    public bool IsDisposed { get; private set; }
+    public string DebugName { get; set; }
 
     // Address for shader access through pointers (buffer device address)
     public ulong DeviceAddress { get; }
@@ -60,9 +62,10 @@ internal sealed unsafe class GpuBuffer : IDisposable
 
     public void Dispose()
     {
-        if (Handle.IsNull)
+        if (IsDisposed)
             return;
 
+        IsDisposed = true;
         var handle = Handle;
         var allocation = Allocation;
         var device = context.Device;

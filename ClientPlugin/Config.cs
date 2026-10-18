@@ -14,17 +14,28 @@ public enum RendererKind
     DirectX11
 }
 
+public enum FrameLimitKind
+{
+    Unlimited,
+    Fps30,
+    Fps60,
+    Fps120,
+    Fps240
+}
+
 public class Config : INotifyPropertyChanged
 {
     #region Options
 
     private RendererKind renderer = RendererKind.Vulkan;
     private bool validation = false;
-    private float exposureScale = 0.12f;
+    private bool diagnostics = true;
+    private FrameLimitKind frameLimit = FrameLimitKind.Unlimited;
+    private float exposureScale = 0.5f;
     private float sunScale = 1f;
     private float ambientScale = 1f;
-    private float specularScale = 0f;
-    private float reflectionScale = 0f;
+    private float specularScale = 1f;
+    private float reflectionScale = 1f;
     private float metalnessScale = 1f;
     private float emissiveScale = 1f;
     private float screenScale = 4f;
@@ -57,11 +68,27 @@ public class Config : INotifyPropertyChanged
         set => SetField(ref renderer, value);
     }
 
+    [Dropdown(description: "Caps the frame rate. Unlimited does not add a cap; VSync in the game's video settings can still limit it to the monitor refresh rate.")]
+    public FrameLimitKind FrameLimit
+    {
+        get => frameLimit;
+        set => SetField(ref frameLimit, value);
+    }
+
     [Checkbox(description: "Enables the Vulkan validation layers if installed. Slow, for diagnosing renderer problems only.")]
     public bool Validation
     {
         get => validation;
         set => SetField(ref validation, value);
+    }
+
+    [Separator("Diagnostics")]
+
+    [Checkbox(label: "Diagnostics overlay", description: "Shows the Vulkan renderer's own frame statistics: GPU triangle/object/cull counts, frame time, FPS and graphs over time.")]
+    public bool Diagnostics
+    {
+        get => diagnostics;
+        set => SetField(ref diagnostics, value);
     }
 
     [Separator("World lighting tuning")]

@@ -107,6 +107,7 @@ internal sealed class InstanceBuffers : IDisposable
         {
             var gpuBuffer = GpuBuffer.Create(context, (ulong)data.Length,
                 VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst, hostVisible: false);
+            gpuBuffer.DebugName = $"InstanceBuffer {buffer.Id} ({count} x {stride})";
             context.Uploads.UploadBuffer(gpuBuffer, data);
             buffer.Buffer = gpuBuffer;
         }

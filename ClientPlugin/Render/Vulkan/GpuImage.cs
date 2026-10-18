@@ -12,6 +12,7 @@ internal sealed unsafe class GpuImage : IDisposable
     public VkImage Handle { get; private set; }
     public VkImageView View { get; private set; }
     public GpuAllocation Allocation { get; private set; }
+    public bool IsDisposed { get; private set; }
     public VkFormat Format { get; }
     public uint Width { get; }
     public uint Height { get; }
@@ -91,9 +92,10 @@ internal sealed unsafe class GpuImage : IDisposable
 
     public void Dispose()
     {
-        if (Handle.IsNull)
+        if (IsDisposed)
             return;
 
+        IsDisposed = true;
         var handle = Handle;
         var view = View;
         var allocation = Allocation;
