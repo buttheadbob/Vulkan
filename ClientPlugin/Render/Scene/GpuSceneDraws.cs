@@ -43,14 +43,14 @@ internal struct GpuSceneActor
     public Vector4 World2;
     public Vector4 World3;
     public Vector4 ColorMaskHsv;
-    public Vector4 Bounds;       // xyz: camera-relative bounds center, w: radius
-    public Vector4 Origin;       // xyz: camera-relative origin, w: scale
+    public Vector4 Bounds;       // xyz: absolute bounds center, w: radius
+    public Vector4 Origin;       // xyz: absolute origin, w: scale
     public Vector4 LodDistances0; // LOD1..4 switch distances
     public Vector4 LodDistances1; // LOD5..8 switch distances
     public ulong Instances;      // cube instance buffer address, 0 when not instanced
     public uint InstanceStart;
     public uint InstanceCount;
-    public uint Flags;           // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance
+    public uint Flags;           // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance, 4: Visible
     public uint RangeBase;       // index into the persistent LOD range buffer
     public uint LodStateIndex;   // index into the persistent LOD state buffer
     public uint LodCount;
@@ -59,6 +59,7 @@ internal struct GpuSceneActor
 
     public const uint NoBackFaceCulling = 1u << 0;
     public const uint DrawOutsideViewDistance = 1u << 1;
+    public const uint Visible = 1u << 2;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -77,6 +78,7 @@ internal struct CullParams
     public ulong Bucket0;
     public ulong Bucket1;
     public ulong Diagnostics;
+    public Vector4 CameraPosition;
 }
 
 // Must match Shaders/Scene/Culling.slang and Scene/Model.slang (184 bytes)
@@ -205,8 +207,8 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
         capacities[slot] = newCapacity;
     }
 
-    public void Dispatch(VkCommandBuffer commands, Matrix cullingViewProjection, float lodCoefficient,
-        ulong actors, uint actorCount, ulong parts, ulong ranges, ulong lodStates,
+    public void Dispatch(VkCommandBuffer commands, Matrix cullingViewProjection, Vector3D cameraPosition,
+        float lodCoefficient, ulong actors, uint actorCount, ulong parts, ulong ranges, ulong lodStates,
         MyNewLoddingSettings lodding)
     {
         if (actorCount == 0)
@@ -246,6 +248,7 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
             Bucket0 = bucketBuffers[slot, 0].DeviceAddress,
             Bucket1 = bucketBuffers[slot, 1].DeviceAddress,
             Diagnostics = diagnosticsBuffers[slot].DeviceAddress,
+            CameraPosition = new Vector4((Vector3)cameraPosition, 0),
         };
         var paramsAllocation = context.Transient.Allocate<CullParams>();
         paramsAllocation.As<CullParams>() = parameters;

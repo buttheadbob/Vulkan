@@ -33,14 +33,14 @@ struct SceneActor
     float4 world2;
     float4 world3;
     float4 colorMaskHsv;
-    float4 bounds;       // xyz: camera-relative bounds center, w: radius
-    float4 origin;       // xyz: camera-relative origin, w: scale
+    float4 bounds;       // xyz: absolute bounds center, w: radius
+    float4 origin;       // xyz: absolute origin, w: scale
     float4 lodDistances0;
     float4 lodDistances1;
     uint64_t instances;
     uint instanceStart;
     uint instanceCount;
-    uint flags;          // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance
+    uint flags;          // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance, 4: Visible
     uint rangeBase;
     uint lodStateIndex;
     uint lodCount;
@@ -83,6 +83,7 @@ struct CullParams
     uint64_t bucket0;
     uint64_t bucket1;
     uint64_t diagnostics;
+    float4 cameraPosition;
 };
 
 // Must match GpuDiagnosticsCounters (32 bytes); written with atomics from this pass.
@@ -178,7 +179,7 @@ uint selectLod(SceneActor actor, CullParams params)
     if (params.lodUpdate == 0)
         return lod;
 
-    float distance = length(actor.origin.xyz);
+    float distance = length(actor.origin.xyz - params.cameraPosition.xyz);
     float scale = max(actor.origin.w, 1.0e-6);
     float d = (distance / scale * params.lodCoefficient + params.objectDistanceAdd)
               * params.objectDistanceMult;
@@ -214,9 +215,14 @@ void main(uint3 threadId : SV_DispatchThreadID)
 
     CullParams params = *push.params;
     SceneActor actor = push.actors[index];
-    float3 center = actor.bounds.xyz;
+    if ((actor.flags & 4u) == 0)
+        return;
+
+    float3 camera = params.cameraPosition.xyz;
+    float3 center = actor.bounds.xyz - camera;
     float radius = actor.bounds.w;
     GpuDiagnostics* diag = (GpuDiagnostics*)params.diagnostics;
+
 
     if ((actor.flags & 2u) == 0 && actor.maxViewDistance < 3.4e38
         && length(center) - radius > actor.maxViewDistance)
@@ -267,10 +273,14 @@ void main(uint3 threadId : SV_DispatchThreadID)
         commands[slot] = command;
 
         DrawData draw;
+        // Records store absolute transforms; the forward pass is camera-relative.
         draw.world0 = actor.world0;
         draw.world1 = actor.world1;
         draw.world2 = actor.world2;
         draw.world3 = actor.world3;
+        draw.world0.w -= camera.x;
+        draw.world1.w -= camera.y;
+        draw.world2.w -= camera.z;
         draw.colorMaskHsv = actor.colorMaskHsv;
         draw.material = part.material;
         draw.vertices = part.vertices;

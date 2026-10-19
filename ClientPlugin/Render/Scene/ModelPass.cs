@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using ClientPlugin.Render.Models;
@@ -99,6 +100,7 @@ internal struct TransparentPushConstants
     public uint InstanceStart;
 }
 
+// Must match Shaders/Scene/Shadow.slang
 // Must match Shaders/Scene/Model.slang
 [StructLayout(LayoutKind.Sequential)]
 internal struct ModelPushConstants
@@ -146,6 +148,10 @@ internal sealed unsafe class ModelPass : IDisposable
         public uint LodStateIndex;
         public int StaticIndex = -1;
         public List<CachedTransparentPart>[] TransparentByLod;
+        public bool HasTransparent;
+        public int PartStart;
+        public int PartCount;
+        public bool Dead;
     }
 
     // OIT accumulation (RGBA16F): additive premultiplied color and alpha.
@@ -180,19 +186,47 @@ internal sealed unsafe class ModelPass : IDisposable
     private readonly InstanceBuffers instanceBuffers;
     private readonly TextureCache textures;
     private readonly GpuSceneDraws gpuDraws;
-    private readonly HashSet<uint> preparedActors = new();
+    private readonly bool shadowsEnabled;
+    private readonly ShadowMap shadowMap;
+    private readonly VkPipeline shadowPipeline;
+    private readonly VkPipeline shadowPipelineNoCull;
+    private readonly List<SceneActor> directActors = new();
     private readonly List<TransparentDraw> transparentDraws = new();
     private readonly HashSet<uint> reportedSkinning = new();
 
     private readonly List<CachedActor> cachedActors = new();
     private readonly List<GpuScenePart> cachedParts = new();
     private readonly List<GpuLodRange> cachedRanges = new();
-    private readonly List<GpuSceneActor> frameActors = new();
-    private GpuBuffer partBuffer;
-    private GpuBuffer rangeBuffer;
-    private GpuBuffer lodStateBuffer;
-    private long cachedRevision = -1;
-    private int cachedModelVersion = -1;
+    private readonly List<CachedActor> transparentActors = new();
+    private readonly Dictionary<uint, List<int>> cachedByActor = new();
+    private GpuSceneActor[] actorStates = [];
+    private Matrix[] actorWorlds = [];
+    private long instanceRevisionSeen = -1;
+    private static int reportedNullTextures;
+    private static int reportedLoadingTextures;
+    private long materialTextureGeneration;
+    private long allMaterialTargetGeneration;
+    private bool allMaterialRefresh;
+    private int allMaterialRefreshIndex;
+    private readonly GpuBuffer[] partBuffers = new GpuBuffer[FrameLoop.FramesInFlight];
+    private readonly GpuBuffer[] rangeBuffers = new GpuBuffer[FrameLoop.FramesInFlight];
+    private readonly GpuBuffer[] lodStateBuffers = new GpuBuffer[FrameLoop.FramesInFlight];
+    private readonly long[] slotCacheVersion = new long[FrameLoop.FramesInFlight];
+    private readonly long[] slotPartsVersion = new long[FrameLoop.FramesInFlight];
+    private long cacheVersion;
+    private long partsVersion;
+    private bool forceCacheRebuild;
+    private long cachedFullRevision = -1;
+    private int lastTriedModelVersion = -1;
+    private readonly List<SceneActor> deferredActors = new();
+
+    // Full rebuilds are only needed for removals/model/skeleton changes. New actors are appended
+    // incrementally; the deferred timer prevents a rebuild storm while a grid is still streaming.
+    private long pendingFullRevision = long.MinValue;
+    private long pendingSince;
+    private long lastRebuild;
+    private const double MaxDeferSeconds = 1.5;
+    private const double MinRebuildIntervalSeconds = 0.75;
     private int cachedPartCount;
     private bool gpuSubmitted;
     private readonly VkPipeline pipeline;
@@ -204,11 +238,37 @@ internal sealed unsafe class ModelPass : IDisposable
 
     public ModelPass(GpuContext context, ModelCache models, InstanceBuffers instanceBuffers, TextureCache textures)
     {
+        Array.Fill(slotCacheVersion, -1L);
+        Array.Fill(slotPartsVersion, -1L);
         this.context = context;
         this.models = models;
         this.instanceBuffers = instanceBuffers;
         this.textures = textures;
         gpuDraws = new GpuSceneDraws(context);
+
+        // Off by default: the shadow pass still needs a safe validation cycle. The lighting model
+        // changes (stock colourisation/IBL) are independent and always active.
+        shadowsEnabled = Environment.GetEnvironmentVariable("VULKAN_SHADOWS") == "1";
+        if (shadowsEnabled)
+        {
+            shadowMap = new ShadowMap(context);
+            shadowMap.Ensure();
+
+            GraphicsPipelineBuilder ShadowBuilder(VkCullModeFlags cullMode) => new()
+            {
+                Code = ShaderBytecode.Model.Code.ToArray(),
+                VertexEntry = ShaderBytecode.Model.ShadowMain,
+                ColorFormats = [],
+                DepthFormat = SceneTargets.DepthFormat,
+                DepthTest = true,
+                DepthWrite = true,
+                DepthCompare = VkCompareOp.GreaterOrEqual, // Reverse Z
+                CullMode = cullMode,
+                FrontFace = VkFrontFace.Clockwise,
+            };
+            shadowPipeline = ShadowBuilder(VkCullModeFlags.None).Build(context, "shadow");
+            shadowPipelineNoCull = ShadowBuilder(VkCullModeFlags.None).Build(context, "shadow-nocull");
+        }
 
         GraphicsPipelineBuilder Builder(VkCullModeFlags cullMode) => new()
         {
@@ -290,14 +350,15 @@ internal sealed unsafe class ModelPass : IDisposable
     public void RecordSkinning(VkCommandBuffer commands, CameraState camera, MyNewLoddingSettings lodding,
         SceneActors actors)
     {
+        var profile = Stopwatch.StartNew();
         var api = context.Device.Api;
         var settings = lodding.Global;
         var any = false;
 
-        foreach (var actor in actors.All)
+        foreach (var actor in actors.Skinned)
             actor.SkinnedVertexAddress = 0;
 
-        foreach (var actor in actors.All)
+        foreach (var actor in actors.Skinned)
         {
             if (!actor.Visible || (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) != 0)
                 continue;
@@ -401,7 +462,10 @@ internal sealed unsafe class ModelPass : IDisposable
         }
 
         if (!any)
+        {
+            LastSkinningMs = profile.Elapsed.TotalMilliseconds;
             return;
+        }
 
         var barrier = new VkMemoryBarrier2
         {
@@ -416,168 +480,842 @@ internal sealed unsafe class ModelPass : IDisposable
             pMemoryBarriers = &barrier,
         };
         api.vkCmdPipelineBarrier2(commands, &dependency);
+        LastSkinningMs = profile.Elapsed.TotalMilliseconds;
     }
 
     public int GpuPartCount => cachedPartCount;
+    public Matrix ShadowViewProjection { get; private set; } = Matrix.Identity;
+    public uint ShadowSlot => shadowMap?.Slot ?? 0;
+    public bool ShadowsReady => shadowsEnabled && shadowMap is { Ready: true };
+
+    public string CacheDiagnostics(SceneActors actors)
+    {
+        int total = 0, cached = 0, direct = 0, deferred = 0, visible = 0, noParts = 0;
+        int zeroIndices = 0, totalIndices = 0;
+        var stateInfo = "";
+        foreach (var actor in actors.All)
+        {
+            var model = actor.Model;
+            if (model == null || (!model.Contains("GatlingTurret", StringComparison.OrdinalIgnoreCase) &&
+                                  !model.Contains("HangarDoor_door", StringComparison.OrdinalIgnoreCase) &&
+                                  !model.Contains("SlideDoorLeft", StringComparison.OrdinalIgnoreCase) &&
+                                  !model.Contains("SlideDoorRight", StringComparison.OrdinalIgnoreCase) &&
+                                  !model.Contains("OffsetDoorLeft", StringComparison.OrdinalIgnoreCase) &&
+                                  !model.Contains("OffsetDoorRight", StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            total++;
+            if (actor.Visible) visible++;
+            if (cachedByActor.TryGetValue(actor.Id, out var indices))
+            {
+                cached++;
+                var parts = 0;
+                var zero = 0;
+                var indicesTotal = 0;
+                stateInfo = $"bounds {actorStates[indices[0]].Bounds.X:F2},{actorStates[indices[0]].Bounds.Y:F2},{actorStates[indices[0]].Bounds.Z:F2} r {actorStates[indices[0]].Bounds.W:F2} ";
+                foreach (var index in indices)
+                {
+                    var cachedActor = cachedActors[index];
+                    parts += cachedActor.PartCount;
+                    var partEnd = cachedActor.PartStart + cachedActor.PartCount;
+                    for (var p = cachedActor.PartStart; p < partEnd; p++)
+                    {
+                        if (cachedParts[p].IndexCount == 0) zero++;
+                        else indicesTotal += (int)cachedParts[p].IndexCount;
+                    }
+                }
+                if (parts == 0) noParts++;
+                noParts += 0;
+                zeroIndices += zero;
+                totalIndices += indicesTotal;
+            }
+            else if (directActors.Contains(actor)) direct++;
+            else if (deferredActors.Contains(actor)) deferred++;
+        }
+
+        var sample = new System.Text.StringBuilder();
+        int shown = 0;
+        foreach (var actor in actors.All)
+        {
+            if (shown >= 3) break;
+            if (actor.Model == null || !actor.Model.Contains("GatlingTurret.mwm", StringComparison.OrdinalIgnoreCase) &&
+                !actor.Model.Contains("HangarDoor_door", StringComparison.OrdinalIgnoreCase) &&
+                !actor.Model.Contains("SlideDoorLeft", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var world = actors.GetWorldMatrix(actor);
+            var parent = actor.ParentId != 0 ? actors.Find(actor.ParentId) : null;
+            var state = cachedByActor.TryGetValue(actor.Id, out var sampleIndices) && sampleIndices.Count > 0
+                ? actorStates[sampleIndices[0]]
+                : default;
+            sample.Append($" [{actor.Model} id {actor.Id} parent {actor.ParentId} " +
+                          $"bounds {state.Bounds.X:F2},{state.Bounds.Y:F2},{state.Bounds.Z:F2} r {state.Bounds.W:F2} flags {state.Flags} " +
+                          $"world {world.Translation.X:F2},{world.Translation.Y:F2},{world.Translation.Z:F2} " +
+                          $"msgtx {actor.WorldMatrix.Translation.X:F2},{actor.WorldMatrix.Translation.Y:F2},{actor.WorldMatrix.Translation.Z:F2} " +
+                          $"local {actor.LocalMatrix.Translation.X:F2},{actor.LocalMatrix.Translation.Y:F2},{actor.LocalMatrix.Translation.Z:F2} " +
+                          $"parentWorld {(parent != null ? actors.GetWorldMatrix(parent).Translation.ToString() : "none")}]");
+            shown++;
+        }
+
+        return $"subparts {total} (visible {visible}, cached {cached}, direct {direct}, deferred {deferred}, noParts {noParts}, zeroIndices {zeroIndices}, indices {totalIndices}); " +
+               $"cache {cachedActors.Count}/{cachedByActor.Count} actors, direct {directActors.Count}, deferred {deferredActors.Count}, localUpdates {actors.LocalMatrixUpdates}" +
+               sample;
+    }
     public GpuDiagnosticsCounters Diagnostics => gpuDraws.Counters;
+
+    // CPU profiling for the diagnostics log.
+    public double LastSkinningMs { get; private set; }
+    public double LastPrepareMs { get; private set; }
+    public double LastEnsureMs { get; private set; }
+    public double LastActorLoopMs { get; private set; }
+    public double LastRecordMs { get; private set; }
+    public double LastTransparentMs { get; private set; }
     public uint LastDirectTriangles { get; private set; }
 
     // Rebuilds the persistent opaque parts when actors/models/materials change. The per-frame path then
     // uploads only actor world/colour/visibility state; the GPU selects the LOD and appends part draws.
     private void EnsureCache(SceneActors actors)
     {
-        if (actors.Revision == cachedRevision && models.Version == cachedModelVersion)
-            return;
+        var forced = forceCacheRebuild;
+        forceCacheRebuild = false;
 
-        cachedRevision = actors.Revision;
-        cachedModelVersion = models.Version;
+        var fullRevision = actors.FullRevision;
+        if (!forced && fullRevision == cachedFullRevision)
+        {
+            ProcessRemovedActors(actors);
+            ProcessRecreatedActors(actors);
+            ProcessCreatedActors(actors);
+            return;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        if (!forced && fullRevision != pendingFullRevision)
+        {
+            if (pendingSince == 0)
+                pendingSince = now;
+            pendingFullRevision = fullRevision;
+
+            var elapsed = (now - pendingSince) / (double)Stopwatch.Frequency;
+            if (elapsed < MaxDeferSeconds)
+                return;
+        }
+        else if (!forced)
+        {
+            // Wait for model builds to settle and avoid rebuilding on every streamed removal.
+            if (models.HasPendingUploads)
+                return;
+
+            var sinceRebuild = (now - lastRebuild) / (double)Stopwatch.Frequency;
+            if (sinceRebuild < MinRebuildIntervalSeconds)
+                return;
+        }
+
+        pendingSince = 0;
+        lastRebuild = now;
+        cachedFullRevision = fullRevision;
+        var rebuildWatch = Stopwatch.StartNew();
         cachedActors.Clear();
         cachedParts.Clear();
         cachedRanges.Clear();
+        directActors.Clear();
+        transparentActors.Clear();
+        cachedByActor.Clear();
+        deferredActors.Clear();
+        lastTriedModelVersion = models.Version;
 
         foreach (var actor in actors.All)
         {
-            var model = models.Get(actor.Model);
-            if (model == null || model.LodCount == 0)
+            if (AddActorToCache(actors, actor))
                 continue;
 
-            // A model with blend data needs the skinned path when the actor actually has a skeleton
-            // (characters). Without skeleton data (armor plates) its MESH parts render statically.
-            var skinned = false;
-            foreach (var lod in model.Lods)
-                skinned |= lod.Skinned;
-            var hasSkeleton = actor.SkinTransforms != null && actor.SkeletonIndexUInts != null;
-            if (skinned && hasSkeleton)
-                continue;
-
-            var rangeBase = (uint)cachedRanges.Count;
-            var transparentByLod = new List<CachedTransparentPart>[model.LodCount];
-
-            for (var lodIndex = 0; lodIndex < model.LodCount; lodIndex++)
+            if (!string.IsNullOrEmpty(actor.Model) && models.Get(actor.Model) == null &&
+                !deferredActors.Contains(actor))
             {
-                var lod = model.Lods[lodIndex];
-                var transparent = new List<CachedTransparentPart>();
-                transparentByLod[lodIndex] = transparent;
-                var firstPart = cachedParts.Count;
-
-                foreach (var part in lod.Parts)
-                {
-                    if (part.IndexCount == 0)
-                        continue;
-
-                    var materialFlags = SceneActors.GetMaterialFlags(actor, part.MaterialName);
-                    if ((materialFlags & RenderFlags.Visible) == 0)
-                        continue;
-
-                    if (part.Technique.IsTransparent())
-                    {
-                        if (part.Transparent != null)
-                            transparent.Add(new CachedTransparentPart { Lod = lod, Part = part });
-                        continue;
-                    }
-
-                    if (!IsOpaque(part.Technique))
-                        continue;
-
-                    ResolveTextures(actor, part, out var cm, out var ng, out var ext, out var alpha);
-                    var material = BuildMaterial(actor, part, lod, actor.HasInstances, cm, ng, ext, alpha,
-                        (materialFlags & RenderFlags.MetalnessColorable) != 0);
-                    cachedParts.Add(new GpuScenePart
-                    {
-                        Material = material,
-                        Vertices = lod.Vertices.DeviceAddress,
-                        Indices = lod.Indices.DeviceAddress,
-                        IndexStart = (uint)part.IndexStart,
-                        IndexCount = (uint)part.IndexCount,
-                    });
-                }
-
-                cachedRanges.Add(new GpuLodRange
-                {
-                    Start = (uint)firstPart,
-                    Count = (uint)(cachedParts.Count - firstPart),
-                });
-            }
-
-            var staticCount = actor.StaticMatrices?.Length ?? 0;
-            if (staticCount > 0)
-            {
-                for (var staticIndex = 0; staticIndex < staticCount; staticIndex++)
-                {
-                    cachedActors.Add(new CachedActor
-                    {
-                        Actor = actor,
-                        Model = model,
-                        RangeBase = rangeBase,
-                        LodStateIndex = (uint)cachedActors.Count,
-                        StaticIndex = staticIndex,
-                        TransparentByLod = transparentByLod,
-                    });
-                }
-            }
-            else
-            {
-                cachedActors.Add(new CachedActor
-                {
-                    Actor = actor,
-                    Model = model,
-                    RangeBase = rangeBase,
-                    LodStateIndex = (uint)cachedActors.Count,
-                    TransparentByLod = transparentByLod,
-                });
+                deferredActors.Add(actor);
             }
         }
 
         cachedPartCount = cachedParts.Count;
-        partBuffer?.Dispose();
-        rangeBuffer?.Dispose();
-        lodStateBuffer?.Dispose();
-        partBuffer = null;
-        rangeBuffer = null;
-        lodStateBuffer = null;
+        cacheVersion++;
+        partsVersion++;
+        instanceRevisionSeen = instanceBuffers.Revision;
+        actors.ClearDirty();
+        actors.ClearMaterialDirty();
+        actors.ClearCreatedActors();
+        actors.ClearRemovedActors();
+        actors.ClearRecreatedActors();
 
-        if (cachedPartCount > 0)
+        if (rebuildWatch.Elapsed.TotalMilliseconds > 50)
+            RenderLog.Warning($"Part cache rebuild took {rebuildWatch.Elapsed.TotalMilliseconds:F1} ms " +
+                              $"({cachedActors.Count} actors, {cachedPartCount} parts; {actors.RevisionCounters})");
+    }
+
+    private GpuScenePart BuildGpuPart(SceneActor actor, ModelPart part, GpuLod lod, bool instanced,
+        RenderFlags materialFlags, bool visible)
+    {
+        ResolveTextures(actor, part, out var cm, out var ng, out var ext, out var alpha);
+
+        if (cm == null && !string.IsNullOrEmpty(part.MaterialName) && reportedNullTextures++ < 20)
+            RenderLog.Info($"No ColorMetal for {actor.Model} part '{part.MaterialName}' (actor {actor.Id})");
+        else if (cm != null && TextureCache.SlotOf(cm) == (uint)BindlessDescriptors.TextureSlot.Transparent &&
+                 reportedLoadingTextures++ < 20)
+            RenderLog.Info($"ColorMetal still loading for {actor.Model} part '{part.MaterialName}': {cm.Path}");
+
+        var material = BuildMaterial(actor, part, lod, instanced, cm, ng, ext, alpha,
+            (materialFlags & RenderFlags.MetalnessColorable) != 0);
+
+        return new GpuScenePart
         {
-            partBuffer = GpuBuffer.Create(context, (ulong)(cachedPartCount * GpuScenePart.Size),
-                VkBufferUsageFlags.StorageBuffer, hostVisible: true);
-            var parts = new Span<GpuScenePart>(partBuffer.Mapped, cachedPartCount);
-            for (var i = 0; i < cachedPartCount; i++)
-                parts[i] = cachedParts[i];
+            Material = material,
+            Vertices = lod.Vertices.DeviceAddress,
+            Indices = lod.Indices.DeviceAddress,
+            IndexStart = (uint)part.IndexStart,
+            // Hidden parts keep their slot (stable part indices) but draw nothing.
+            IndexCount = visible ? (uint)part.IndexCount : 0u,
+        };
+    }
+
+    // Rebuilds one actor's cached part/materials in place. Part count/order must stay unchanged;
+    // otherwise the cache is rebuilt structurally on the next frame.
+    private void RefreshActorMaterial(CachedActor cached)
+    {
+        if (cached.Dead)
+            return;
+
+        var actor = cached.Actor;
+        var model = cached.Model;
+        var partIndex = cached.PartStart;
+        var end = cached.PartStart + cached.PartCount;
+        var instanced = actor.HasInstances;
+
+        foreach (var list in cached.TransparentByLod)
+            list.Clear();
+
+        for (var lodIndex = 0; lodIndex < model.LodCount; lodIndex++)
+        {
+            var lod = model.Lods[lodIndex];
+            var transparent = cached.TransparentByLod[lodIndex];
+            foreach (var part in lod.Parts)
+            {
+                if (part.IndexCount == 0)
+                    continue;
+
+                var materialFlags = SceneActors.GetMaterialFlags(actor, part.MaterialName);
+                var visible = (materialFlags & RenderFlags.Visible) != 0;
+
+                if (part.Technique.IsTransparent())
+                {
+                    if (visible && part.Transparent != null)
+                        transparent.Add(new CachedTransparentPart { Lod = lod, Part = part });
+                    continue;
+                }
+
+                if (!IsOpaque(part.Technique))
+                    continue;
+
+                if (partIndex >= end)
+                {
+                    forceCacheRebuild = true;
+                    return;
+                }
+
+                cachedParts[partIndex++] = BuildGpuPart(actor, part, lod, instanced, materialFlags, visible);
+            }
         }
 
-        if (cachedRanges.Count > 0)
+        if (partIndex != end)
         {
-            rangeBuffer = GpuBuffer.Create(context, (ulong)(cachedRanges.Count * sizeof(GpuLodRange)),
-                VkBufferUsageFlags.StorageBuffer, hostVisible: true);
-            var ranges = new Span<GpuLodRange>(rangeBuffer.Mapped, cachedRanges.Count);
-            for (var i = 0; i < cachedRanges.Count; i++)
-                ranges[i] = cachedRanges[i];
+            forceCacheRebuild = true;
+            return;
         }
 
-        if (cachedActors.Count > 0)
+        var hasTransparent = false;
+        foreach (var list in cached.TransparentByLod)
         {
-            lodStateBuffer = GpuBuffer.Create(context, (ulong)(cachedActors.Count * sizeof(uint)),
+            if (list.Count > 0)
+            {
+                hasTransparent = true;
+                break;
+            }
+        }
+
+        if (hasTransparent != cached.HasTransparent)
+        {
+            cached.HasTransparent = hasTransparent;
+            if (hasTransparent)
+            {
+                if (!transparentActors.Contains(cached))
+                    transparentActors.Add(cached);
+            }
+            else
+            {
+                transparentActors.Remove(cached);
+            }
+        }
+
+        partsVersion++;
+    }
+
+    private void UpdateDirtyMaterials(SceneActors actors)
+    {
+        if (cachedActors.Count == 0)
+        {
+            actors.ClearMaterialDirty();
+            return;
+        }
+
+        var watch = Stopwatch.StartNew();
+
+        // Textures finish decoding asynchronously. Part records store bindless slot indices, so a
+        // part built while a texture was still loading keeps the placeholder forever unless the
+        // material is rebuilt. Refresh all cached materials (budgeted) when new textures appear.
+        if (!allMaterialRefresh && textures.ReadyGeneration != materialTextureGeneration)
+        {
+            allMaterialRefresh = true;
+            allMaterialRefreshIndex = 0;
+            allMaterialTargetGeneration = textures.ReadyGeneration;
+            RenderLog.Info($"Material texture refresh start: generation {allMaterialTargetGeneration}, {cachedActors.Count} cached actors");
+        }
+
+        if (allMaterialRefresh)
+        {
+            while (allMaterialRefreshIndex < cachedActors.Count &&
+                   watch.Elapsed.TotalMilliseconds < 2.0)
+            {
+                RefreshActorMaterial(cachedActors[allMaterialRefreshIndex++]);
+            }
+
+            if (allMaterialRefreshIndex >= cachedActors.Count)
+            {
+                allMaterialRefresh = false;
+                allMaterialRefreshIndex = 0;
+                materialTextureGeneration = allMaterialTargetGeneration;
+                RenderLog.Info($"Material texture refresh done: generation {materialTextureGeneration}");
+            }
+        }
+
+        var processed = 0;
+        foreach (var actor in actors.MaterialDirtyActors)
+        {
+            if (forceCacheRebuild || watch.Elapsed.TotalMilliseconds >= 2.0)
+                break;
+
+            processed++;
+            if (!cachedByActor.TryGetValue(actor.Id, out var indices))
+                continue;
+
+            foreach (var index in indices)
+                RefreshActorMaterial(cachedActors[index]);
+        }
+
+        actors.TrimMaterialDirty(processed);
+    }
+
+    // Marks an actor's cached records invisible without touching the part buffer. The parts stay
+    // until a compaction pass; this makes removals and model replacements O(1).
+    private void KillCachedActor(SceneActor actor)
+    {
+        if (!cachedByActor.TryGetValue(actor.Id, out var indices))
+            return;
+
+        foreach (var index in indices)
+        {
+            actorStates[index].Flags &= ~GpuSceneActor.Visible;
+            cachedActors[index].Dead = true;
+            transparentActors.Remove(cachedActors[index]);
+        }
+
+        cachedByActor.Remove(actor.Id);
+    }
+
+    private void ProcessRemovedActors(SceneActors actors)
+    {
+        var removed = actors.RemovedActorIds;
+        if (removed.Count == 0)
+            return;
+
+        var watch = Stopwatch.StartNew();
+        var processed = 0;
+        foreach (var id in removed)
+        {
+            if (watch.Elapsed.TotalMilliseconds >= 2.0)
+                break;
+
+            processed++;
+            if (cachedByActor.TryGetValue(id, out var indices))
+            {
+                foreach (var index in indices)
+                {
+                    actorStates[index].Flags &= ~GpuSceneActor.Visible;
+                    cachedActors[index].Dead = true;
+                    transparentActors.Remove(cachedActors[index]);
+                }
+                cachedByActor.Remove(id);
+            }
+
+            directActors.RemoveAll(a => a.Id == id);
+            deferredActors.RemoveAll(a => a.Id == id);
+        }
+
+        actors.TrimRemovedActors(processed);
+    }
+
+    private void ProcessRecreatedActors(SceneActors actors)
+    {
+        var recreated = actors.RecreatedActors;
+        if (recreated.Count == 0)
+            return;
+
+        var watch = Stopwatch.StartNew();
+        var processed = 0;
+        var changed = false;
+        foreach (var actor in recreated)
+        {
+            if (watch.Elapsed.TotalMilliseconds >= 3.0)
+                break;
+
+            processed++;
+            KillCachedActor(actor);
+            if (AddActorToCache(actors, actor))
+            {
+                changed = true;
+            }
+            else if (!string.IsNullOrEmpty(actor.Model) && models.Get(actor.Model) == null &&
+                     !deferredActors.Contains(actor))
+            {
+                // The replacement model is still loading; retry when the model version changes.
+                deferredActors.Add(actor);
+            }
+        }
+
+        actors.TrimRecreatedActors(processed);
+        if (changed)
+        {
+            cachedPartCount = cachedParts.Count;
+            cacheVersion++;
+            partsVersion++;
+        }
+    }
+
+    // Uploads the persistent part/range/LOD-state data to the current frame slot's buffers. Only
+    // the slot whose fence was waited on is written, so the other in-flight slot is untouched.
+    private void UploadPartData(int frameSlot)
+    {
+        if (cachedPartCount == 0)
+            return;
+
+        var partsStale = slotPartsVersion[frameSlot] != partsVersion;
+        var cacheStale = slotCacheVersion[frameSlot] != cacheVersion;
+        if (!partsStale && !cacheStale)
+            return;
+
+        var partBytes = (ulong)(cachedPartCount * GpuScenePart.Size);
+        if (partBuffers[frameSlot] == null || partBuffers[frameSlot].Size < partBytes)
+        {
+            partBuffers[frameSlot]?.Dispose();
+            partBuffers[frameSlot] = GpuBuffer.Create(context, partBytes,
                 VkBufferUsageFlags.StorageBuffer, hostVisible: true);
-            var states = new Span<uint>(lodStateBuffer.Mapped, cachedActors.Count);
+        }
+
+        CollectionsMarshal.AsSpan(cachedParts).CopyTo(
+            new Span<GpuScenePart>(partBuffers[frameSlot].Mapped, cachedPartCount));
+
+        if (cacheStale)
+        {
+            var rangeBytes = (ulong)(cachedRanges.Count * sizeof(GpuLodRange));
+            if (rangeBuffers[frameSlot] == null || rangeBuffers[frameSlot].Size < rangeBytes)
+            {
+                rangeBuffers[frameSlot]?.Dispose();
+                rangeBuffers[frameSlot] = GpuBuffer.Create(context, rangeBytes,
+                    VkBufferUsageFlags.StorageBuffer, hostVisible: true);
+            }
+            CollectionsMarshal.AsSpan(cachedRanges).CopyTo(
+                new Span<GpuLodRange>(rangeBuffers[frameSlot].Mapped, cachedRanges.Count));
+
+            var lodBytes = (ulong)(cachedActors.Count * sizeof(uint));
+            if (lodStateBuffers[frameSlot] == null || lodStateBuffers[frameSlot].Size < lodBytes)
+            {
+                lodStateBuffers[frameSlot]?.Dispose();
+                lodStateBuffers[frameSlot] = GpuBuffer.Create(context, lodBytes,
+                    VkBufferUsageFlags.StorageBuffer, hostVisible: true);
+            }
+
+            var states = new Span<uint>(lodStateBuffers[frameSlot].Mapped, cachedActors.Count);
             for (var i = 0; i < cachedActors.Count; i++)
                 states[i] = (uint)Math.Clamp(cachedActors[i].Actor.Lod, 0, cachedActors[i].Model.LodCount - 1);
+
+            slotCacheVersion[frameSlot] = cacheVersion;
         }
+
+        slotPartsVersion[frameSlot] = partsVersion;
+    }
+
+    private void EnsureActorStateCapacity(int count)
+    {
+        if (actorStates.Length >= count)
+            return;
+
+        var capacity = Math.Max(count, Math.Max(1024, actorStates.Length * 2));
+        Array.Resize(ref actorStates, capacity);
+        Array.Resize(ref actorWorlds, capacity);
+    }
+
+    private void AddCachedActor(SceneActors actors, SceneActor actor, GpuModel model, uint rangeBase,
+        int staticIndex, List<CachedTransparentPart>[] transparentByLod, bool hasTransparent,
+        int partStart, int partCount)
+    {
+        var index = cachedActors.Count;
+        var cached = new CachedActor
+        {
+            Actor = actor,
+            Model = model,
+            RangeBase = rangeBase,
+            LodStateIndex = (uint)index,
+            StaticIndex = staticIndex,
+            TransparentByLod = transparentByLod,
+            HasTransparent = hasTransparent,
+            PartStart = partStart,
+            PartCount = partCount,
+        };
+
+        cachedActors.Add(cached);
+        EnsureActorStateCapacity(index + 1);
+        BuildActorState(actors, cached, index);
+
+        if (hasTransparent)
+            transparentActors.Add(cached);
+
+        if (!cachedByActor.TryGetValue(actor.Id, out var indices))
+            cachedByActor[actor.Id] = indices = new List<int>(1);
+        indices.Add(index);
+    }
+
+    // Appends one actor to the persistent cache. Returns false for skinned/not-ready actors, which
+    // stay on the direct/deferred paths.
+    private bool AddActorToCache(SceneActors actors, SceneActor actor)
+    {
+        if (cachedByActor.ContainsKey(actor.Id))
+            return false;
+
+        if (string.IsNullOrEmpty(actor.Model))
+        {
+            if (!directActors.Contains(actor))
+                directActors.Add(actor);
+            return false;
+        }
+
+        var model = models.Get(actor.Model);
+        if (model == null || model.LodCount == 0)
+        {
+            if (!directActors.Contains(actor))
+                directActors.Add(actor);
+            return false;
+        }
+
+        var skinned = false;
+        foreach (var lod in model.Lods)
+            skinned |= lod.Skinned;
+        var hasSkeleton = actor.SkinTransforms != null && actor.SkeletonIndexUInts != null;
+        if (skinned && hasSkeleton)
+        {
+            if (!directActors.Contains(actor))
+                directActors.Add(actor);
+            return false;
+        }
+
+        var rangeBase = (uint)cachedRanges.Count;
+        var partStart = cachedParts.Count;
+        var transparentByLod = new List<CachedTransparentPart>[model.LodCount];
+
+        for (var lodIndex = 0; lodIndex < model.LodCount; lodIndex++)
+        {
+            var lod = model.Lods[lodIndex];
+            var transparent = new List<CachedTransparentPart>();
+            transparentByLod[lodIndex] = transparent;
+            var firstPart = cachedParts.Count;
+
+            foreach (var part in lod.Parts)
+            {
+                if (part.IndexCount == 0)
+                    continue;
+
+                var materialFlags = SceneActors.GetMaterialFlags(actor, part.MaterialName);
+                var visible = (materialFlags & RenderFlags.Visible) != 0;
+
+                if (part.Technique.IsTransparent())
+                {
+                    if (visible && part.Transparent != null)
+                        transparent.Add(new CachedTransparentPart { Lod = lod, Part = part });
+                    continue;
+                }
+
+                if (!IsOpaque(part.Technique))
+                    continue;
+
+                cachedParts.Add(BuildGpuPart(actor, part, lod, actor.HasInstances, materialFlags, visible));
+            }
+
+            cachedRanges.Add(new GpuLodRange
+            {
+                Start = (uint)firstPart,
+                Count = (uint)(cachedParts.Count - firstPart),
+            });
+        }
+
+        var hasTransparent = false;
+        foreach (var list in transparentByLod)
+        {
+            if (list.Count > 0)
+            {
+                hasTransparent = true;
+                break;
+            }
+        }
+
+        var partCount = cachedParts.Count - partStart;
+        var staticCount = actor.StaticMatrices?.Length ?? 0;
+        if (staticCount > 0)
+        {
+            for (var staticIndex = 0; staticIndex < staticCount; staticIndex++)
+            {
+                AddCachedActor(actors, actor, model, rangeBase, staticIndex, transparentByLod,
+                    hasTransparent, partStart, partCount);
+            }
+        }
+        else
+        {
+            AddCachedActor(actors, actor, model, rangeBase, -1, transparentByLod,
+                hasTransparent, partStart, partCount);
+        }
+
+        directActors.Remove(actor);
+        return true;
+    }
+
+    private void ProcessCreatedActors(SceneActors actors)
+    {
+        var created = actors.CreatedActors;
+        var modelsChanged = lastTriedModelVersion != models.Version;
+        if (created.Count == 0 && deferredActors.Count == 0 && !modelsChanged)
+            return;
+
+        var changed = false;
+        var watch = Stopwatch.StartNew();
+        var processed = 0;
+        for (var i = 0; i < created.Count; i++)
+        {
+            if (watch.Elapsed.TotalMilliseconds >= 4.0)
+                break;
+
+            var actor = created[i];
+            processed++;
+            if (cachedByActor.ContainsKey(actor.Id))
+                continue;
+
+            if (string.IsNullOrEmpty(actor.Model))
+            {
+                if (!directActors.Contains(actor))
+                    directActors.Add(actor);
+                continue;
+            }
+
+            if (AddActorToCache(actors, actor))
+            {
+                changed = true;
+            }
+            else if (models.Get(actor.Model) == null && !deferredActors.Contains(actor))
+            {
+                deferredActors.Add(actor);
+            }
+        }
+        actors.TrimCreatedActors(processed);
+
+        // Deferred models can become ready at any time; retry under the same budget.
+        if (watch.Elapsed.TotalMilliseconds < 4.0)
+        {
+            for (var i = deferredActors.Count - 1; i >= 0 && watch.Elapsed.TotalMilliseconds < 4.0; i--)
+            {
+                var actor = deferredActors[i];
+                if (models.Get(actor.Model) == null)
+                    continue;
+
+                if (AddActorToCache(actors, actor))
+                {
+                    deferredActors.RemoveAt(i);
+                    changed = true;
+                }
+            }
+        }
+        lastTriedModelVersion = models.Version;
+
+        if (changed)
+        {
+            cachedPartCount = cachedParts.Count;
+            cacheVersion++;
+            partsVersion++;
+        }
+    }
+
+    // Absolute (world-space) actor state. The culling compute subtracts the camera position, so
+    // camera movement does not invalidate any record.
+    private void BuildActorState(SceneActors actors, CachedActor cached, int index)
+    {
+        var actor = cached.Actor;
+        var model = cached.Model;
+
+        Matrix world;
+        if (cached.StaticIndex >= 0)
+        {
+            world = actor.StaticMatrices[cached.StaticIndex];
+            world.Translation += (Vector3)actor.StaticTranslation;
+        }
+        else
+        {
+            world = BuildAbsoluteWorld(actors.GetWorldMatrix(actor), actor.Scale);
+        }
+        actorWorlds[index] = world;
+
+        var worldT = Matrix.Transpose(world);
+        var localBounds = actor.LocalAabb ?? model.Bounds;
+        var worldBounds = localBounds.Transform(world);
+        var center = (worldBounds.Min + worldBounds.Max) * 0.5f;
+        var radius = (worldBounds.Max - worldBounds.Min).Length() * 0.5f;
+
+        var visible = actor.Visible && (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) == 0;
+        var instances = (InstanceBuffer)null;
+        var instanceStart = 0;
+        var instanceCount = 1;
+        var instanceAddress = 0ul;
+        if (actor.HasInstances)
+        {
+            instances = instanceBuffers.Get(actor.InstanceBufferId);
+            if (instances?.Buffer == null || instances.Type != MyRenderInstanceBufferType.Cube)
+            {
+                visible = false;
+            }
+            else
+            {
+                instanceStart = actor.InstanceStart;
+                instanceCount = Math.Min(actor.InstanceCount, instances.Count - instanceStart);
+                if (instanceCount <= 0)
+                    visible = false;
+                else
+                    instanceAddress = instances.Buffer.DeviceAddress;
+            }
+        }
+
+        var lodCount = Math.Min(model.LodCount, 8);
+        Vector4 lodDistances0 = default;
+        Vector4 lodDistances1 = default;
+        for (var i = 0; i < lodCount - 1 && i < 8; i++)
+        {
+            var threshold = i < model.LodDistances.Length ? model.LodDistances[i] : 0f;
+            if (i < 4)
+                lodDistances0[i] = threshold;
+            else
+                lodDistances1[i - 4] = threshold;
+        }
+
+        var flags = (actor.Flags & RenderFlags.NoBackFaceCulling) != 0 ? GpuSceneActor.NoBackFaceCulling : 0u;
+        if ((actor.Flags & RenderFlags.DrawOutsideViewDistance) != 0)
+            flags |= GpuSceneActor.DrawOutsideViewDistance;
+        if (visible)
+            flags |= GpuSceneActor.Visible;
+
+        actorStates[index] = new GpuSceneActor
+        {
+            World0 = new Vector4(worldT.M11, worldT.M12, worldT.M13, worldT.M14),
+            World1 = new Vector4(worldT.M21, worldT.M22, worldT.M23, worldT.M24),
+            World2 = new Vector4(worldT.M31, worldT.M32, worldT.M33, worldT.M34),
+            World3 = new Vector4(worldT.M41, worldT.M42, worldT.M43, worldT.M44),
+            ColorMaskHsv = new Vector4(actor.ColorMaskHsv, 0),
+            Bounds = new Vector4(center, radius),
+            Origin = new Vector4(world.Translation, actor.Scale),
+            LodDistances0 = lodDistances0,
+            LodDistances1 = lodDistances1,
+            Instances = instanceAddress,
+            InstanceStart = (uint)instanceStart,
+            InstanceCount = (uint)instanceCount,
+            Flags = flags,
+            RangeBase = cached.RangeBase,
+            LodStateIndex = cached.LodStateIndex,
+            LodCount = (uint)lodCount,
+            MaxViewDistance = (actor.Flags & RenderFlags.DrawOutsideViewDistance) != 0
+                ? float.MaxValue
+                : actor.MaxViewDistance,
+            Pad0 = 0,
+        };
+    }
+
+    // Refreshes only records the game changed plus actors whose instance buffer was replaced.
+    private void UpdateDirtyActorStates(SceneActors actors)
+    {
+        if (cachedActors.Count == 0)
+        {
+            actors.ClearDirty();
+            return;
+        }
+
+        if (instanceRevisionSeen != instanceBuffers.Revision)
+        {
+            instanceRevisionSeen = instanceBuffers.Revision;
+            for (var i = 0; i < cachedActors.Count; i++)
+            {
+                if (!cachedActors[i].Dead && cachedActors[i].Actor.HasInstances)
+                    BuildActorState(actors, cachedActors[i], i);
+            }
+        }
+
+        var watch = Stopwatch.StartNew();
+        var processed = 0;
+        foreach (var actor in actors.DirtyActors)
+        {
+            if (watch.Elapsed.TotalMilliseconds >= 2.0)
+                break;
+
+            processed++;
+            if (!cachedByActor.TryGetValue(actor.Id, out var indices))
+                continue;
+
+            foreach (var index in indices)
+                BuildActorState(actors, cachedActors[index], index);
+        }
+
+        actors.TrimDirty(processed);
     }
 
     // Builds per-frame actor state and dispatches the GPU culling/LOD compute. Parts/materials are persistent.
     public void RecordPrepare(VkCommandBuffer commands, int frameSlot, CameraState camera,
-        MyNewLoddingSettings lodding, SceneActors actors)
+        MyNewLoddingSettings lodding, SceneActors actors, Vector3D sunDirection)
     {
+        var profile = Stopwatch.StartNew();
         EnsureCache(actors);
+        LastEnsureMs = profile.Elapsed.TotalMilliseconds;
+        if (shadowsEnabled)
+            ShadowViewProjection = ShadowMap.BuildViewProjection(sunDirection);
+        var loopStart = profile.Elapsed;
+        UpdateDirtyActorStates(actors);
+        UpdateDirtyMaterials(actors);
+        if (forceCacheRebuild)
+        {
+            EnsureCache(actors);
+            UpdateDirtyActorStates(actors);
+        }
+
         var settings = lodding.Global;
         var frustum = new Frustum(camera.CullingViewProjection);
-        preparedActors.Clear();
         transparentDraws.Clear();
-        frameActors.Clear();
         gpuSubmitted = false;
         gpuDraws.Begin(frameSlot, Math.Max(cachedPartCount, 1));
 
-        foreach (var cached in cachedActors)
+        // The game calls Render.Draw only for IDs reported visible; publish them once per frame.
+        foreach (var actor in actors.VisibilityUpdates)
+        {
+            if (actor.Visible && (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) == 0)
+                MyRenderProxy.VisibleObjectsWrite.Add(actor.Id);
+        }
+
+        // Transparent parts keep the direct path and still need a CPU LOD/cull selection.
+        foreach (var cached in transparentActors)
         {
             var actor = cached.Actor;
             if (!actor.Visible || (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) != 0)
@@ -599,9 +1337,8 @@ internal sealed unsafe class ModelPass : IDisposable
                     continue;
             }
 
-            var world = cached.StaticIndex >= 0
-                ? BuildStaticWorld(actor, camera.Position, cached.StaticIndex)
-                : BuildWorld(actors.GetWorldMatrix(actor), actor.Scale, camera.Position);
+            var world = actorWorlds[cached.LodStateIndex];
+            world.Translation -= (Vector3)camera.Position;
             var distance = world.Translation.Length();
             var localBounds = actor.LocalAabb ?? model.Bounds;
             var worldBounds = localBounds.Transform(world);
@@ -612,88 +1349,140 @@ internal sealed unsafe class ModelPass : IDisposable
                 : actor.MaxViewDistance;
             var cpuVisible = distance - radius <= maxViewDistance && frustum.Intersects(worldBounds);
 
-            preparedActors.Add(actor.Id);
-            if (actor.VisibilityUpdates)
-                MyRenderProxy.VisibleObjectsWrite.Add(actor.Id);
-
-            var worldT = Matrix.Transpose(world);
             var lodModel = SelectLod(model, distance, actor.Scale, camera, settings, ref actor.Lod);
+            if (!cpuVisible)
+                continue;
 
-            if (cpuVisible && cached.TransparentByLod.Length > 0)
+            var lodIndex = Math.Clamp(actor.Lod, 0, cached.TransparentByLod.Length - 1);
+            foreach (var transparent in cached.TransparentByLod[lodIndex])
             {
-                var lodIndex = Math.Clamp(actor.Lod, 0, cached.TransparentByLod.Length - 1);
-                foreach (var transparent in cached.TransparentByLod[lodIndex])
+                transparentDraws.Add(new TransparentDraw
                 {
-                    transparentDraws.Add(new TransparentDraw
-                    {
-                        Actor = actor,
-                        Lod = transparent.Lod,
-                        Part = transparent.Part,
-                        World = world,
-                        Vertices = transparent.Lod.Vertices.DeviceAddress,
-                        Instances = instances,
-                        InstanceStart = instanceStart,
-                        InstanceCount = instances != null ? instanceCount : 1,
-                    });
-                }
+                    Actor = actor,
+                    Lod = transparent.Lod,
+                    Part = transparent.Part,
+                    World = world,
+                    Vertices = transparent.Lod.Vertices.DeviceAddress,
+                    Instances = instances,
+                    InstanceStart = instanceStart,
+                    InstanceCount = instances != null ? instanceCount : 1,
+                });
             }
-
-            var lodCount = Math.Min(model.LodCount, 8);
-            Vector4 lodDistances0 = default;
-            Vector4 lodDistances1 = default;
-            for (var i = 0; i < lodCount - 1 && i < 8; i++)
-            {
-                var threshold = i < model.LodDistances.Length ? model.LodDistances[i] : 0f;
-                if (i < 4)
-                    lodDistances0[i] = threshold;
-                else
-                    lodDistances1[i - 4] = threshold;
-            }
-
-            frameActors.Add(new GpuSceneActor
-            {
-                World0 = new Vector4(worldT.M11, worldT.M12, worldT.M13, worldT.M14),
-                World1 = new Vector4(worldT.M21, worldT.M22, worldT.M23, worldT.M24),
-                World2 = new Vector4(worldT.M31, worldT.M32, worldT.M33, worldT.M34),
-                World3 = new Vector4(worldT.M41, worldT.M42, worldT.M43, worldT.M44),
-                ColorMaskHsv = new Vector4(actor.ColorMaskHsv, 0),
-                Bounds = new Vector4(center, radius),
-                Origin = new Vector4(world.Translation, actor.Scale),
-                LodDistances0 = lodDistances0,
-                LodDistances1 = lodDistances1,
-                Instances = instances?.Buffer.DeviceAddress ?? 0,
-                InstanceStart = (uint)instanceStart,
-                InstanceCount = (uint)instanceCount,
-                Flags = (actor.Flags & RenderFlags.NoBackFaceCulling) != 0 ? GpuSceneActor.NoBackFaceCulling : 0u,
-                RangeBase = cached.RangeBase,
-                LodStateIndex = cached.LodStateIndex,
-                LodCount = (uint)lodCount,
-                MaxViewDistance = maxViewDistance,
-                Pad0 = 0,
-            });
         }
 
-        // Visibility updates for skinned/static-group actors happen in Record; simple actors were
-        // published above. Static groups are not in the persistent cache.
-        if (frameActors.Count == 0 || cachedPartCount == 0 || partBuffer == null ||
-            rangeBuffer == null || lodStateBuffer == null)
+        LastActorLoopMs = (profile.Elapsed - loopStart).TotalMilliseconds;
+        UploadPartData(frameSlot);
+        LastPrepareMs = profile.Elapsed.TotalMilliseconds;
+
+        if (cachedActors.Count == 0 || cachedPartCount == 0 || partBuffers[frameSlot] == null ||
+            rangeBuffers[frameSlot] == null || lodStateBuffers[frameSlot] == null)
             return;
 
-        var allocation = context.Transient.Allocate<GpuSceneActor>(frameActors.Count);
-        var span = allocation.AsSpan<GpuSceneActor>(frameActors.Count);
-        for (var i = 0; i < frameActors.Count; i++)
-            span[i] = frameActors[i];
+        var actorCount = cachedActors.Count;
+        var allocation = context.Transient.Allocate<GpuSceneActor>(actorCount);
+        actorStates.AsSpan(0, actorCount).CopyTo(allocation.AsSpan<GpuSceneActor>(actorCount));
 
-        gpuDraws.Dispatch(commands, camera.CullingViewProjection, camera.LodCoefficient,
-            allocation.Address, (uint)frameActors.Count, partBuffer.DeviceAddress,
-            rangeBuffer.DeviceAddress, lodStateBuffer.DeviceAddress, lodding);
+        gpuDraws.Dispatch(commands, camera.CullingViewProjection, camera.Position, camera.LodCoefficient,
+            allocation.Address, (uint)actorCount, partBuffers[frameSlot].DeviceAddress,
+            rangeBuffers[frameSlot].DeviceAddress, lodStateBuffers[frameSlot].DeviceAddress, lodding);
         gpuSubmitted = true;
+    }
+
+    // Records the sun depth map. Reuses the opaque pass draw data (same culled/LOD-selected set),
+    // so it costs one extra vertex-only pass and no second culling dispatch.
+    public unsafe void RecordShadow(VkCommandBuffer commands, CameraState camera)
+    {
+        if (!shadowsEnabled || !gpuSubmitted || shadowMap is not { Ready: true })
+            return;
+
+        var api = context.Device.Api;
+        var image = shadowMap.Image;
+
+        var firstUse = shadowMap.Layout == VkImageLayout.Undefined;
+        var toAttachment = new VkImageMemoryBarrier2
+        {
+            srcStageMask = firstUse ? VkPipelineStageFlags2.None : VkPipelineStageFlags2.FragmentShader,
+            srcAccessMask = firstUse ? VkAccessFlags2.None : VkAccessFlags2.ShaderSampledRead,
+            dstStageMask = VkPipelineStageFlags2.EarlyFragmentTests,
+            dstAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
+            oldLayout = shadowMap.Layout,
+            newLayout = VkImageLayout.DepthAttachmentOptimal,
+            image = image.Handle,
+            subresourceRange = image.FullRange,
+            srcQueueFamilyIndex = uint.MaxValue,
+            dstQueueFamilyIndex = uint.MaxValue,
+        };
+        var toAttachmentInfo = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &toAttachment };
+        api.vkCmdPipelineBarrier2(commands, &toAttachmentInfo);
+
+        var depthAttachment = new VkRenderingAttachmentInfo
+        {
+            imageView = image.View,
+            imageLayout = VkImageLayout.DepthAttachmentOptimal,
+            loadOp = VkAttachmentLoadOp.Clear,
+            storeOp = VkAttachmentStoreOp.Store,
+            clearValue = new VkClearValue { depthStencil = new VkClearDepthStencilValue(0f, 0) },
+        };
+        var renderingInfo = new VkRenderingInfo
+        {
+            renderArea = new VkRect2D(0, 0, ShadowMap.Size, ShadowMap.Size),
+            layerCount = 1,
+            colorAttachmentCount = 0,
+            pDepthAttachment = &depthAttachment,
+        };
+        api.vkCmdBeginRendering(commands, &renderingInfo);
+
+        var viewport = new VkViewport(0, 0, ShadowMap.Size, ShadowMap.Size, 0, 1);
+        var scissor = new VkRect2D(0, 0, ShadowMap.Size, ShadowMap.Size);
+        api.vkCmdSetViewport(commands, 0, 1, &viewport);
+        api.vkCmdSetScissor(commands, 0, 1, &scissor);
+
+        var vp = Matrix.Transpose(ShadowViewProjection);
+        for (var bucket = 0; bucket < 2; bucket++)
+        {
+            api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics,
+                bucket == 0 ? shadowPipeline : shadowPipelineNoCull);
+            context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
+            var push = new ModelPushConstants
+            {
+                World0 = new Vector4(vp.M11, vp.M12, vp.M13, vp.M14),
+                World1 = new Vector4(vp.M21, vp.M22, vp.M23, vp.M24),
+                World2 = new Vector4(vp.M31, vp.M32, vp.M33, vp.M34),
+                World3 = new Vector4(vp.M41, vp.M42, vp.M43, vp.M44),
+                DrawData = gpuDraws.DrawDataAddress(bucket),
+            };
+            api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
+                0, (uint)sizeof(ModelPushConstants), &push);
+            api.vkCmdDrawIndirectCount(commands, gpuDraws.BucketBuffer(bucket),
+                (ulong)GpuSceneDraws.CommandOffset, gpuDraws.BucketBuffer(bucket), 0,
+                gpuDraws.MaxParts, 16);
+        }
+
+        api.vkCmdEndRendering(commands);
+
+        var toSampled = new VkImageMemoryBarrier2
+        {
+            srcStageMask = VkPipelineStageFlags2.LateFragmentTests,
+            srcAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
+            dstStageMask = VkPipelineStageFlags2.FragmentShader,
+            dstAccessMask = VkAccessFlags2.ShaderSampledRead,
+            oldLayout = VkImageLayout.DepthAttachmentOptimal,
+            newLayout = VkImageLayout.ShaderReadOnlyOptimal,
+            image = image.Handle,
+            subresourceRange = image.FullRange,
+            srcQueueFamilyIndex = uint.MaxValue,
+            dstQueueFamilyIndex = uint.MaxValue,
+        };
+        var toSampledInfo = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &toSampled };
+        api.vkCmdPipelineBarrier2(commands, &toSampledInfo);
+        shadowMap.Layout = VkImageLayout.ShaderReadOnlyOptimal;
     }
 
     // Records all opaque actors into the scene targets. Returns the number of draws recorded.
     public int Record(VkCommandBuffer commands, SceneTargets targets, CameraState camera,
         MyNewLoddingSettings lodding, SceneActors actors, ulong frameConstants, out int culled)
     {
+        var profile = Stopwatch.StartNew();
         var frustum = new Frustum(camera.CullingViewProjection);
         var loddingSettings = lodding.Global;
 
@@ -735,17 +1524,13 @@ internal sealed unsafe class ModelPass : IDisposable
             boundPipeline = pipelineNoCull;
         }
 
-        foreach (var actor in actors.All)
+        foreach (var actor in directActors)
         {
             if (!actor.Visible || (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) != 0)
                 continue;
 
             var model = models.Get(actor.Model);
             if (model == null)
-                continue;
-
-            // Simple actors were fully recorded in RecordPrepare.
-            if (preparedActors.Contains(actor.Id))
                 continue;
 
             var instances = (InstanceBuffer)null;
@@ -901,8 +1686,12 @@ internal sealed unsafe class ModelPass : IDisposable
     public int RecordTransparent(VkCommandBuffer commands, SceneTargets targets, ulong frameConstants)
     {
         if (transparentDraws.Count == 0)
+        {
+            LastTransparentMs = 0;
             return 0;
+        }
 
+        var profile = Stopwatch.StartNew();
         var api = context.Device.Api;
         var viewport = new VkViewport(0, 0, targets.Extent.width, targets.Extent.height, 0, 1);
         var scissor = new VkRect2D(0, 0, targets.Extent.width, targets.Extent.height);
@@ -977,6 +1766,7 @@ internal sealed unsafe class ModelPass : IDisposable
         }
 
         transparentDraws.Clear();
+        LastTransparentMs = profile.Elapsed.TotalMilliseconds;
         return draws;
     }
 
@@ -1004,6 +1794,25 @@ internal sealed unsafe class ModelPass : IDisposable
         }
 
         return lod;
+    }
+
+    private static Matrix BuildAbsoluteWorld(MatrixD worldD, float scale)
+    {
+        var world = (Matrix)worldD;
+        if (scale != 1f)
+        {
+            world.M11 *= scale;
+            world.M12 *= scale;
+            world.M13 *= scale;
+            world.M21 *= scale;
+            world.M22 *= scale;
+            world.M23 *= scale;
+            world.M31 *= scale;
+            world.M32 *= scale;
+            world.M33 *= scale;
+        }
+
+        return world;
     }
 
     private static Matrix BuildWorld(MatrixD worldD, float scale, Vector3D cameraPosition)
@@ -1125,8 +1934,20 @@ internal sealed unsafe class ModelPass : IDisposable
 
     public void Dispose()
     {
+        foreach (var buffer in partBuffers)
+            buffer?.Dispose();
+        foreach (var buffer in rangeBuffers)
+            buffer?.Dispose();
+        foreach (var buffer in lodStateBuffers)
+            buffer?.Dispose();
+
         var api = context.Device.Api;
         gpuDraws.Dispose();
+        shadowMap?.Dispose();
+        if (shadowPipeline != VkPipeline.Null)
+            context.Release(() => context.Device.Api.vkDestroyPipeline(shadowPipeline, null));
+        if (shadowPipelineNoCull != VkPipeline.Null)
+            context.Release(() => context.Device.Api.vkDestroyPipeline(shadowPipelineNoCull, null));
         var cullHandle = pipeline;
         var noCullHandle = pipelineNoCull;
         var transparentCull = pipelineTransparent;

@@ -66,6 +66,16 @@ internal sealed class SceneActor
     public uint[] SkeletonIndexUInts;   // model bone -> skeleton bone (GPU buffer source)
     public Matrix[] BoneTransforms;     // per skeleton bone, per frame
     public ulong SkinnedVertexAddress;  // this frame's compute output
+
+    // Cached absolute world matrix, invalidated by SceneActors.TransformRevision
+    public MatrixD CachedWorldMatrix;
+    public long WorldRevision = -1;
+
+    // Per-frame GPU actor record needs a refresh (world, visibility, instance range, local bounds)
+    public bool StateDirty;
+
+    // Cached parts/material records need a refresh (colour, emissive, flags, texture changes)
+    public bool MaterialDirty;
 }
 
 // Actors by render object ID. The game owns lifetime; messages mutate this on the render thread only.
@@ -88,12 +98,136 @@ internal sealed class SceneActors
     private readonly Dictionary<uint, SceneActor> actors = new();
     private readonly Dictionary<uint, PendingActor> pending = new();
     private readonly HashSet<uint> reportedMissingTransforms = new();
+    private readonly List<SceneActor> skinned = new();
+    private readonly List<SceneActor> dirtyActors = new();
+    private readonly List<SceneActor> materialDirtyActors = new();
+    private readonly List<SceneActor> visibilityUpdates = new();
+    private readonly List<SceneActor> createdActors = new();
+    private readonly List<uint> removedActorIds = new();
+    private readonly List<SceneActor> recreatedActors = new();
+    private readonly Dictionary<uint, List<uint>> children = new();
     private long revision;
+    private long fullRevision;
+    private long transformRevision;
+    private long revCreate, revRemove, revEntity, revProps, revTexture, revSkeleton, revInstance, revModel;
+
+    // Diagnostics: which messages trigger part-cache rebuilds.
+    public string RevisionCounters =>
+        $"create {revCreate}, remove {revRemove}, entity {revEntity}, props {revProps}, " +
+        $"texture {revTexture}, skeleton {revSkeleton}, instance {revInstance}, model {revModel}";
 
     public int Count => actors.Count;
 
     // Bumped on any change that affects persistent part/material data or the actor list.
     public long Revision => revision;
+
+    // Actors whose skeleton has arrived and which therefore take the skinned compute/direct path.
+    public IReadOnlyList<SceneActor> Skinned => skinned;
+    public IReadOnlyList<SceneActor> DirtyActors => dirtyActors;
+    public IReadOnlyList<SceneActor> MaterialDirtyActors => materialDirtyActors;
+    public IReadOnlyList<SceneActor> VisibilityUpdates => visibilityUpdates;
+
+    // Actors added since the last part-cache pass. ModelPass appends them incrementally.
+    public IReadOnlyList<SceneActor> CreatedActors => createdActors;
+    public void ClearCreatedActors() => createdActors.Clear();
+    public void ClearRemovedActors() => removedActorIds.Clear();
+    public void ClearRecreatedActors() => recreatedActors.Clear();
+
+    public IReadOnlyList<uint> RemovedActorIds => removedActorIds;
+    public IReadOnlyList<SceneActor> RecreatedActors => recreatedActors;
+
+    public void TrimRemovedActors(int count)
+    {
+        if (count > 0)
+            removedActorIds.RemoveRange(0, Math.Min(count, removedActorIds.Count));
+    }
+
+    public void TrimRecreatedActors(int count)
+    {
+        if (count > 0)
+            recreatedActors.RemoveRange(0, Math.Min(count, recreatedActors.Count));
+    }
+
+    public void TrimCreatedActors(int count)
+    {
+        if (count > 0)
+            createdActors.RemoveRange(0, Math.Min(count, createdActors.Count));
+    }
+
+    public void TrimMaterialDirty(int count)
+    {
+        if (count <= 0)
+            return;
+
+        count = Math.Min(count, materialDirtyActors.Count);
+        for (var i = 0; i < count; i++)
+            materialDirtyActors[i].MaterialDirty = false;
+        materialDirtyActors.RemoveRange(0, count);
+    }
+
+    public void TrimDirty(int count)
+    {
+        if (count <= 0)
+            return;
+
+        count = Math.Min(count, dirtyActors.Count);
+        for (var i = 0; i < count; i++)
+            dirtyActors[i].StateDirty = false;
+        dirtyActors.RemoveRange(0, count);
+    }
+
+    // Changes that require a full part-cache rebuild rather than an incremental append.
+    public long FullRevision => fullRevision;
+
+    private void MarkDirty(SceneActor actor)
+    {
+        if (actor.StateDirty)
+            return;
+
+        actor.StateDirty = true;
+        dirtyActors.Add(actor);
+    }
+
+    // A parent transform moves its whole subtree; cached world matrices are invalidated globally by
+    // transformRevision, but every descendant needs its GPU actor record refreshed.
+    private void MarkDirtyTree(SceneActor actor, int depth = 0)
+    {
+        if (depth > 8)
+            return;
+
+        MarkDirty(actor);
+        if (!children.TryGetValue(actor.Id, out var childIds))
+            return;
+
+        foreach (var childId in childIds)
+        {
+            if (actors.TryGetValue(childId, out var child))
+                MarkDirtyTree(child, depth + 1);
+        }
+    }
+
+    private void MarkMaterialDirty(SceneActor actor)
+    {
+        if (actor.MaterialDirty)
+            return;
+
+        actor.MaterialDirty = true;
+        materialDirtyActors.Add(actor);
+    }
+
+    public void ClearDirty()
+    {
+        foreach (var actor in dirtyActors)
+            actor.StateDirty = false;
+        dirtyActors.Clear();
+    }
+
+    public void ClearMaterialDirty()
+    {
+        foreach (var actor in materialDirtyActors)
+            actor.MaterialDirty = false;
+        materialDirtyActors.Clear();
+    }
 
     public int InstancedCount
     {
@@ -130,7 +264,11 @@ internal sealed class SceneActors
         ApplyPending(actor);
 
         actors[message.ID] = actor;
+        createdActors.Add(actor);
+        revCreate++;
         revision++;
+        transformRevision++;
+        MarkDirtyTree(actor);
     }
 
     public void CreateCharacter(MyRenderMessageCreateRenderCharacter message)
@@ -146,7 +284,11 @@ internal sealed class SceneActors
             ColorMaskHsv = message.ColorMaskHSV ?? Vector3.Zero,
         };
         ApplyPending(actors[message.ID]);
+        createdActors.Add(actors[message.ID]);
+        revCreate++;
         revision++;
+        transformRevision++;
+        MarkDirtyTree(actors[message.ID]);
     }
 
     public void CreateStaticGroup(MyRenderMessageCreateStaticGroup message)
@@ -162,7 +304,11 @@ internal sealed class SceneActors
             Visible = true,
         };
         ApplyPending(actors[message.ID]);
+        createdActors.Add(actors[message.ID]);
+        revCreate++;
         revision++;
+        transformRevision++;
+        MarkDirtyTree(actors[message.ID]);
     }
 
     public void CreateManualCullObject(MyRenderMessageCreateManualCullObject message)
@@ -174,6 +320,9 @@ internal sealed class SceneActors
             Visible = true,
         };
         ApplyPending(actors[message.ID]);
+        createdActors.Add(actors[message.ID]);
+        transformRevision++;
+        MarkDirtyTree(actors[message.ID]);
     }
 
     public void SetParentCullObject(MyRenderMessageSetParentCullObject message)
@@ -189,9 +338,20 @@ internal sealed class SceneActors
             return;
         }
 
+        if (child.ParentId != 0 && children.TryGetValue(child.ParentId, out var oldChildren))
+            oldChildren.Remove(child.Id);
         child.ParentId = message.CullObjectID;
+        if (child.ParentId != 0)
+        {
+            if (!children.TryGetValue(child.ParentId, out var list))
+                children[child.ParentId] = list = new List<uint>();
+            if (!list.Contains(child.Id))
+                list.Add(child.Id);
+        }
         if (message.ChildToParent.HasValue)
             child.LocalMatrix = message.ChildToParent.Value;
+        transformRevision++;
+        MarkDirtyTree(child);
     }
 
     public SceneActor Find(uint id) => actors.TryGetValue(id, out var actor) ? actor : null;
@@ -209,7 +369,16 @@ internal sealed class SceneActors
         if (state.ColorMul.HasValue)
             actor.ColorMul = state.ColorMul.Value;
         if (state.ParentId.HasValue)
+        {
             actor.ParentId = state.ParentId.Value;
+            if (actor.ParentId != 0)
+            {
+                if (!children.TryGetValue(actor.ParentId, out var list))
+                    children[actor.ParentId] = list = new List<uint>();
+                if (!list.Contains(actor.Id))
+                    list.Add(actor.Id);
+            }
+        }
         if (state.LocalMatrix.HasValue)
             actor.LocalMatrix = state.LocalMatrix.Value;
         if (state.WorldMatrix.HasValue)
@@ -239,14 +408,23 @@ internal sealed class SceneActors
 
     // Manual cull objects move; their children (characters, optionally grid cells) are drawn
     // relative to them. Depth-limited against malformed/cyclic hierarchies.
-    public MatrixD GetWorldMatrix(SceneActor actor) => GetWorldMatrix(actor, 0);
+    public MatrixD GetWorldMatrix(SceneActor actor)
+    {
+        if (actor.WorldRevision == transformRevision)
+            return actor.CachedWorldMatrix;
 
-    private MatrixD GetWorldMatrix(SceneActor actor, int depth)
+        var world = ResolveWorldMatrix(actor, 0);
+        actor.CachedWorldMatrix = world;
+        actor.WorldRevision = transformRevision;
+        return world;
+    }
+
+    private MatrixD ResolveWorldMatrix(SceneActor actor, int depth)
     {
         if (depth >= 4 || actor.ParentId == 0 || !actors.TryGetValue(actor.ParentId, out var parent))
             return actor.WorldMatrix;
 
-        return (MatrixD)actor.LocalMatrix * GetWorldMatrix(parent, depth + 1);
+        return (MatrixD)actor.LocalMatrix * ResolveWorldMatrix(parent, depth + 1);
     }
 
     public void Update(MyRenderMessageUpdateRenderObject message)
@@ -267,10 +445,26 @@ internal sealed class SceneActors
         // The relative transform (set by SetParentCullObject / a pending local update) is what
         // places subparts; world updates continue to drive the cull-object root and the character.
         if (message.Data.HasWorldMatrix)
+        {
             actor.WorldMatrix = message.Data.WorldMatrix;
+            transformRevision++;
+            MarkDirtyTree(actor);
+        }
+        if (message.Data.HasLocalMatrix)
+        {
+            actor.LocalMatrix = message.Data.LocalMatrix;
+            LocalMatrixUpdates++;
+            transformRevision++;
+            MarkDirtyTree(actor);
+        }
         if (message.Data.HasLocalAABB)
+        {
             actor.LocalAabb = message.Data.LocalAABB;
+            MarkDirty(actor);
+        }
     }
+
+    public long LocalMatrixUpdates { get; private set; }
 
     public void SetVisible(uint id, bool visible, bool near)
     {
@@ -279,6 +473,8 @@ internal sealed class SceneActors
         {
             actor.Visible = visible;
             actor.Near = near;
+            MarkDirty(actor);
+            MarkMaterialDirty(actor);
         }
     }
 
@@ -297,9 +493,13 @@ internal sealed class SceneActors
 
         if (message.ColorMaskHSV.HasValue)
             actor.ColorMaskHsv = message.ColorMaskHSV.Value;
+        MarkDirty(actor);
         if (message.DiffuseColor.HasValue)
+        {
             actor.ColorMul = message.DiffuseColor.Value.ToVector3();
-        revision++;
+            MarkMaterialDirty(actor);
+            revEntity++;
+        }
     }
 
     public void SetModelProperties(MyRenderMessageUpdateModelProperties message)
@@ -317,7 +517,9 @@ internal sealed class SceneActors
                 actor.ColorMul = message.DiffuseColor.Value.ToVector3();
             if (message.Emissivity.HasValue)
                 actor.Emissivity = message.Emissivity.Value;
-            revision++;
+            MarkDirty(actor);
+            MarkMaterialDirty(actor);
+            revProps++;
             return;
         }
 
@@ -332,7 +534,8 @@ internal sealed class SceneActors
             material.ColorMul = message.DiffuseColor.Value.ToVector3();
         if (message.Emissivity.HasValue)
             material.Emissivity = message.Emissivity.Value;
-        revision++;
+        MarkMaterialDirty(actor);
+        revProps++;
     }
 
     public void SetColorEmissivity(MyRenderMessageUpdateColorEmissivity message)
@@ -348,14 +551,26 @@ internal sealed class SceneActors
 
         material.ColorMul = message.DiffuseColor.ToVector3();
         material.Emissivity = message.Emissivity;
-        revision++;
+        MarkMaterialDirty(actor);
+        revProps++;
     }
 
     public void SetVisibilityUpdates(uint id, bool state)
     {
         var actor = Find(id);
-        if (actor != null)
-            actor.VisibilityUpdates = state;
+        if (actor == null)
+            return;
+
+        actor.VisibilityUpdates = state;
+        if (state)
+        {
+            if (!visibilityUpdates.Contains(actor))
+                visibilityUpdates.Add(actor);
+        }
+        else
+        {
+            visibilityUpdates.Remove(actor);
+        }
     }
 
     public void SetCharacterSkeleton(MyRenderMessageSetCharacterSkeleton message)
@@ -383,9 +598,15 @@ internal sealed class SceneActors
 
         RenderLog.Info($"Character skeleton {message.CharacterID}: {actor.SkeletonBones.Length} bones, " +
                        $"{actor.SkeletonIndices.Length} skin indices");
+        if (!skinned.Contains(actor))
+            skinned.Add(actor);
+
         // The GPU part cache must drop this actor once it has a skeleton and move it to the
         // direct skinned path.
+        revSkeleton++;
         revision++;
+        if (!recreatedActors.Contains(actor))
+            recreatedActors.Add(actor);
     }
 
     public void SetCharacterTransforms(MyRenderMessageSetCharacterTransforms message)
@@ -424,11 +645,21 @@ internal sealed class SceneActors
             return;
         }
 
+        var hadInstances = actor.HasInstances;
         actor.InstanceBufferId = message.InstanceBufferId;
         actor.InstanceStart = message.InstanceStart;
         actor.InstanceCount = message.InstanceCount;
         actor.LocalAabb = message.LocalAabb;
-        revision++;
+
+        MarkDirty(actor);
+
+        // Range changes do not alter the persistent part data; only gaining/losing instances
+        // changes the material's Instanced flag. Avoid rebuilding the whole cache per grid update.
+        if (hadInstances != actor.HasInstances)
+        {
+            MarkMaterialDirty(actor);
+            revInstance++;
+        }
     }
 
     // ChangeMaterialTexture: merge per-material texture replacements; Changes == null clears them
@@ -447,26 +678,32 @@ internal sealed class SceneActors
             state.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
             foreach (var pair in message.Changes)
                 state.TextureChanges[pair.Key.String] = pair.Value;
-            revision++;
+            revTexture++;
             return;
         }
 
         if (message.Changes == null)
         {
             actor.TextureChanges = null;
-            revision++;
+            MarkMaterialDirty(actor);
+            revTexture++;
             return;
         }
 
         var changes = actor.TextureChanges ??= new Dictionary<string, MyTextureChange>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in message.Changes)
             changes[pair.Key.String] = pair.Value;
-        revision++;
+        MarkMaterialDirty(actor);
+        revTexture++;
     }
 
     public static RenderFlags GetMaterialFlags(SceneActor actor, string materialName)
     {
-        var flags = actor.Flags;
+        // Runtime visibility (UpdateRenderObjectVisibility) is authoritative over the create flags.
+        var flags = actor.Visible
+            ? actor.Flags | RenderFlags.Visible
+            : actor.Flags & ~RenderFlags.Visible;
+
         if (!string.IsNullOrEmpty(materialName) && actor.MaterialOverrides != null &&
             actor.MaterialOverrides.TryGetValue(materialName, out var material) && material.FlagsChange.HasValue)
         {
@@ -491,26 +728,54 @@ internal sealed class SceneActors
 
         actor.Model = message.Model;
         actor.Scale = message.Scale != 0f ? message.Scale : 1f;
+        revModel++;
         revision++;
+        if (!recreatedActors.Contains(actor))
+            recreatedActors.Add(actor);
     }
 
     public void Remove(uint id)
     {
         pending.Remove(id);
-        if (!actors.Remove(id))
+        if (!actors.Remove(id, out var removed))
             return;
+        skinned.Remove(removed);
+        visibilityUpdates.Remove(removed);
+        dirtyActors.Remove(removed);
+        materialDirtyActors.Remove(removed);
+        if (removed.ParentId != 0 && children.TryGetValue(removed.ParentId, out var oldChildren))
+            oldChildren.Remove(id);
+        children.Remove(id);
+
         foreach (var actor in actors.Values)
         {
-            if (actor.ParentId == id)
-                actor.ParentId = 0;
+            if (actor.ParentId != id)
+                continue;
+            actor.ParentId = 0;
+            MarkDirty(actor);
         }
+        revRemove++;
         revision++;
+        removedActorIds.Add(id);
+        recreatedActors.Remove(removed);
+        transformRevision++;
     }
 
     public void Clear()
     {
         actors.Clear();
         pending.Clear();
+        skinned.Clear();
+        dirtyActors.Clear();
+        materialDirtyActors.Clear();
+        visibilityUpdates.Clear();
+        createdActors.Clear();
+        removedActorIds.Clear();
+        recreatedActors.Clear();
+        children.Clear();
+        revRemove++;
         revision++;
+        fullRevision++;
+        transformRevision++;
     }
 }

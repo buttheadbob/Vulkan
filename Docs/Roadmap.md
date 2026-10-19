@@ -74,6 +74,20 @@ memory with usage percent, GPU text counts and actual frame-generation time. `Co
 `Unlimited`, `Fps30`, `Fps60`, `Fps120` and `Fps240`; the observed 120 fps is VSync/FIFO at the monitor refresh,
 so higher/unlimited needs VSync off. Build and shader check are clean.
 
+**Async asset uploads are in (2026-10-19).** GPU copies now run on a **dedicated transfer queue**
+(RADV exposes family 1; the RX 7900 XTX uses it) with a timeline semaphore: the graphics submission
+waits on the batch value, so the copy engine overlaps the previous frame and the CPU never blocks on
+a transfer. Resources are created with concurrent sharing when the transfer family differs. Model GPU
+building (vertex/skinned/index packing, buffer allocation and worker-side staging) runs on up to three
+worker threads; the render thread only publishes the result and records the copies. Texture uploads
+are time-budgeted (4 ms/frame), model publishing/startup 2 ms, instance buffers coalesce to one upload
+per buffer per frame, and the persistent part cache waits for a quiet frame (rebuilds at most every
+0.75 s, forced after 1.5 s of continuous changes). Per-texture `ChangeMaterialTexture` logging was
+removed (it wrote hundreds of thousands of lines during a large paste). Verified in the user's world:
+9,728 actors / 130,779 GPU parts / 72,032 instances render correctly with the large grid loaded,
+no log errors, and the 60 s frame max dropped to ~50 ms (was a multi-second UI freeze). The remaining
+~50-123 ms cost is the full part-cache rebuild; incremental append is the next optimization.
+
 **Block paints and skins are verified (2026-10-18).** Space Engineers stores a block's paint as a
 `ColorMaskHSV` **delta**, not a final colour; stock `ColorizeGray` adds
 `TextureDebugMultipliers.ColorizeHSV = (0, 0.8, -0.1)` before converting HSV back to RGB. Our shader
@@ -98,6 +112,18 @@ respawn pod + green battery); the in-game red battery is intentional and correct
 that reference: our unlit faces are much darker (no dynamic scene probe yet) and the provisional
 `ExposureScale=0.5` / `Specular=1` / `Reflection=1` defaults still read brighter and harsher than stock.
 
+**Two-sided per-block lighting fixed (2026-10-19).** The hangar door was fully direct-lit from the
+shadow side because the MWM normal belongs to the authored front face, while no-back-face-cull actors also
+draw the visible back face with that same normal. `Model.slang` now aligns the normal with the view vector
+after the normal map (`if (dot(n, toCamera) < 0) n = -n`) before evaluating sun/ambient lobes. This is
+per-visible-surface two-sided lighting, not a shadow pass: correctly authored front faces are unchanged.
+`FrontFace=Clockwise` is retained; a CCW experiment swapped every door face and was reverted. An IBL
+diffuse-ambient experiment washed the whole grid out and was reverted; the stock `AmbientForwardPass` /
+`AmbientMinClamp` floor (0.02) remains. Verified with the debug dark/sun-side cameras: direct-only hangar
+door is black from the dark side and bright red from the sun side; player capture shows the expected lit
+rims and dark visible faces. Frame ~2.9 ms CPU / 4.7 ms GPU during capture; build and shader check clean.
+Temporary lighting diagnostics and the flip env flags were removed. No shadow work and no git operations.
+
 **Immediate next steps:**
 1. Calibrate exposure/specular/reflection against the stock reference with a lit camera (ideally on the
    respawn pod front), then set the defaults.
@@ -107,9 +133,10 @@ that reference: our unlit faces are much darker (no dynamic scene probe yet) and
 **Next tasks, in order:**
 1. **Lighting calibration** (above) against the stock reference, then the dynamic probe.
 2. **Finish the GPU-driven scene path**: persistent opaque parts, GPU LOD selection (stock hysteresis) and
-   static-group buckets are in. Remaining: upload actor state only when it changes (cache the camera-relative world
-   per actor instead of rebuilding every visible actor record), move skinned actors and transparent parts into GPU
-   buckets, and keep the direct path only for unsupported techniques. Goal: no per-frame actor/part walk.
+   static-group buckets are in. Remaining: make the part cache incremental (append new actors/ranges in place and
+   grow the host-visible buffers instead of rebuilding all 130k parts; the rebuild is now the largest load hitch at
+   ~50-123 ms), upload actor state only when it changes, move skinned actors and transparent parts into GPU buckets,
+   and keep the direct path only for unsupported techniques. Goal: no per-frame actor/part walk.
 3. **Dynamic environment probe** (scene cubemap capture + prefilter, close/far blend) to soften the hard sunlight
    terminator and light interiors; then shadows.
 4. **G-buffer + motion vectors** (frame constants already carry the camera; add previous-frame matrices and the
@@ -200,9 +227,11 @@ Pulsar client plugin, that:
 | Opaque lighting | Direct sun uses a GGX specular + Lambert diffuse model with stock `SurfaceAlbedo = baseColor * (1 - metalness)` and `SurfaceF0 = lerp(0.04, baseColor, metalness)`; ambient is the game's probe floor times the same albedo; IBL uses the prefiltered skybox + split-sum BRDF. Stock's Forward pass is Lambert-only, but the reference screenshot comes from the deferred PBR path, so specular/reflection are enabled by default (`SpecularScale=1`, `ReflectionScale=1`). Exposure default is provisionally `0.5`; the current captures are too bright versus the stock reference and still need calibration. |
 | Static decals | `DECAL_CUTOUT` parts (cockpit/battery `Paneling*`, `Decals`, etc.) render as alpha-masked opaque geometry through the same `Model.slang` pipeline: `clip(alphamask - 0.5)`, `MaterialFlags.AlphaMasked | Decal`, and the stock `+0.0001` clip-space depth nudge. They use the derivative normal path and are part of the persistent GPU-driven part cache. Blended (`DECAL`) and projected screen-space decals (`Decals.hlsl`) are still not implemented. |
 | User settings | All lighting/exposure/bloom sliders live in a persistent one-element `GpuRenderSettings` storage buffer (set 0 binding 3) once per device, not in per-frame constants. `Config.PropertyChanged` only sets a dirty flag; the render thread uploads the 48-byte block when it changes. Shaders read `renderSettings[0]` (sun/ambient/specular/metalness, emissive/lights/reflection/screen, exposure/bloom). Slider tuning has no per-frame CPU reads or transfers; the frame limit and diagnostics visibility are polled per frame. Defaults: Exposure 0.5, Specular 1, Reflections 1, Sun/Ambient/Metalness/Emissive/Lights 1, Screen 4, Bloom 0.2 (provisional until calibrated against the stock screenshot). |
+| Uploads | Dedicated transfer queue + timeline semaphore when the device exposes a transfer family different from graphics (RADV: family 1); resources use concurrent sharing so copies need no ownership transfer. The graphics submission waits on the batch timeline value (`FrameLoop.EndFrame`), so the copy engine overlaps the previous frame and the CPU never spins. No separate queue: copies fall back into the graphics command buffer. Model GPU building and staging run on workers (max 3); textures are finished on the render thread under a 4 ms/frame budget. |
 | GPU buffers | No UBOs by design: per-frame/per-draw constants go through push constants plus host-visible transient buffers read via buffer device addresses (the modern SSBO style). Persistent device-local buffers hold model vertices/indices, instance data, textures and the skinned streams; a small host-visible `GpuRenderSettings` storage buffer (set 0 binding 3) holds user tuning and is written only on changes. Compute writes/reads (skinning, palette, culling) use the same BDA path. Indirect buffers are host-visible storage buffers with `Indirect` usage. Storage images/RW buffers and acceleration structures are still reserved for OIT, GI/RT. |
 | Bloom | First version: half-resolution HDR bright pass (threshold 1.0, soft knee), separable 9-tap Gaussian blur, added in `Composite.slang` with a user `BloomScale` (default 0.2). Stock's multi-scale prefilter/cascaded blur and exposure-aware strength are not matched yet. |
 | GPU-driven opaque draws | Opaque, non-skinned actors (including instanced cubes and **static groups**) use a **persistent** `GpuScenePart` buffer (material + vertex/index BDAs + index range, built on actor/model/material changes), persistent per-LOD ranges, and a persistent per-actor LOD-state buffer. Per frame the CPU uploads only actor world/colour/bounds/instance state; `Scene/Culling.slang` runs one thread per actor, selects the LOD with the stock distance formula + 10% hysteresis, sphere-tests 5 normalized planes + `MaxViewDistance`, then appends one command + 184-byte draw data per part to a cull/no-cull bucket: `[counter u32][commands @64, 16 B]` followed by draw data. Static groups are expanded into one actor record per local matrix sharing the same ranges. The indirect command is **non-indexed** (`vertexCount=indexCount`); the vertex shader fetches the model index from the draw data's index buffer BDA and then the vertex. `SV_DrawIndex` selects the draw data; the fragment gets the same material through a flat draw-index varying. `push.drawData == 0` selects the direct push path, so one `Model.slang`/pipeline serves both. |
+| Per-actor GPU state | Opaque actor state is cached as **absolute** `GpuSceneActor` records (transposed world, bounding sphere, origin, LOD distances, instance address/range, flags/visible) built once per part-cache rebuild and updated only for dirty actors. `SceneActors` tracks dirty actors (world/visibility/instance range/local AABB), marks a parent's subtree on transforms, caches resolved world matrices per `transformRevision`, and keeps small `Skinned`/`VisibilityUpdates` lists. Per frame the render thread copies the record array to transient GPU memory (camera movement costs nothing) and `Scene/Culling.slang` subtracts the camera position for distance/frustum/draw data. This removed the previous per-frame loop over all ~9.6k actors (prepare 5.4 ms -> 0.2-1.0 ms; frame ~8.9 ms -> ~1.8-2.9 ms). |
 | Asset preload | `PreloadTextures`/`PreloadModel(s)`/`PreloadMaterials` start background decodes/parses immediately (mapping TextureType to the sampling kind), so GPU buffers/images are created during the loading screen rather than on first draw. Model texture dependencies also start when each model is parsed. `UnloadTextures` frees matching entries/slots (in-flight decodes are discarded) and `DeprioritizeTextures` is a no-op (no streaming priorities). `AddRuntimeModel` builds a one-LOD GPU mesh from `MyModelData`, resolves section material names through the model-material table, and registers the name (plus a `ReplacedModel` alias). |
 | Exposure / emissive | `UpdatePostprocessSettings` is cached. `Post/Exposure.slang` samples the HDR scene on a sparse grid, averages log-luminance, applies the shipped `CalculateExposure` (`LuminanceKeyValueCendos`) and writes a 1x1 R32F exposure texture; the composite samples it and applies Hable with the world's `WhitePoint`. The 0.025 calibration was removed (it made the world ~40x too dark); a user `ExposureScale` multiplier is applied and clamped to [0.02, 4]. Current default is 0.5, which is still too bright on the cockpit capture. Emissive radiance is `albedo * extras.y * Emissivity * BloomEmissiveness` (albedo already includes `1-metalness`); the test world uses `BloomEmissiveness=120`, which is what makes battery LEDs read in shadow. Full histogram eye adaptation, temporal smoothing and stock multi-scale bloom are still missing. |
 | LCD budget | Linux's platform renderer reports no generated-texture memory budget. `LcdMemoryBudgetPatch` sets `MySessionComponentPanels.m_memoryBudget` to 1 GiB after init; otherwise the panel manager's visible counter never reaches its threshold, `IsInRange` stays false, and every powered LCD keeps the default "Online" texture. |
@@ -237,7 +266,8 @@ Pulsar client plugin, that:
 | `Render/Vulkan/GpuContext.cs` | Device + memory + bindless + uploads + **deferred destruction per frame slot** (`Release`). |
 | `Render/Vulkan/GpuMemory.cs` | Block sub-allocator (64 MB blocks, dedicated ≥ 32 MB, buffers and images in separate blocks, host-visible blocks persistently mapped, every block has DEVICE_ADDRESS flag) and device-local allocated/total tracking for diagnostics. |
 | `Render/Vulkan/GpuBuffer.cs`, `GpuImage.cs` | Resources; `Dispose` defers destruction through `GpuContext.Release`. |
-| `Render/Vulkan/UploadQueue.cs` | Per-frame 32 MB staging rings; copies recorded at the start of the frame's command buffer; images end in ShaderReadOnlyOptimal. Render thread only. |
+| `Render/Vulkan/UploadQueue.cs` | Per-frame 32 MB staging rings for same-frame uploads (generated textures); copies recorded at the start of the graphics command buffer. Render thread only. |
+| `Render/Vulkan/TransferSystem.cs` | Asynchronous asset uploads: dedicated transfer queue + timeline semaphore, worker-side staging (`PrepareBufferUpload`), copy/barrier recording and one submit per frame; falls back to recording into the graphics command buffer when there is no separate queue. |
 | `Render/Vulkan/BindlessDescriptors.cs` | Set 0 (binding 0: up to 65536 sampled images, binding 1: 4 immutable samplers, binding 2: 16 cubemaps with a black default, binding 3: persistent `GpuRenderSettings` storage buffer), the shared pipeline layout (128 B push constants, all stages), fixed texture slots White/Black/Missing/Transparent. |
 | `Render/Vulkan/MipGenerator.cs` | Blit-chain mip generation (uploads with `generateMips`, offscreen targets). |
 | `Render/Vulkan/GraphicsPipelineBuilder.cs` | Init-property description → graphics pipeline (dynamic rendering, shared bindless layout, dynamic viewport/scissor, no vertex input, reverse-Z depth compare by default). Use it for every new pipeline. |
@@ -246,14 +276,14 @@ Pulsar client plugin, that:
 | `Render/Scene/SkyboxPass.cs` | Depth-less fullscreen background sampling the environment cubemap along the view ray. |
 | `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, ambient, IBL slots/params, paint conversion `ColorizeHsv`), LOD coefficient. |
 | `Render/Scene/GpuRenderSettings.cs` | Persistent one-element setting block: sun/ambient/specular/metalness, emissive/lights/reflection/screen, exposure/bloom. Uploaded only when `Config` changes. |
-| `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy, instance ranges/bounds, max view distance, per-actor LOD; `Revision` drives persistent part-cache rebuilds and pending pre-create colour/skin state. |
+| `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy (parent->children map), instance ranges/bounds, max view distance, per-actor LOD; `Revision` drives persistent part-cache rebuilds, `DirtyActors` drives per-actor GPU state refresh, cached world matrices use `transformRevision`, and `Skinned`/`VisibilityUpdates` avoid full scans. Pending pre-create colour/skin state is applied at creation. |
 | `Render/Scene/Frustum.cs` | Five-plane infinite-far-plane culling from the stock view-projection. |
-| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: persistent part cache + GPU LOD/culling for opaque non-skinned actors (incl. static groups/cubes), direct path for skinned/transparent, cull-back/no-cull pipelines, bindless materials, IBL + sun shading; GPU skinning compute pre-pass; visible-object reporting (`VisibleObjectsWrite`). |
+| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: persistent part cache + GPU LOD/culling for opaque non-skinned actors (incl. static groups/cubes), direct path for skinned/transparent, cull-back/no-cull pipelines, bindless materials, IBL + sun shading; GPU skinning compute pre-pass; visible-object reporting (`VisibleObjectsWrite`). Per-actor GPU records are built once per cache rebuild, refreshed only for dirty actors/instance-buffer changes, and copied to transient memory per frame; the culling shader subtracts the camera. The full part-cache rebuild waits for a quiet frame (max once per 0.75 s, forced after 1.5 s). |
 | `Render/Scene/GpuSceneDraws.cs` | Wire-format structs for persistent parts/LOD ranges/actor state, the cull compute dispatch, and the two indirect cull/no-cull buckets. |
 | `Render/Scene/BloomPass.cs` | Half-resolution HDR bloom: bright-pass, separable blur targets, resize/slot lifetime. |
-| `Render/Scene/InstanceBuffers.cs` | GPU instance buffers for cube/generic ranges (replaced per update for frames-in-flight safety). |
+| `Render/Scene/InstanceBuffers.cs` | GPU instance buffers for cube/generic ranges. Updates are coalesced: the newest message per buffer is kept (`AddRef`) and uploaded once per frame through `TransferSystem`, replacing the old buffer for frames-in-flight safety. |
 | `Render/Models/MwmLoader.cs`, `MwmMeshData.cs` | Background MWM parsing through `MyModelImporter`, all LODs, stock vertex decodes, texture path resolution. |
-| `Render/Models/ModelCache.cs` | Model path → parsed LOD data → device-local GPU buffers, parts and texture entries; LOD selection helper; `Version` bumps when a model becomes GPU-ready so `ModelPass` rebuilds its part cache. |
+| `Render/Models/ModelCache.cs` | Model path → parsed LOD data → device-local GPU buffers, parts and texture entries. Parsing and GPU building/staging run on workers (max 3); the render thread publishes prepared models and submits their transfer uploads. `Version` bumps on publish so `ModelPass` rebuilds its part cache. |
 | `Render/Scene/CompositePass.cs` | Fullscreen triangle: HDR scene + OIT resolve → ACES/Hable backbuffer using the exposure texture. |
 | `Render/Vulkan/ShaderModule.cs`, `VkNames.cs`, `DeviceCapabilities.cs` | Helpers. |
 | `Render/Textures/DdsLoader.cs`, `TextureData.cs` | DDS → upload layout (DX10, FourCC, masks, palette; conversions to RGBA8 where Vulkan has no format). |
@@ -1082,3 +1112,58 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   this work time. Verified at `Fps30`: `30.0 fps  frame 0.69 ms`, graph mostly green, while the old metric
   reported the expected `33.33 ms` interval and mis-colored it red. The loading hitches still appear as red
   60 s-max spikes until they age out. Build clean.
+- **2026-10-19** — Async asset uploads and load-stall fixes. The UI freeze during large grid loads was a render-thread
+  stall (the game kept simulating). Added `VulkanDevice` selection of a dedicated transfer queue family (RADV family 1;
+  falls back to the graphics queue), `TransferSystem` with a timeline semaphore, per-frame staging rings, one submit per
+  frame and `FrameLoop.EndFrame` waiting on the batch value; resources use concurrent sharing when the families differ.
+  Model GPU building (vertex/skinned/index packing, buffer creation, worker staging) moved to up to three worker threads;
+  the render thread publishes results and submits their copies. `TextureCache.ProcessDecoded` is budgeted at 4 ms/frame.
+  `InstanceBuffers` now coalesces updates (`AddRef` + newest message) and uploads once per buffer per frame, and
+  `SetInstanceBuffer` only bumps the cache revision when the `HasInstances` state changes. `ModelPass.EnsureCache` waits
+  for model uploads to settle and enforces a 0.75 s minimum interval (1.5 s max deferral), removing the rebuild storm.
+  Removed the per-`ChangeMaterialTexture` logging that wrote hundreds of thousands of lines on a large paste.
+  Verified with the user's world via `VULKAN_AUTOLOAD`: 9,728 actors / 130,779 GPU parts / 72,032 instances render
+  correctly; dedicated transfer queue logged, no errors, 60 s frame max ~50 ms (load rebuilds are now 4 instead of a
+  storm). Build and `ShaderCompiler --check` clean. Remaining hiccup: the full part-cache rebuild (~50-123 ms); next is
+  incremental append/grow. No git operations performed.
+- **2026-10-19** — Culling-diagnostics clarification. The overlay's `Drawn ... culled ...` line reports only the **CPU
+  direct path** (`lastCulledActors`), which is 0 when nearly everything goes through the GPU-driven buckets; it did not
+  mean culling was broken. Added `GpuVisible` to the stats and relabelled the overlay (`Direct draws ...` / `GPU culled
+  ... visible ...`), and the scene log now prints `gpu culled/visible` next to the direct-path counts. Verified with the
+  debug camera: 192 actors GPU-culled, 6 visible; in the large-grid scene 5,601 of ~9,700 were GPU-culled. Temporary
+  shader debug writes were removed and the bytecode regenerated. Build and shader check clean. No git operations.
+- **2026-10-19** — CPU frame-time cut by moving per-actor state to a cached/GPU-friendly path. Profiling showed `prepare`
+  at ~5.4 ms and two full `RecordSkinning` scans at ~0.8 ms for a 9.1k-actor grid (frame ~8.9 ms). Added persistent
+  absolute `GpuSceneActor` records built once per cache rebuild; `SceneActors` now tracks dirty actors (world/local AABB,
+  visibility, instance range), marks a parent's whole subtree via a children map, caches resolved world matrices by
+  `transformRevision`, and keeps small `Skinned`/`VisibilityUpdates` lists. `GpuSceneDraws`/`Culling.slang` receive the
+  camera position and subtract it for distance/frustum/draw data, so camera movement no longer rebuilds anything. The
+  per-frame path now only refreshes dirty records, processes transparent parts, and copies the ~1.8 MB actor array;
+  `RecordSkinning` and the direct path iterate small lists instead of all actors. Removed the misleading stale LOD
+  histogram from the scene log. Measured in the same large scene: frame ~1.8 ms (overlay), prepare 0.2-1.0 ms, skin
+  ~0.01 ms, GPU culling 3.2k culled / 5.8k visible; visuals verified by capture. Build and shaders clean. Next, if moving
+  grids still mark many actors dirty, move local/parent transform composition into the culling shader and refresh only
+  instance-buffer users. No git operations performed.
+- **2026-10-19** — Incremental cache and texture-readiness fix (regression after the per-actor state change). `ChangeModel` no
+  longer triggered any cache update, so submodels (turret guns, doors, hangar doors) disappeared; removals also left stale
+  records. Added `CreatedActors`/`RemovedActorIds`/`RecreatedActors`: new actors append their parts/ranges/state, removals mark
+  cached records dead (O(1)), and model/skeleton changes re-append the actor. Material properties (colour/emissive/flags/
+  texture changes) now refresh only the affected actor's part records; part/range/LOD-state data lives in per-frame-slot
+  buffers and only the current slot is written. Work is budgeted (create 4 ms, recreate 3 ms, material 2 ms, state 2 ms).
+  The missing skins/textures were caused by part records storing bindless slot indices built before async textures finished:
+  with no more full rebuilds they kept the placeholder. `TextureCache.ReadyGeneration` now triggers a budgeted all-material
+  refresh whenever new textures become ready (single pass at a time; new arrivals start another pass after it completes).
+  Verified in the user's world: skins, decals, doors/turrets and other submodels render; frame ~1.5-2.2 ms with prepare
+  0.15-2.2 ms, and no recurring post-load hitches (the 60 s window only contains the load spike until it ages out). Build and
+  shaders clean. Follow-up: compact dead cached part records, and budget/throttle message bursts during loads. No git.
+- **2026-10-19** — Two-sided per-block lighting fix. Diagnosed the hangar-door symptom with per-actor normals,
+  camera/sun dot products and direct/emissive/albedo debug views: the door has no emissive contribution and its
+  direct term was strong because the visible back face used the authored front normal. A CCW front-face experiment
+  made the door dark but inverted every other door face and was reverted to the D3D-matching `Clockwise`. The shader
+  now flips only normals facing away from the camera after normal mapping, so the visible side of open panels gets
+  the sun/ambient from the side the player sees; correctly authored geometry is unchanged. An IBL diffuse ambient
+  attempt was tested and reverted (washed the scene white); the 0.02 forward ambient floor stays. Verified by
+  `/tmp/vk_fixed_dark_direct.png` (direct-only shadow-side door black), `/tmp/vk_fixed_sun_side.png` (sun-side door
+  red and lit) and `/tmp/vk_lighting_final.png` (player view, ~2.9 ms CPU / 4.7 ms GPU). Removed the temporary
+  `DominantNormal`/`LightingDiagnostics` instrumentation and `VULKAN_FLIP_MODEL_NORMALS`/`VULKAN_FLIP_SUN` flags.
+  Build and `ShaderCompiler --check` clean. No shadow work, no git operations.

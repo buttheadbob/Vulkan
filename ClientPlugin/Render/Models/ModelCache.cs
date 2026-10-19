@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using ClientPlugin.Render.Textures;
 using ClientPlugin.Render.Vulkan;
@@ -140,6 +142,7 @@ internal sealed class ModelCache : IDisposable
     {
         Loading,
         DataReady,
+        Building,
         Ready,
         Failed,
     }
@@ -158,13 +161,27 @@ internal sealed class ModelCache : IDisposable
         public GpuModel Gpu;
     }
 
+    private sealed class PreparedModel
+    {
+        public Entry Entry;
+        public GpuModel Gpu;
+        public List<TransferSystem.PendingBufferUpload> Uploads;
+    }
+
     private readonly GpuContext context;
     private readonly TextureCache textures;
     private readonly Dictionary<string, Entry> entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, GpuModel> aliases = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, MwmPartData> materialParts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, MwmPartData> materialParts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<Entry> decoded = new();
+    private readonly ConcurrentQueue<PreparedModel> prepared = new();
+    private int activeBuilds;
     private int version;
+
+    // Creating GPU buffers and packing vertex streams is CPU work that can take over 100 ms for a
+    // large model. Build on workers; the render thread only publishes the result and submits the
+    // staged copies.
+    private const int MaxConcurrentBuilds = 3;
 
     // Incremented whenever a model becomes GPU-ready; ModelPass rebuilds its persistent parts then.
     public int Version => version;
@@ -202,13 +219,62 @@ internal sealed class ModelCache : IDisposable
     // Render thread. Starts loading a model that will likely be drawn soon (CreateRenderEntity and friends).
     public void StartLoading(string model) => Get(model);
 
-    // Render thread, once per frame before recording: creates GPU buffers for models decoded since the last frame
+    // Render thread, once per frame before recording. Publishes worker-built models and starts
+    // new builds; the expensive buffer creation/staging happens off the render thread.
+    public bool HasPendingUploads => !decoded.IsEmpty || !prepared.IsEmpty || Volatile.Read(ref activeBuilds) > 0;
+
     public void ProcessReady()
     {
-        while (decoded.TryDequeue(out var entry))
+        var watch = Stopwatch.StartNew();
+        var count = 0;
+
+        while (prepared.TryDequeue(out var model))
         {
-            if (entry.State == LoadState.DataReady)
-                CreateGpu(entry);
+            Publish(model);
+            count++;
+        }
+
+        while (Volatile.Read(ref activeBuilds) < MaxConcurrentBuilds && decoded.TryDequeue(out var entry))
+        {
+            if (entry.State != LoadState.DataReady)
+                continue;
+
+            entry.State = LoadState.Building;
+            Interlocked.Increment(ref activeBuilds);
+            Task.Run(() => BuildGpu(entry));
+            count++;
+        }
+
+        if (count > 0 && watch.Elapsed.TotalMilliseconds > 20)
+            RenderLog.Warning($"Model publishing/startup took {watch.Elapsed.TotalMilliseconds:F1} ms for {count} models");
+    }
+
+    private void Publish(PreparedModel model)
+    {
+        context.Transfer.AddPrepared(model.Uploads);
+        model.Entry.Gpu = model.Gpu;
+        model.Entry.State = LoadState.Ready;
+        version++;
+
+        var gpu = model.Gpu;
+        var distances = gpu.LodDistances.Length > 0 ? ", switch at " + string.Join(", ", gpu.LodDistances) : "";
+        var transparent = new List<string>();
+        foreach (var part in gpu.Lods[0].Parts)
+        {
+            if (part.Transparent != null)
+                transparent.Add(part.MaterialName + " -> " + part.Transparent.Id.String);
+        }
+
+        var skinned = gpu.Lods[0].Skinned ? $", skinned {gpu.Lods[0].VertexStride} B/vertex" : "";
+        RenderLog.Info($"Model loaded: {gpu.Name} ({gpu.LodCount} LODs, LOD0 {gpu.Lods[0].Parts.Length} parts{distances}{skinned})" +
+                       (transparent.Count > 0 ? "; transparent: " + string.Join(", ", transparent) : ""));
+        if (gpu.Name.Contains("Cockpit", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var part in gpu.Lods[0].Parts)
+            {
+                RenderLog.Info($"Cockpit part '{part.MaterialName}' ({part.IndexCount} idx, {part.Technique}): " +
+                               $"cm '{part.ColorMetal?.Path}', ng '{part.NormalGloss?.Path}', ext '{part.Extensions?.Path}'");
+            }
         }
     }
 
@@ -244,62 +310,75 @@ internal sealed class ModelCache : IDisposable
         }
     }
 
-    private void CreateGpu(Entry entry)
+    // Worker thread. Builds GPU buffers and stages their data; the render thread submits the copies.
+    private void BuildGpu(Entry entry)
     {
-        var data = entry.Data;
-        entry.Data = null;
-
-        var lods = new List<GpuLod>(data.Lods.Count);
-        var bounds = BoundingBox.CreateInvalid();
-        foreach (var lodData in data.Lods)
+        var uploads = new List<TransferSystem.PendingBufferUpload>();
+        try
         {
-            var lod = CreateLod(entry.Model, lodData);
-            if (lod == null)
+            var data = entry.Data;
+            entry.Data = null;
+
+            var lods = new List<GpuLod>(data.Lods.Count);
+            var bounds = BoundingBox.CreateInvalid();
+            foreach (var lodData in data.Lods)
             {
-                RenderLog.Warning($"Model {entry.Model} has a LOD without geometry, skipping the model");
-                foreach (var created in lods)
-                    created.Dispose();
-                entry.State = LoadState.Failed;
-                return;
+                var lod = CreateLod(entry.Model, lodData, uploads);
+                if (lod == null)
+                {
+                    RenderLog.Warning($"Model {entry.Model} has a LOD without geometry, skipping the model");
+                    foreach (var created in lods)
+                        created.Dispose();
+                    Discard(uploads);
+                    entry.State = LoadState.Failed;
+                    return;
+                }
+
+                bounds.Include(lod.Bounds);
+                lods.Add(lod);
             }
 
-            bounds.Include(lod.Bounds);
-            lods.Add(lod);
-        }
-
-        entry.Gpu = new GpuModel
-        {
-            Name = entry.Model,
-            Lods = lods.ToArray(),
-            LodDistances = data.Distances.ToArray(),
-            Bounds = bounds,
-        };
-        entry.State = LoadState.Ready;
-        version++;
-
-        var distances = data.Distances.Count > 0 ? ", switch at " + string.Join(", ", data.Distances) : "";
-        var transparent = new List<string>();
-        foreach (var part in lods[0].Parts)
-        {
-            if (part.Transparent != null)
-                transparent.Add(part.MaterialName + " -> " + part.Transparent.Id.String);
-        }
-
-        var skinned = lods[0].Skinned ? $", skinned {lods[0].VertexStride} B/vertex" : "";
-        RenderLog.Info($"Model loaded: {entry.Model} ({lods.Count} LODs, LOD0 {lods[0].Parts.Length} parts{distances}{skinned})" +
-                       (transparent.Count > 0 ? "; transparent: " + string.Join(", ", transparent) : ""));
-        if (entry.Model.Contains("Cockpit", StringComparison.OrdinalIgnoreCase))
-        {
-            foreach (var part in lods[0].Parts)
+            prepared.Enqueue(new PreparedModel
             {
-                RenderLog.Info($"Cockpit part '{part.MaterialName}' ({part.IndexCount} idx, {part.Technique}): " +
-                               $"cm '{part.ColorMetal?.Path}', ng '{part.NormalGloss?.Path}', ext '{part.Extensions?.Path}'");
-            }
+                Entry = entry,
+                Gpu = new GpuModel
+                {
+                    Name = entry.Model,
+                    Lods = lods.ToArray(),
+                    LodDistances = data.Distances.ToArray(),
+                    Bounds = bounds,
+                },
+                Uploads = uploads,
+            });
         }
-
+        catch (Exception e)
+        {
+            RenderLog.Warning($"Failed to create GPU model {entry.Model}: {e.Message}");
+            Discard(uploads);
+            entry.State = LoadState.Failed;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref activeBuilds);
+        }
     }
 
-    private GpuLod CreateLod(string model, MwmMeshData data)
+    private static void Discard(List<TransferSystem.PendingBufferUpload> uploads)
+    {
+        foreach (var upload in uploads)
+            upload.OwnedStaging?.Dispose();
+        uploads.Clear();
+    }
+
+    private void Upload(List<TransferSystem.PendingBufferUpload> uploads, GpuBuffer buffer, byte[] bytes)
+    {
+        if (uploads == null)
+            context.Transfer.UploadBuffer(buffer, bytes);
+        else
+            uploads.Add(context.Transfer.PrepareBufferUpload(buffer, bytes));
+    }
+
+    private GpuLod CreateLod(string model, MwmMeshData data, List<TransferSystem.PendingBufferUpload> uploads = null)
     {
         if (data.Positions.Length == 0 || data.Indices.Length == 0)
             return null;
@@ -337,7 +416,7 @@ internal sealed class ModelCache : IDisposable
         var vertexBuffer = GpuBuffer.Create(context, (ulong)vertexBytes.Length,
             VkBufferUsageFlags.VertexBuffer | VkBufferUsageFlags.TransferDst, hostVisible: false);
         vertexBuffer.DebugName = $"{model} vertices";
-        context.Uploads.UploadBuffer(vertexBuffer, vertexBytes);
+        Upload(uploads, vertexBuffer, vertexBytes);
 
         GpuBuffer skinnedBuffer = null;
         if (skinned)
@@ -360,7 +439,7 @@ internal sealed class ModelCache : IDisposable
             skinnedBuffer = GpuBuffer.Create(context, (ulong)skinnedBytes.Length,
                 VkBufferUsageFlags.VertexBuffer | VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst,
                 hostVisible: false);
-            context.Uploads.UploadBuffer(skinnedBuffer, skinnedBytes);
+            Upload(uploads, skinnedBuffer, skinnedBytes);
             stride = 64;
         }
 
@@ -369,7 +448,7 @@ internal sealed class ModelCache : IDisposable
         var indexBuffer = GpuBuffer.Create(context, (ulong)indexBytes.Length,
             VkBufferUsageFlags.IndexBuffer | VkBufferUsageFlags.TransferDst, hostVisible: false);
         indexBuffer.DebugName = $"{model} indices";
-        context.Uploads.UploadBuffer(indexBuffer, indexBytes);
+        Upload(uploads, indexBuffer, indexBytes);
 
         var parts = new ModelPart[data.Parts.Count];
         for (var i = 0; i < parts.Length; i++)
@@ -581,6 +660,10 @@ internal sealed class ModelCache : IDisposable
 
     public void Dispose()
     {
+        // Let in-flight worker builds finish before the device is destroyed.
+        while (Volatile.Read(ref activeBuilds) > 0)
+            Thread.Sleep(10);
+
         lock (entries)
         {
             foreach (var entry in entries.Values)
@@ -591,5 +674,6 @@ internal sealed class ModelCache : IDisposable
         }
 
         decoded.Clear();
+        prepared.Clear();
     }
 }

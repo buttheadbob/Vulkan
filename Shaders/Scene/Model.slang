@@ -152,18 +152,27 @@ float3 rgbToHsv(float3 rgb)
     return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
 }
 
-// Geometry/Materials/PixelUtilsMaterials.hlsli ColorizeGray
-float3 colorizeGray(float3 texel, float3 colorMaskHsv, float coloring, float3 colorizeHsv)
+// Geometry/Materials/PixelUtilsMaterials.hlsli ColorizeGray. Stock operates on the linear
+// texel and adds the paint-mask HSV directly; converting to sRGB first shifts both hue and value.
+float3 colorizeGray(float3 texel, float3 hsvmask, float coloring)
 {
     if (coloring <= 0.0)
         return texel;
 
-    // ColorMaskHSV is a delta from the grey/magenta paint base. Stock adds the environment's
-    // TextureDebugMultipliers.ColorizeHSV (default 0, 0.8, -0.1) before converting back to RGB.
-    float3 hsv = rgbToHsv(linearToSrgb(texel));
-    hsv.xy = 0;
-    float3 finalHsv = saturate(hsv + colorMaskHsv + colorizeHsv);
-    return lerp(texel, srgbToLinear(hsvToRgb(finalHsv)), coloring);
+    float3 coloringc = hsvToRgb(float3(hsvmask.x, 1.0, 1.0));
+    float3 hsv = rgbToHsv(lerp(texel, texel * coloringc, coloring));
+    hsv.x = 0.0;
+
+    float3 fhsv = hsv + hsvmask * float3(1.0, 1.0, 0.5);
+    fhsv.x = frac(fhsv.x);
+
+    float gray2 = 1.0 - saturate((hsvmask.y + 1.0) / 0.1);
+    fhsv.yz = lerp(saturate(fhsv.yz), saturate(hsv.yz + hsvmask.yz), gray2);
+
+    float gray3 = 1.0 - saturate((hsvmask.y + 0.9) / 0.1);
+    fhsv.y = lerp(saturate(fhsv.y), saturate(hsv.y + hsvmask.y), gray3);
+
+    return lerp(texel, hsvToRgb(fhsv), coloring);
 }
 
 struct VertexOutput
@@ -334,6 +343,54 @@ float toksvigGloss(float gloss, float normalLength)
     return specularToGloss(ft * specular);
 }
 
+float3 addDirectionalLight(float3 n, float3 albedo, float3 f0, float gloss, float nov,
+    float3 toCamera, float3 toLight, float3 color, float glossFactor, float diffuseFactor)
+{
+    if (glossFactor <= 0.0 && diffuseFactor <= 0.0)
+        return 0.0;
+
+    float nol = saturate(dot(n, toLight));
+    float3 halfVector = normalize(toLight + toCamera);
+    float noh = saturate(dot(n, halfVector));
+    float voh = saturate(dot(toCamera, halfVector));
+    float roughness = max(1.0 - gloss, 0.04);
+    float alpha = roughness * roughness;
+    float3 fresnel = fresnelSchlick(f0, voh);
+    float specular = distributionGGX(noh, alpha) * visibilitySmithGGX(nov, nol, alpha);
+    return (albedo * (nol / PI) * diffuseFactor + fresnel * specular * nol * glossFactor) * color;
+}
+
+
+// Sun shadow depth pass. Reuses the opaque ShaderBytecode.Model module (a standalone vertex-only
+// module crashes RADV's pipeline compiler). The four "world" push constants carry the light
+// view-projection rows instead of an object matrix.
+[shader("vertex")]
+float4 shadowMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID,
+    uint drawIndex : SV_DrawIndex) : SV_Position
+{
+    DrawData draw = push.drawData[drawIndex];
+    uint index = draw.indices[draw.indexStart + vertexId];
+    ModelVertex vertex = draw.vertices[index];
+    float4 position = vertex.position;
+
+    if (draw.instanceCount > 0 && draw.instances != nullptr)
+    {
+        CubeInstance instance = draw.instances[draw.instanceStart + instanceId];
+        float4 packed = instance.translationAndRot;
+        int dir = (int)packed.w;
+        float3 forward = PACKED_DIR[dir / 6];
+        float3 up = PACKED_DIR[dir - (dir / 6) * 6];
+        float3 right = cross(up, -forward);
+        float3x3 rotation = float3x3(right, up, -forward);
+        position = float4(mul(position.xyz, rotation) + packed.xyz, 1.0);
+    }
+
+    float4 world = float4(dot(position, draw.world0), dot(position, draw.world1),
+                         dot(position, draw.world2), 1.0);
+    return float4(dot(world, push.world0), dot(world, push.world1),
+                  dot(world, push.world2), dot(world, push.world3));
+}
+
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target0
 {
@@ -370,7 +427,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         coloring *= saturate(1.0 - saturate(metalness - 0.4) / 0.3);
     }
 
-    float3 baseColor = colorizeGray(cm.rgb, input.colorMaskHsv.xyz, coloring, push.frame.colorizeHsv.xyz);
+    float3 paintMask = input.colorMaskHsv.xyz + push.frame.colorizeHsv.xyz;
+    float3 baseColor = colorizeGray(cm.rgb, paintMask, coloring);
     baseColor *= material.colorMulEmissive.rgb;
     // Stock SurfaceAlbedo: metals do not contribute diffuse, only their F0 does.
     float3 albedo = baseColor * (1.0 - metalness);
@@ -394,6 +452,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float emissive = saturate(extras.y - 1.0 / 255.0) * material.colorMulEmissive.w;
 
     float3 toCamera = normalize(-input.worldPosition);
+    // Two-sided lighting: open panels (doors, hangar doors) are visible from both sides, but the
+    // MWM normal belongs to only one side. The shaded side is the one facing the viewer, so align
+    // the normal with the view vector before evaluating the sun/ambient lobes.
+    if (dot(n, toCamera) < 0.0)
+        n = -n;
+
     float3 toSun = -normalize(push.frame.sunDirection.xyz);
     float3 sunColor = push.frame.sunColor.rgb * push.frame.sunDirection.w * renderSettings[0].tuning0.x;
 
@@ -411,6 +475,38 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
     float3 diffuse = albedo * (nol / PI);
     float3 direct = (diffuse + fresnel * specular * nol * renderSettings[0].tuning0.z) * sunColor;
+
+    // Sun shadow map (reverse-Z, 3x3 PCF). Only the main directional light is shadowed; stock
+    // applies the same map scale/AO split to the fill lights separately.
+    if (push.frame.shadowEnabled != 0)
+    {
+        float4 light = float4(input.worldPosition, 1.0);
+        float4 shadowPos = float4(dot(light, push.frame.shadowMatrix0),
+                                  dot(light, push.frame.shadowMatrix1),
+                                  dot(light, push.frame.shadowMatrix2),
+                                  dot(light, push.frame.shadowMatrix3));
+        float3 ndc = shadowPos.xyz / max(shadowPos.w, 1e-6);
+        float2 uv = ndc.xy * 0.5 + 0.5;
+        if (all(uv >= 0.0) && all(uv <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0)
+        {
+            float texel = push.frame.shadowParams.z / max((float)push.frame.shadowSize, 1.0);
+            float bias = push.frame.shadowParams.y;
+            float lit = 0.0;
+            [unroll]
+            for (int y = -1; y <= 1; y++)
+            {
+                [unroll]
+                for (int x = -1; x <= 1; x++)
+                {
+                    float stored = sampleTextureLevel(push.frame.shadowMap, SamplerSlot.PointClamp,
+                        uv + float2(x, y) * texel, 0.0).r;
+                    lit += stored >= ndc.z - bias ? 1.0 : 0.0;
+                }
+            }
+            lit /= 9.0;
+            direct *= lerp(1.0, lit, saturate(push.frame.shadowParams.x));
+        }
+    }
 
     // Dynamic point/spot lights. The game's light component already multiplies intensity into the
     // linear color; falloff is the converted polynomial from MyLightComponent.
@@ -468,8 +564,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 emissiveColor = albedo * emissive * push.frame.emissiveScale *
                            renderSettings[0].tuning1.x * screenScale;
 
-    // Stock forward ambient is the game's AmbientForwardPass floor (0.01 + probe clamp), not the
-    // full skybox irradiance. Using the nebula cubemap as ambient washed every albedo out to white.
+    // Forward ambient floor. Full skybox irradiance is intentionally not used here: the game's
+    // AmbientForwardPass is the stock forward ambient and avoids washing albedo out to white.
     float3 ambient = albedo * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
                      renderSettings[0].tuning0.y * ao;
     float3 ambientSpecular = 0;
@@ -483,5 +579,17 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         ambientSpecular = prefiltered * (f0 * brdf.x + brdf.y) * push.frame.skyboxParams.w * ao *
                           renderSettings[0].tuning1.z;
     }
+    int debugView = (int)push.frame.colorizeHsv.w;
+    if (debugView == 1)
+        return float4(n * 0.5 + 0.5, 1.0);
+    if (debugView == 2)
+        return float4(direct, 1.0);
+    if (debugView == 3)
+        return float4(ambient, 1.0);
+    if (debugView == 4)
+        return float4(emissiveColor, 1.0);
+    if (debugView == 5)
+        return float4(albedo, 1.0);
+
     return float4(direct + ambient + ambientSpecular + emissiveColor, 1.0);
 }

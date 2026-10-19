@@ -106,7 +106,9 @@ internal sealed unsafe class FrameLoop : IDisposable
     }
 
     // Ends recording and submits. The backbuffer must already be in PresentSrcKHR layout.
-    public void EndFrame()
+    // transferValue > 0 makes the graphics queue wait for that timeline value, so uploads
+    // recorded on the transfer queue are visible before any command in this frame runs.
+    public void EndFrame(ulong transferValue = 0, VkSemaphore transferTimeline = default)
     {
         if (!recording)
             return;
@@ -115,11 +117,25 @@ internal sealed unsafe class FrameLoop : IDisposable
         ref var frame = ref frames[frameIndex];
         device.Api.vkEndCommandBuffer(frame.Commands).CheckResult("vkEndCommandBuffer");
 
-        var wait = new VkSemaphoreSubmitInfo
+        var waits = stackalloc VkSemaphoreSubmitInfo[2];
+        waits[0] = new VkSemaphoreSubmitInfo
         {
             semaphore = frame.ImageAvailable,
             stageMask = VkPipelineStageFlags2.ColorAttachmentOutput | VkPipelineStageFlags2.Transfer,
         };
+
+        var waitCount = 1u;
+        if (transferValue > 0)
+        {
+            waits[1] = new VkSemaphoreSubmitInfo
+            {
+                semaphore = transferTimeline,
+                value = transferValue,
+                stageMask = VkPipelineStageFlags2.AllCommands,
+            };
+            waitCount = 2;
+        }
+
         var signal = new VkSemaphoreSubmitInfo
         {
             semaphore = swapchain.RenderFinished[imageIndex],
@@ -128,8 +144,8 @@ internal sealed unsafe class FrameLoop : IDisposable
         var commands = new VkCommandBufferSubmitInfo { commandBuffer = frame.Commands };
         var submit = new VkSubmitInfo2
         {
-            waitSemaphoreInfoCount = 1,
-            pWaitSemaphoreInfos = &wait,
+            waitSemaphoreInfoCount = waitCount,
+            pWaitSemaphoreInfos = waits,
             commandBufferInfoCount = 1,
             pCommandBufferInfos = &commands,
             signalSemaphoreInfoCount = 1,

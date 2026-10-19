@@ -27,6 +27,9 @@ Implemented and verified in game:
   live lighting/exposure/bloom sliders. Slider values are GPU-resident and updated only when changed.
 - GPU text layout for HUD, chat, notifications and diagnostics; a 60 s diagnostics overlay with
   frame-generation time, GPU counts, GPU memory and a rolling graph; frame limits (30/60/120/240/unlimited).
+- Asynchronous asset uploads on a dedicated transfer queue (timeline semaphore), worker-side model GPU
+  building/staging, budgeted texture uploads and coalesced instance-buffer updates, so large grids load
+  without stalling the render thread.
 
 Known rendering gaps (see the roadmap): exposure/specular/reflection calibration against stock and the
 missing dynamic scene probe (shadowed faces are too dark). `DECAL_CUTOUT` paneling/decals are now rendered;

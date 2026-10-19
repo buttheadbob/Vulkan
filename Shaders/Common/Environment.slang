@@ -50,6 +50,30 @@ public struct FrameConstants
     public float emissiveScale;    // MyPostprocessSettings.Data.BloomEmissiveness
     public uint pad3;
 
+    // Stock back directional lights (fill from the environment/planet).
+    public float4 backLight1Direction; // xyz: direction FROM light, w: gloss factor
+    public float4 backLight1Color;     // rgb: linear, w: diffuse factor
+    public float4 backLight2Direction;
+    public float4 backLight2Color;
+
+    // x: AmbientGlobalMinimum, y: AmbientGlobalDensity, z: AmbientGlobalMultiplier
+    public float4 ambientGlobal;
+
+    // MyEnvironmentLightData.SunDiscColor (rgb), w: stock multiplier
+    public float4 sunDiscColor;
+    // x: SunDiscInnerDot, y: SunDiscOuterDot, z: SunBillboardEnabled
+    public float4 sunDiscDots;
+
+    public float4 shadowMatrix0;
+    public float4 shadowMatrix1;
+    public float4 shadowMatrix2;
+    public float4 shadowMatrix3;
+    public uint shadowMap;
+    public uint shadowSize;
+    public uint shadowEnabled;
+    public uint shadowPad;
+    public float4 shadowParams; // x: strength, y: depth bias, z: PCF texel scale
+
     // User tuning lives in the persistent GPU settings buffer (Bindless.renderSettings).
 };
 
@@ -69,6 +93,12 @@ public float3 skyboxColorReflected(FrameConstants frame, float3 viewDirection)
 {
     return sampleCube(frame.skyboxCube, SamplerSlot.LinearClamp,
                       -applySkyboxOrientation(frame, viewDirection), 0).rgb;
+}
+
+// Stock samples the indirect cubemap directly (no skybox orientation), with x flipped.
+public float3 iblColorRaw(FrameConstants frame, float3 direction, float level)
+{
+    return sampleCube(frame.iblCube, SamplerSlot.LinearClamp, direction, level).rgb;
 }
 
 // IBL lookup: the indirect cubemap shares the skybox orientation

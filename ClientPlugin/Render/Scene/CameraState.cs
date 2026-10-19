@@ -57,6 +57,32 @@ internal struct FrameConstants
     // brighter than 1 (the test world uses 120)
     public float EmissiveScale;
     public uint Pad3;
+
+    // Stock back directional lights (fill from the environment/planet).
+    public Vector4 BackLight1Direction; // xyz: direction FROM light, w: gloss factor
+    public Vector4 BackLight1Color;     // rgb: linear, w: diffuse factor
+    public Vector4 BackLight2Direction;
+    public Vector4 BackLight2Color;
+
+    // x: AmbientGlobalMinimum, y: AmbientGlobalDensity, z: AmbientGlobalMultiplier
+    public Vector4 AmbientGlobal;
+
+    // MyEnvironmentLightData.SunDiscColor (rgb), w: stock multiplier
+    public Vector4 SunDiscColor;
+    // x: SunDiscInnerDot, y: SunDiscOuterDot, z: SunBillboardEnabled
+    public Vector4 SunDiscDots;
+
+    // Sun shadow map: light view-projection rows, bindless slot, size in texels, and
+    // (x: strength, y: depth bias, z: enabled).
+    public Vector4 ShadowMatrix0;
+    public Vector4 ShadowMatrix1;
+    public Vector4 ShadowMatrix2;
+    public Vector4 ShadowMatrix3;
+    public uint ShadowMap;
+    public uint ShadowSize;
+    public uint ShadowEnabled;
+    public uint ShadowPad;
+    public Vector4 ShadowParams;
 }
 
 // Camera from MyRenderMessageSetCameraViewMatrix, plus the stock projection and camera-relative setup.
@@ -150,6 +176,15 @@ internal sealed class CameraState
         };
     }
 
+    private static readonly float DebugView = ParseDebugView();
+    private static float ParseFlag(string name) =>
+        Environment.GetEnvironmentVariable(name) == "1" ? 1f : 0f;
+    private static float ParseDebugView()
+    {
+        var value = Environment.GetEnvironmentVariable("VULKAN_DEBUG_VIEW");
+        return int.TryParse(value, out var view) ? view : 0f;
+    }
+
     public FrameConstants BuildFrameConstants(MyEnvironmentData environment,
         uint skyboxCube, uint iblCube, uint brdfLut, uint iblMipCount)
     {
@@ -180,7 +215,17 @@ internal sealed class CameraState
             SunDirection = new Vector4(sunDirection, light.SunDiffuseFactor),
             SunColor = new Vector4(sun, light.SunSpecularFactor),
             AmbientColor = new Vector4(1f, 1f, 1f, ambient * light.AmbientDiffuseFactor),
-            ColorizeHsv = environment.TextureMultipliers.ColorizeHSV,
+            ColorizeHsv = new Vector4(environment.TextureMultipliers.ColorizeHSV.X,
+                environment.TextureMultipliers.ColorizeHSV.Y,
+                environment.TextureMultipliers.ColorizeHSV.Z, DebugView),
+            // This game build does not expose the stock fill/global-ambient fields; keep them neutral.
+            BackLight1Direction = Vector4.Zero,
+            BackLight1Color = Vector4.Zero,
+            BackLight2Direction = Vector4.Zero,
+            BackLight2Color = Vector4.Zero,
+            AmbientGlobal = Vector4.Zero,
+            SunDiscColor = new Vector4(light.SunDiscColor, light.SunDiscIntensity),
+            SunDiscDots = new Vector4(light.SunDiscInnerDot, light.SunDiscOuterDot, 1f, 0f),
 
             InvViewProjection0 = new Vector4(invViewProjection.M11, invViewProjection.M12, invViewProjection.M13, invViewProjection.M14),
             InvViewProjection1 = new Vector4(invViewProjection.M21, invViewProjection.M22, invViewProjection.M23, invViewProjection.M24),

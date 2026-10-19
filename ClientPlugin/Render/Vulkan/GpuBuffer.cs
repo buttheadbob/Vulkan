@@ -35,15 +35,20 @@ internal sealed unsafe class GpuBuffer : IDisposable
         var api = context.Device.Api;
         usage |= VkBufferUsageFlags.ShaderDeviceAddress;
 
-        var createInfo = new VkBufferCreateInfo
-        {
-            size = size,
-            usage = usage,
-            sharingMode = VkSharingMode.Exclusive,
-        };
-
         VkBuffer buffer;
-        api.vkCreateBuffer(&createInfo, null, &buffer).CheckResult("vkCreateBuffer");
+        fixed (uint* queueFamilies = context.QueueFamilies)
+        {
+            var createInfo = new VkBufferCreateInfo
+            {
+                size = size,
+                usage = usage,
+                sharingMode = context.SharingMode,
+                queueFamilyIndexCount = (uint)(context.QueueFamilies?.Length ?? 0),
+                pQueueFamilyIndices = queueFamilies,
+            };
+
+            api.vkCreateBuffer(&createInfo, null, &buffer).CheckResult("vkCreateBuffer");
+        }
 
         VkMemoryRequirements requirements;
         api.vkGetBufferMemoryRequirements(buffer, &requirements);

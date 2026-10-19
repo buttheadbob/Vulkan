@@ -19,6 +19,9 @@ internal sealed class GraphicsPipelineBuilder
     public bool DepthTest { get; init; }
     public bool DepthWrite { get; init; }
     public VkCompareOp DepthCompare { get; init; } = VkCompareOp.GreaterOrEqual; // Reverse Z
+    public bool DepthBiasEnable { get; init; }
+    public float DepthBiasConstant { get; init; }
+    public float DepthBiasSlope { get; init; }
     public VkPipelineColorBlendAttachmentState Blend { get; init; } = Opaque;
     public VkPipelineColorBlendAttachmentState[] BlendStates { get; init; } // per color attachment; null = Blend for all
 
@@ -54,6 +57,9 @@ internal sealed class GraphicsPipelineBuilder
                 cullMode = CullMode,
                 frontFace = FrontFace,
                 lineWidth = 1,
+                depthBiasEnable = DepthBiasEnable,
+                depthBiasConstantFactor = DepthBiasConstant,
+                depthBiasSlopeFactor = DepthBiasSlope,
             };
             var multisample = new VkPipelineMultisampleStateCreateInfo { rasterizationSamples = VkSampleCountFlags.Count1 };
             var depthStencil = new VkPipelineDepthStencilStateCreateInfo
@@ -66,7 +72,11 @@ internal sealed class GraphicsPipelineBuilder
             var attachments = stackalloc VkPipelineColorBlendAttachmentState[Math.Max(1, ColorFormats.Length)];
             for (var i = 0; i < ColorFormats.Length; i++)
                 attachments[i] = BlendStates != null && i < BlendStates.Length ? BlendStates[i] : Blend;
-            var colorBlend = new VkPipelineColorBlendStateCreateInfo { attachmentCount = (uint)ColorFormats.Length, pAttachments = attachments };
+            var colorBlend = new VkPipelineColorBlendStateCreateInfo
+            {
+                attachmentCount = (uint)ColorFormats.Length,
+                pAttachments = ColorFormats.Length > 0 ? attachments : null,
+            };
 
             var dynamicStates = stackalloc VkDynamicState[2] { VkDynamicState.Viewport, VkDynamicState.Scissor };
             var dynamicState = new VkPipelineDynamicStateCreateInfo { dynamicStateCount = 2, pDynamicStates = dynamicStates };
@@ -76,7 +86,7 @@ internal sealed class GraphicsPipelineBuilder
                 var rendering = new VkPipelineRenderingCreateInfo
                 {
                     colorAttachmentCount = (uint)ColorFormats.Length,
-                    pColorAttachmentFormats = colorFormats,
+                    pColorAttachmentFormats = ColorFormats.Length > 0 ? colorFormats : null,
                     depthAttachmentFormat = DepthFormat,
                 };
 

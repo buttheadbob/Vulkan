@@ -42,23 +42,28 @@ internal sealed unsafe class GpuImage : IDisposable
     {
         var api = context.Device.Api;
 
-        var createInfo = new VkImageCreateInfo
-        {
-            flags = isCube ? VkImageCreateFlags.CubeCompatible : VkImageCreateFlags.None,
-            imageType = VkImageType.Image2D,
-            format = format,
-            extent = new VkExtent3D(width, height, 1),
-            mipLevels = mipLevels,
-            arrayLayers = arrayLayers,
-            samples = VkSampleCountFlags.Count1,
-            tiling = VkImageTiling.Optimal,
-            usage = usage,
-            sharingMode = VkSharingMode.Exclusive,
-            initialLayout = VkImageLayout.Undefined,
-        };
-
         VkImage image;
-        api.vkCreateImage(&createInfo, null, &image).CheckResult("vkCreateImage");
+        fixed (uint* queueFamilies = context.QueueFamilies)
+        {
+            var createInfo = new VkImageCreateInfo
+            {
+                flags = isCube ? VkImageCreateFlags.CubeCompatible : VkImageCreateFlags.None,
+                imageType = VkImageType.Image2D,
+                format = format,
+                extent = new VkExtent3D(width, height, 1),
+                mipLevels = mipLevels,
+                arrayLayers = arrayLayers,
+                samples = VkSampleCountFlags.Count1,
+                tiling = VkImageTiling.Optimal,
+                usage = usage,
+                sharingMode = context.SharingMode,
+                queueFamilyIndexCount = (uint)(context.QueueFamilies?.Length ?? 0),
+                pQueueFamilyIndices = queueFamilies,
+                initialLayout = VkImageLayout.Undefined,
+            };
+
+            api.vkCreateImage(&createInfo, null, &image).CheckResult("vkCreateImage");
+        }
 
         VkMemoryRequirements requirements;
         api.vkGetImageMemoryRequirements(image, &requirements);

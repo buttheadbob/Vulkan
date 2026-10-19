@@ -39,5 +39,13 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
     float3 direction = normalize(world.xyz / world.w);
     float3 color = skyboxColorReflected(*push.frame, direction) * push.frame.skyboxParams.x;
+
+    // Stock LightDir.hlsl: the sun is a smoothstep disc around -SunLightDirection.
+    float3 toSun = -normalize(push.frame.sunDirection.xyz);
+    float cosSun = dot(direction, toSun);
+    float disc = smoothstep(push.frame.sunDiscDots.y, push.frame.sunDiscDots.x, cosSun);
+    disc *= disc;
+    color += push.frame.sunDiscColor.rgb * push.frame.sunDiscColor.w * disc *
+             push.frame.sunDiscDots.z;
     return float4(color, 1.0);
 }

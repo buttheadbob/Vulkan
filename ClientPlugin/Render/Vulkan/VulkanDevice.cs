@@ -17,6 +17,13 @@ internal sealed unsafe class VulkanDevice : IDisposable
     public uint QueueFamily { get; private set; }
     public VkQueue Queue { get; private set; }
 
+    // Separate copy engine used for asynchronous asset uploads. Null when the device has no
+    // transfer-capable family different from the graphics family; uploads then fall back to the
+    // graphics queue (same behaviour, just without copy-engine overlap).
+    public bool HasDedicatedTransfer { get; private set; }
+    public uint TransferQueueFamily { get; private set; }
+    public VkQueue TransferQueue { get; private set; }
+
     // Serializes queue submission and presentation, VkQueue access must be externally synchronized
     public readonly object QueueLock = new();
 
@@ -28,6 +35,12 @@ internal sealed unsafe class VulkanDevice : IDisposable
 
         var (physicalDevice, selected, queueFamily) = Select(instance, surface, candidates, preferredAdapter);
         RenderLog.Info("Selected GPU: " + selected.Name);
+
+        var transferFamily = FindTransferFamily(instance, physicalDevice, queueFamily);
+        if (transferFamily.HasValue)
+            RenderLog.Info($"Dedicated transfer queue: family {transferFamily.Value} (graphics family {queueFamily})");
+        else
+            RenderLog.Info("No dedicated transfer queue family; uploads use the graphics queue");
 
         var extensions = new List<string> { VkNames.ToString(VK_KHR_SWAPCHAIN_EXTENSION_NAME) };
 
@@ -58,39 +71,83 @@ internal sealed unsafe class VulkanDevice : IDisposable
         features2.features.samplerAnisotropy = true;
 
         var priority = 1f;
-        var queueInfo = new VkDeviceQueueCreateInfo
+        var queueInfos = new VkDeviceQueueCreateInfo[transferFamily.HasValue ? 2 : 1];
+        queueInfos[0] = new VkDeviceQueueCreateInfo
         {
             queueFamilyIndex = queueFamily,
             queueCount = 1,
             pQueuePriorities = &priority,
         };
+        if (transferFamily.HasValue)
+        {
+            queueInfos[1] = new VkDeviceQueueCreateInfo
+            {
+                queueFamilyIndex = transferFamily.Value,
+                queueCount = 1,
+                pQueuePriorities = &priority,
+            };
+        }
 
         using var extensionNames = new VkStringArray(extensions);
-        var createInfo = new VkDeviceCreateInfo
+        fixed (VkDeviceQueueCreateInfo* pQueueInfos = queueInfos)
         {
-            pNext = &features2,
-            queueCreateInfoCount = 1,
-            pQueueCreateInfos = &queueInfo,
-            enabledExtensionCount = extensionNames.Length,
-            ppEnabledExtensionNames = extensionNames,
-        };
+            var createInfo = new VkDeviceCreateInfo
+            {
+                pNext = &features2,
+                queueCreateInfoCount = (uint)queueInfos.Length,
+                pQueueCreateInfos = pQueueInfos,
+                enabledExtensionCount = extensionNames.Length,
+                ppEnabledExtensionNames = extensionNames,
+            };
 
-        VkDevice device;
-        instance.Api.vkCreateDevice(physicalDevice, &createInfo, &device).CheckResult("vkCreateDevice");
+            VkDevice device;
+            instance.Api.vkCreateDevice(physicalDevice, &createInfo, &device).CheckResult("vkCreateDevice");
 
-        var api = GetApi(instance.Handle, device);
-        VkQueue queue;
-        api.vkGetDeviceQueue(queueFamily, 0, &queue);
+            var api = GetApi(instance.Handle, device);
+            VkQueue queue;
+            api.vkGetDeviceQueue(queueFamily, 0, &queue);
+            VkQueue transferQueue = VkQueue.Null;
+            if (transferFamily.HasValue)
+                api.vkGetDeviceQueue(transferFamily.Value, 0, &transferQueue);
 
-        return new VulkanDevice
+            return new VulkanDevice
+            {
+                PhysicalDevice = physicalDevice,
+                Caps = selected,
+                Handle = device,
+                Api = api,
+                QueueFamily = queueFamily,
+                Queue = queue,
+                HasDedicatedTransfer = transferFamily.HasValue,
+                TransferQueueFamily = transferFamily ?? queueFamily,
+                TransferQueue = transferQueue,
+            };
+        }
+    }
+
+    // Prefers a queue family that only does transfers (a real copy engine). Falls back to any
+    // transfer-capable family that is not the graphics family; null means no separate queue.
+    private static uint? FindTransferFamily(VulkanInstance instance, VkPhysicalDevice device, uint graphicsFamily)
+    {
+        uint count;
+        instance.Api.vkGetPhysicalDeviceQueueFamilyProperties(device, &count, null);
+        var families = new VkQueueFamilyProperties[count];
+        fixed (VkQueueFamilyProperties* p = families)
+            instance.Api.vkGetPhysicalDeviceQueueFamilyProperties(device, &count, p);
+
+        uint? fallback = null;
+        for (uint i = 0; i < count; i++)
         {
-            PhysicalDevice = physicalDevice,
-            Caps = selected,
-            Handle = device,
-            Api = api,
-            QueueFamily = queueFamily,
-            Queue = queue,
-        };
+            if (i == graphicsFamily || (families[i].queueFlags & VkQueueFlags.Transfer) == 0)
+                continue;
+
+            if ((families[i].queueFlags & (VkQueueFlags.Graphics | VkQueueFlags.Compute)) == 0)
+                return i;
+
+            fallback ??= i;
+        }
+
+        return fallback;
     }
 
     // Prefers the GPU the game selected (matched by PCI vendor and device ID), otherwise the best usable one

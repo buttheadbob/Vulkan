@@ -16,6 +16,7 @@ internal struct DiagnosticsStats
     public uint Parts;
     public uint Instances;
     public uint Culled;
+    public uint GpuVisible;
     public int DrawnActors;
     public int CulledActors;
     public int GpuParts;
@@ -70,8 +71,8 @@ internal sealed class DiagnosticsOverlay
         DrawLine(font, addText, ref line,
             $"Vulkan  {stats.Fps:0.0} fps   frame {stats.FrameMilliseconds:0.00} ms");
         DrawLine(font, addText, ref line, $"GPU tris {stats.Triangles:N0}  parts {stats.Parts:N0}  inst {stats.Instances:N0}");
-        DrawLine(font, addText, ref line, $"Drawn {stats.DrawnActors}  culled {stats.CulledActors}  GPU parts {stats.GpuParts:N0}");
-        DrawLine(font, addText, ref line, $"GPU culled {stats.Culled:N0}  direct tris {stats.DirectTriangles:N0}");
+        DrawLine(font, addText, ref line, $"Direct draws {stats.DrawnActors}  culled {stats.CulledActors}  GPU parts {stats.GpuParts:N0}");
+        DrawLine(font, addText, ref line, $"GPU culled {stats.Culled:N0}  visible {stats.GpuVisible:N0}  direct tris {stats.DirectTriangles:N0}");
         DrawLine(font, addText, ref line, $"GPU text {stats.TextRuns} runs  {stats.TextGlyphs} glyphs");
         var memoryPercent = stats.GpuMemoryTotalBytes > 0
             ? stats.GpuMemoryBytes * 100.0 / stats.GpuMemoryTotalBytes

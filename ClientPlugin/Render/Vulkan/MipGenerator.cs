@@ -52,7 +52,7 @@ internal static unsafe class MipGenerator
         }
 
         barriers[0] = Barrier(image, 0, image.MipLevels, VkPipelineStageFlags2.Blit, VkAccessFlags2.TransferRead, VkImageLayout.TransferSrcOptimal,
-            VkPipelineStageFlags2.AllGraphics | VkPipelineStageFlags2.ComputeShader, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
+            VkPipelineStageFlags2.AllCommands, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
         Submit(api, commands, barriers, 1);
     }
 

@@ -71,7 +71,23 @@ public sealed class VulkanRender : IMyRender
     private bool hasEnvironment;
     private int sceneFrameCounter;
     private int lastDrawnActors;
+    private int reportedModelChanges;
     private int lastCulledActors;
+
+    // CPU stage timing, averaged for the 5 s diagnostics log.
+    private double cpuMessagesMs;
+    private double cpuUploadsMs;
+    private double cpuGuiMs;
+    private double lastMessagesMs;
+    private double lastUploadsMs;
+    private double lastGuiMs;
+    private long frameAllocStart;
+    private long loggedAllocBytes;
+    private int loggedFrames;
+    private TimeSpan loggedGcPause;
+    private int loggedGc0;
+    private int loggedGc1;
+    private int loggedGc2;
     private MyNewLoddingSettings loddingSettings = new();
     private readonly HashSet<MyRenderMessageEnum> reported = new();
     private readonly Stopwatch frameClock = Stopwatch.StartNew();
@@ -389,6 +405,7 @@ public sealed class VulkanRender : IMyRender
                     framesPerSecond = framesPerSecond * 0.9 + (1 / delta) * 0.1;
 
                 workStart = Stopwatch.GetTimestamp();
+                frameAllocStart = GC.GetAllocatedBytesForCurrentThread();
                 gpu.BeginFrame(frameLoop.FrameSlot);
                 gui.BeginFrame(frameLoop.FrameSlot);
                 drawScene = false;
@@ -397,6 +414,7 @@ public sealed class VulkanRender : IMyRender
 
         // Without a frame to draw into, only state changes are applied; the draw messages of this
         // update frame are processed with the next frame that is drawn.
+        var stageStart = Stopwatch.GetTimestamp();
         messages.Process(frameStarted);
 
         if (!frameStarted)
@@ -407,7 +425,12 @@ public sealed class VulkanRender : IMyRender
 
         textures.ProcessDecoded();
         models.ProcessReady();
+        instanceBuffers.ProcessPending();
         ApplyDebugCamera();
+        lastMessagesMs = Ms(stageStart);
+        cpuMessagesMs = Mix(cpuMessagesMs, lastMessagesMs);
+
+        stageStart = Stopwatch.GetTimestamp();
 
         // Slider changes only mark a flag; the GPU buffer is refreshed on the render thread and the
         // shaders read it directly. No per-frame Config reads or tuning uploads.
@@ -415,7 +438,11 @@ public sealed class VulkanRender : IMyRender
             UploadRenderSettings();
 
         var commands = frameLoop.Commands;
+        var transferValue = gpu.Transfer.Submit(commands);
         gpu.Uploads.Record(commands);
+        lastUploadsMs = Ms(stageStart);
+        cpuUploadsMs = Mix(cpuUploadsMs, lastUploadsMs);
+        stageStart = Stopwatch.GetTimestamp();
         gui.RecordOffscreen(commands);
         if (drawScene)
             RecordScene(commands);
@@ -435,6 +462,7 @@ public sealed class VulkanRender : IMyRender
             Parts = counters.Parts,
             Instances = counters.Instances,
             Culled = counters.CulledActors,
+            GpuVisible = counters.VisibleActors,
             DrawnActors = lastDrawnActors,
             CulledActors = lastCulledActors,
             GpuParts = modelPass?.GpuPartCount ?? 0,
@@ -447,11 +475,32 @@ public sealed class VulkanRender : IMyRender
         // GPU text layout must run outside the backbuffer rendering pass, after all runs are queued.
         gui.RecordTextLayout(commands);
         RecordFrame(commands);
-        frameLoop.EndFrame();
+        lastGuiMs = Ms(stageStart);
+        cpuGuiMs = Mix(cpuGuiMs, lastGuiMs);
+        frameLoop.EndFrame(transferValue, gpu.Transfer.Timeline);
         var workMs = (Stopwatch.GetTimestamp() - workStart) * 1000.0 / Stopwatch.Frequency;
         rawFrameMilliseconds = workMs;
         frameMilliseconds = frameMilliseconds * 0.9 + workMs * 0.1;
+
+        var allocBytes = GC.GetAllocatedBytesForCurrentThread() - frameAllocStart;
+        loggedAllocBytes += allocBytes;
+        loggedFrames++;
+        if (workMs > 20)
+        {
+            RenderLog.Warning($"Frame hitch {workMs:0.0} ms: msg {lastMessagesMs:0.0}, upload {lastUploadsMs:0.0}, " +
+                              $"skin {modelPass?.LastSkinningMs ?? 0:0.0}, prepare {modelPass?.LastPrepareMs ?? 0:0.0} " +
+                              $"(cache {modelPass?.LastEnsureMs ?? 0:0.0}), " +
+                              $"record {modelPass?.LastRecordMs ?? 0:0.0}, transparent {modelPass?.LastTransparentMs ?? 0:0.0}, " +
+                              $"gui {lastGuiMs:0.0}; alloc {allocBytes / 1024.0:0.0} KB, " +
+                              $"gc {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+        }
     }
+
+    private static double Ms(long start) =>
+        (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
+
+    private static double Mix(double average, double value) =>
+        average == 0 ? value : average * 0.9 + value * 0.1;
 
     private void LimitFrameRate()
     {
@@ -533,10 +582,12 @@ public sealed class VulkanRender : IMyRender
         var frameConstants = 0ul;
         if (sceneReady)
         {
-            frameConstants = PrepareFrameConstants(environment);
-            // Compute skinning and GPU culling must run outside the dynamic rendering pass
+            // Compute skinning, GPU culling and the shadow depth pass must run outside dynamic rendering.
             modelPass.RecordSkinning(commands, camera, loddingSettings, actors);
-            modelPass.RecordPrepare(commands, frameLoop.FrameSlot, camera, loddingSettings, actors);
+            modelPass.RecordPrepare(commands, frameLoop.FrameSlot, camera, loddingSettings, actors,
+                environment.EnvironmentLight.SunLightDirection);
+            modelPass.RecordShadow(commands, camera);
+            frameConstants = PrepareFrameConstants(environment);
         }
 
         api.vkCmdBeginRendering(commands, &renderingInfo);
@@ -636,21 +687,33 @@ public sealed class VulkanRender : IMyRender
 
         if (++sceneFrameCounter % 300 == 0)
         {
-            Span<int> lods = stackalloc int[8];
-            var skinned = 0;
-            foreach (var actor in actors.All)
-            {
-                lods[Math.Min(actor.Lod, lods.Length - 1)]++;
-                if (actor.SkinnedVertexAddress != 0)
-                    skinned++;
-            }
-
-            RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced, {skinned} skinned), " +
-                           $"{lastDrawnActors} draws, {lastCulledActors} culled, gpu {modelPass.GpuPartCount} parts, " +
+            var gpuCounters = modelPass.Diagnostics;
+            RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced, {actors.Skinned.Count} skinned), " +
+                           $"{lastDrawnActors} direct draws ({lastCulledActors} culled), " +
+                           $"gpu culled {gpuCounters.CulledActors} visible {gpuCounters.VisibleActors}, " +
+                           $"gpu {modelPass.GpuPartCount} parts, " +
                            $"{sceneLights.LastCount} lights, " +
-                           $"LOD histogram [{string.Join(",", lods.ToArray())}], " +
                            $"instance buffers {instanceBuffers.Count} ({instanceBuffers.TotalInstances} instances), " +
                            $"camera {camera.HasValue}, environment {hasEnvironment}");
+            RenderLog.Info($"Cache: {modelPass.CacheDiagnostics(actors)}");
+
+            var gcPause = GC.GetTotalPauseDuration();
+            var gc0 = GC.CollectionCount(0);
+            var gc1 = GC.CollectionCount(1);
+            var gc2 = GC.CollectionCount(2);
+            RenderLog.Info($"CPU ms (avg): frame {frameMilliseconds:0.00}, msg {cpuMessagesMs:0.00}, upload {cpuUploadsMs:0.00}, " +
+                           $"skin {modelPass.LastSkinningMs:0.00}, prepare {modelPass.LastPrepareMs:0.00} " +
+                           $"(cache {modelPass.LastEnsureMs:0.00}, actors {modelPass.LastActorLoopMs:0.00}), " +
+                           $"record {modelPass.LastRecordMs:0.00}, transparent {modelPass.LastTransparentMs:0.00}, gui {cpuGuiMs:0.00}; " +
+                           $"alloc {(loggedFrames > 0 ? loggedAllocBytes / 1024.0 / loggedFrames : 0):0.0} KB/frame, " +
+                           $"gc {gc0}/{gc1}/{gc2} (+{gc0 - loggedGc0}/{gc1 - loggedGc1}/{gc2 - loggedGc2}), " +
+                           $"pause +{(gcPause - loggedGcPause).TotalMilliseconds:0.0} ms");
+            loggedAllocBytes = 0;
+            loggedFrames = 0;
+            loggedGcPause = gcPause;
+            loggedGc0 = gc0;
+            loggedGc1 = gc1;
+            loggedGc2 = gc2;
         }
 
         frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
@@ -721,6 +784,20 @@ public sealed class VulkanRender : IMyRender
         var lightData = sceneLights.Build(gpu, camera.Position);
         constants.Lights = lightData.Address;
         constants.LightCount = lightData.Count;
+        constants.ShadowParams = new Vector4(1f, 0.0015f, 2f, 0f);
+
+        if (modelPass.ShadowsReady)
+        {
+            var shadow = Matrix.Transpose(modelPass.ShadowViewProjection);
+            constants.ShadowMatrix0 = new Vector4(shadow.M11, shadow.M12, shadow.M13, shadow.M14);
+            constants.ShadowMatrix1 = new Vector4(shadow.M21, shadow.M22, shadow.M23, shadow.M24);
+            constants.ShadowMatrix2 = new Vector4(shadow.M31, shadow.M32, shadow.M33, shadow.M34);
+            constants.ShadowMatrix3 = new Vector4(shadow.M41, shadow.M42, shadow.M43, shadow.M44);
+            constants.ShadowMap = modelPass.ShadowSlot;
+            constants.ShadowSize = ShadowMap.Size;
+            constants.ShadowEnabled = 1;
+            constants.ShadowParams = new Vector4(1f, 0.0015f, 2f, 0f);
+        }
 
         var allocation = gpu.Transient.Allocate<FrameConstants>();
         allocation.As<FrameConstants>() = constants;
@@ -1052,16 +1129,7 @@ public sealed class VulkanRender : IMyRender
 
             case MyRenderMessageEnum.ChangeMaterialTexture:
             {
-                var m = (MyRenderMessageChangeMaterialTexture)message;
-                if (m.Changes != null)
-                {
-                    foreach (var pair in m.Changes)
-                    {
-                        RenderLog.Info($"Texture change actor {m.RenderObjectID}, '{pair.Key.String}': " +
-                                       $"cm '{pair.Value.ColorMetalFileName}', ng '{pair.Value.NormalGlossFileName}'");
-                    }
-                }
-                actors.ChangeMaterialTexture(m);
+                actors.ChangeMaterialTexture((MyRenderMessageChangeMaterialTexture)message);
                 break;
             }
 
@@ -1072,6 +1140,8 @@ public sealed class VulkanRender : IMyRender
             case MyRenderMessageEnum.ChangeModel:
             {
                 var m = (MyRenderMessageChangeModel)message;
+                if (reportedModelChanges++ < 30)
+                    RenderLog.Info($"ChangeModel: actor {m.ID} -> {m.Model}");
                 actors.ChangeModel(m);
                 models?.StartLoading(m.Model);
                 break;
@@ -1101,8 +1171,13 @@ public sealed class VulkanRender : IMyRender
                 break;
 
             case MyRenderMessageEnum.CollectGarbage:
+            {
+                var gcWatch = Stopwatch.StartNew();
                 MyVRage.Platform.System.CollectGC();
+                if (gcWatch.Elapsed.TotalMilliseconds > 2)
+                    RenderLog.Warning($"CollectGarbage took {gcWatch.Elapsed.TotalMilliseconds:0.0} ms");
                 break;
+            }
 
             // The game tracks the IDs of render objects; release them like the stock renderer does
             case MyRenderMessageEnum.RemoveRenderObject:

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -70,6 +71,10 @@ internal sealed class TextureCache : IDisposable
     private readonly ConcurrentDictionary<string, Vector2I> sizes = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<Entry> decoded = new();
 
+    // Bumped whenever a texture becomes ready, so material records that captured a placeholder
+    // slot while it was loading can be refreshed.
+    public long ReadyGeneration { get; private set; }
+
     public TextureCache(GpuContext context)
     {
         this.context = context;
@@ -130,14 +135,24 @@ internal sealed class TextureCache : IDisposable
     public static uint MipLevelsOf(Entry entry) =>
         entry is { Status: State.Ready, IsCube: true } ? entry.Image.MipLevels : 1;
 
-    // Render thread, once per frame before rendering: creates and uploads the textures decoded since the last frame
+    // Render thread, once per frame before rendering: creates and uploads the textures decoded since the last frame.
+    // Work is time-budgeted so a large asset load cannot stall one frame for seconds; the remainder is
+    // processed on following frames.
+    private const double DecodeBudgetMs = 4.0;
+
     public void ProcessDecoded()
     {
-        while (decoded.TryDequeue(out var entry))
+        var watch = Stopwatch.StartNew();
+        var count = 0;
+        while (watch.Elapsed.TotalMilliseconds < DecodeBudgetMs && decoded.TryDequeue(out var entry))
         {
+            count++;
             if (entry.Status == State.Decoded)
                 Finish(entry);
         }
+
+        if (count > 0 && watch.Elapsed.TotalMilliseconds > 50)
+            RenderLog.Warning($"Texture uploads took {watch.Elapsed.TotalMilliseconds:F1} ms for {count} textures");
     }
 
     // Any thread. Size in pixels from the file header, without loading the texture (IMyRender.GetTextureSize).
@@ -319,7 +334,7 @@ internal sealed class TextureCache : IDisposable
 
             var image = GpuImage.Create2D(context, data.Width, data.Height, data.MipLevels, data.ArrayLayers, data.Format,
                 VkImageUsageFlags.Sampled | VkImageUsageFlags.TransferDst, data.IsCube);
-            context.Uploads.UploadImage(image, data.Data, data.Regions);
+            context.Transfer.UploadImage(image, data.Data, data.Regions);
 
             entry.Image = image;
             entry.IsCube = data.IsCube;
@@ -335,6 +350,9 @@ internal sealed class TextureCache : IDisposable
             }
 
             entry.Status = State.Ready;
+            ReadyGeneration++;
+            if (entry.Path.Contains("Skins", StringComparison.OrdinalIgnoreCase))
+                RenderLog.Info($"Skin texture ready: {entry.Path} slot {entry.Slot}");
         }
     }
 

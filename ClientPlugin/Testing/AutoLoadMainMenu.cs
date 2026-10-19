@@ -1,10 +1,13 @@
 using System;
 using System.Diagnostics;
 using System.Reflection;
+using System.Threading;
 using ClientPlugin.Render;
 using HarmonyLib;
 using Sandbox.Graphics.GUI;
 using SpaceEngineers.Game.GUI;
+using VRageMath;
+using VRageRender;
 
 namespace ClientPlugin.Testing;
 
@@ -57,5 +60,6 @@ internal static class AutoLoadMainMenuPatch
         fired = true;
         RenderLog.Info($"AutoLoad: continuing the last game after {elapsed:0.#} s");
         ContinueMethod.Invoke(__instance, [button]);
+        StockScreenshot.Schedule();
     }
 }

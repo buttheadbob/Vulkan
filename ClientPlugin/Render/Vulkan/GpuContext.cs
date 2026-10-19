@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Vortice.Vulkan;
 
 namespace ClientPlugin.Render.Vulkan;
 
@@ -11,7 +12,14 @@ internal sealed class GpuContext : IDisposable
     public GpuMemory Memory { get; }
     public BindlessDescriptors Bindless { get; private set; }
     public UploadQueue Uploads { get; private set; }
+    public TransferSystem Transfer { get; private set; }
     public TransientAllocator Transient { get; private set; }
+
+    // Queue families that may access resources created here. When a separate transfer family is
+    // used, resources are created with concurrent sharing so copies there and rendering on the
+    // graphics queue need no ownership-transfer bookkeeping.
+    public uint[] QueueFamilies { get; }
+    public VkSharingMode SharingMode { get; }
 
     // Releases queued per frame slot, run once the GPU is done with that slot's previous frame
     private readonly List<Action>[] pendingReleases = new List<Action>[FrameLoop.FramesInFlight];
@@ -24,10 +32,22 @@ internal sealed class GpuContext : IDisposable
         Device = device;
         Memory = new GpuMemory(instance, device);
 
+        if (device.HasDedicatedTransfer)
+        {
+            QueueFamilies = [device.QueueFamily, device.TransferQueueFamily];
+            SharingMode = VkSharingMode.Concurrent;
+        }
+        else
+        {
+            QueueFamilies = null;
+            SharingMode = VkSharingMode.Exclusive;
+        }
+
         for (var i = 0; i < pendingReleases.Length; i++)
             pendingReleases[i] = new List<Action>();
 
         Uploads = new UploadQueue(this);
+        Transfer = new TransferSystem(this);
         Transient = new TransientAllocator(this);
         Bindless = new BindlessDescriptors(this);
     }
@@ -54,6 +74,7 @@ internal sealed class GpuContext : IDisposable
             destroy();
 
         Uploads.BeginFrame(slot);
+        Transfer.BeginFrame(slot);
         Transient.BeginFrame(slot);
     }
 
@@ -63,6 +84,9 @@ internal sealed class GpuContext : IDisposable
 
         Bindless?.Dispose();
         Bindless = null;
+
+        Transfer?.Dispose();
+        Transfer = null;
 
         Uploads?.Dispose();
         Uploads = null;

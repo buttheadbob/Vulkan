@@ -39,6 +39,11 @@ public float4 sampleTexture(uint texture, SamplerSlot sampler, float2 uv)
     return textures[NonUniformResourceIndex(texture)].Sample(samplers[uint(sampler)], uv);
 }
 
+public float4 sampleTextureLevel(uint texture, SamplerSlot sampler, float2 uv, float level)
+{
+    return textures[NonUniformResourceIndex(texture)].SampleLevel(samplers[uint(sampler)], uv, level);
+}
+
 public float4 sampleCube(uint texture, SamplerSlot sampler, float3 direction, float level)
 {
     return cubeTextures[NonUniformResourceIndex(texture)].SampleLevel(samplers[uint(sampler)], direction, level);
