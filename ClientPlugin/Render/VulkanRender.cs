@@ -53,8 +53,6 @@ public sealed class VulkanRender : IMyRender
     private VkFormat compositeFormat;
     private GpuBuffer renderSettingsBuffer;
     private int renderSettingsDirty;
-    private string environmentStatus = "";
-    private bool reportedCharacterTransforms;
     private ModelCache models;
     private InstanceBuffers instanceBuffers;
     private ModelPass modelPass;
@@ -71,30 +69,17 @@ public sealed class VulkanRender : IMyRender
     private bool reportedDebugLookAt;
     private SceneActor debugTarget;
     private Vector3D debugTargetCenter;
-    private string postprocessStatus = "";
     private MyEnvironmentData environment;
     private bool hasEnvironment;
-    private int sceneFrameCounter;
     private int lastDrawnActors;
     private int reportedModelChanges;
     private int lastCulledActors;
 
-    // CPU stage timing, averaged for the 5 s diagnostics log.
-    private double cpuMessagesMs;
-    private double cpuUploadsMs;
-    private double cpuGuiMs;
     private double lastMessagesMs;
     private double lastUploadsMs;
     private double lastGuiMs;
     private long frameAllocStart;
-    private long loggedAllocBytes;
-    private int loggedFrames;
-    private TimeSpan loggedGcPause;
-    private int loggedGc0;
-    private int loggedGc1;
-    private int loggedGc2;
     private MyNewLoddingSettings loddingSettings = new();
-    private readonly HashSet<MyRenderMessageEnum> reported = new();
     private readonly Stopwatch frameClock = Stopwatch.StartNew();
     private readonly Stopwatch frameLimitClock = Stopwatch.StartNew();
     private double nextFrameTime;
@@ -471,7 +456,6 @@ public sealed class VulkanRender : IMyRender
         instanceBuffers.ProcessPending();
         ApplyDebugCamera();
         lastMessagesMs = Ms(stageStart);
-        cpuMessagesMs = Mix(cpuMessagesMs, lastMessagesMs);
 
         stageStart = Stopwatch.GetTimestamp();
 
@@ -484,7 +468,6 @@ public sealed class VulkanRender : IMyRender
         var transferValue = gpu.Transfer.Submit(commands);
         gpu.Uploads.Record(commands);
         lastUploadsMs = Ms(stageStart);
-        cpuUploadsMs = Mix(cpuUploadsMs, lastUploadsMs);
         stageStart = Stopwatch.GetTimestamp();
         gui.RecordOffscreen(commands);
         if (drawScene)
@@ -519,15 +502,12 @@ public sealed class VulkanRender : IMyRender
         gui.RecordTextLayout(commands);
         RecordFrame(commands);
         lastGuiMs = Ms(stageStart);
-        cpuGuiMs = Mix(cpuGuiMs, lastGuiMs);
         frameLoop.EndFrame(transferValue, gpu.Transfer.Timeline);
         var workMs = (Stopwatch.GetTimestamp() - workStart) * 1000.0 / Stopwatch.Frequency;
         rawFrameMilliseconds = workMs;
         frameMilliseconds = frameMilliseconds * 0.9 + workMs * 0.1;
 
         var allocBytes = GC.GetAllocatedBytesForCurrentThread() - frameAllocStart;
-        loggedAllocBytes += allocBytes;
-        loggedFrames++;
         if (workMs > 20)
         {
             RenderLog.Warning($"Frame hitch {workMs:0.0} ms: msg {lastMessagesMs:0.0}, upload {lastUploadsMs:0.0}, " +
@@ -541,9 +521,6 @@ public sealed class VulkanRender : IMyRender
 
     private static double Ms(long start) =>
         (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
-
-    private static double Mix(double average, double value) =>
-        average == 0 ? value : average * 0.9 + value * 0.1;
 
     private void LimitFrameRate()
     {
@@ -729,36 +706,6 @@ public sealed class VulkanRender : IMyRender
             sceneTargets.OitRevealLayout = VkImageLayout.ShaderReadOnlyOptimal;
         }
 
-        if (++sceneFrameCounter % 300 == 0)
-        {
-            var gpuCounters = modelPass.Diagnostics;
-            RenderLog.Info($"Scene: {actors.Count} actors ({actors.InstancedCount} instanced, {actors.Skinned.Count} skinned), " +
-                           $"{lastDrawnActors} direct draws ({lastCulledActors} culled), " +
-                           $"gpu culled {gpuCounters.CulledActors} visible {gpuCounters.VisibleActors}, " +
-                           $"gpu {modelPass.GpuPartCount} parts, " +
-                           $"{sceneLights.LastCount} lights, " +
-                           $"instance buffers {instanceBuffers.Count} ({instanceBuffers.TotalInstances} instances), " +
-                           $"camera {camera.HasValue}, environment {hasEnvironment}");
-
-            var gcPause = GC.GetTotalPauseDuration();
-            var gc0 = GC.CollectionCount(0);
-            var gc1 = GC.CollectionCount(1);
-            var gc2 = GC.CollectionCount(2);
-            RenderLog.Info($"CPU ms (avg): frame {frameMilliseconds:0.00}, msg {cpuMessagesMs:0.00}, upload {cpuUploadsMs:0.00}, " +
-                           $"skin {modelPass.LastSkinningMs:0.00}, prepare {modelPass.LastPrepareMs:0.00} " +
-                           $"(cache {modelPass.LastEnsureMs:0.00}, actors {modelPass.LastActorLoopMs:0.00}), " +
-                           $"record {modelPass.LastRecordMs:0.00}, transparent {modelPass.LastTransparentMs:0.00}, gui {cpuGuiMs:0.00}; " +
-                           $"alloc {(loggedFrames > 0 ? loggedAllocBytes / 1024.0 / loggedFrames : 0):0.0} KB/frame, " +
-                           $"gc {gc0}/{gc1}/{gc2} (+{gc0 - loggedGc0}/{gc1 - loggedGc1}/{gc2 - loggedGc2}), " +
-                           $"pause +{(gcPause - loggedGcPause).TotalMilliseconds:0.0} ms");
-            loggedAllocBytes = 0;
-            loggedFrames = 0;
-            loggedGcPause = gcPause;
-            loggedGc0 = gc0;
-            loggedGc1 = gc1;
-            loggedGc2 = gc2;
-        }
-
         frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
             VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal,
             VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
@@ -812,15 +759,6 @@ public sealed class VulkanRender : IMyRender
         var iblSlot = TextureCache.CubeSlotOf(iblEntry);
         var iblMips = TextureCache.MipLevelsOf(iblEntry);
         var brdfSlot = TextureCache.SlotOf(brdf);
-
-        var status = $"skybox {skyboxEntry?.Status.ToString() ?? "none"} (slot {skyboxSlot}), " +
-                     $"IBL {iblEntry?.Status.ToString() ?? "none"} (slot {iblSlot}, {iblMips} mips), " +
-                     $"BRDF {brdf?.Status.ToString() ?? "none"} (slot {brdfSlot})";
-        if (status != environmentStatus)
-        {
-            environmentStatus = status;
-            RenderLog.Info($"Environment textures: {status}");
-        }
 
         var constants = camera.BuildFrameConstants(environment, skyboxSlot, iblSlot, brdfSlot, iblMips);
         constants.EmissiveScale = postprocessSettings.Data.BloomEmissiveness;
@@ -979,7 +917,6 @@ public sealed class VulkanRender : IMyRender
                 var kind = TextureKindOf(m.TextureType);
                 foreach (var file in m.Files)
                     textures.Get(NormalizeAssetPath(file), waitTillLoaded: false, kind);
-                RenderLog.Info($"Preload: {m.Files.Count} textures as {kind}");
                 break;
             }
 
@@ -988,7 +925,6 @@ public sealed class VulkanRender : IMyRender
                 var m = (MyRenderMessagePreloadModels)message;
                 foreach (var model in m.Models)
                     models?.StartLoading(model);
-                RenderLog.Info($"Preload: {m.Models.Count} models");
                 break;
             }
 
@@ -1006,16 +942,7 @@ public sealed class VulkanRender : IMyRender
 
             case MyRenderMessageEnum.UpdatePostprocessSettings:
             {
-                var m = (MyRenderMessageUpdatePostprocessSettings)message;
-                postprocessSettings = m.Settings;
-                var d = m.Settings.Data;
-                var status = $"constant {d.ConstantLuminance}, exposure {d.LuminanceExposure}, white {d.WhitePoint}, " +
-                             $"bloom emissiveness {d.BloomEmissiveness}, eye adaptation {m.Settings.EnableEyeAdaptation}";
-                if (status != postprocessStatus)
-                {
-                    postprocessStatus = status;
-                    RenderLog.Info($"Postprocess: {status}");
-                }
+                postprocessSettings = ((MyRenderMessageUpdatePostprocessSettings)message).Settings;
                 break;
             }
 
@@ -1028,14 +955,9 @@ public sealed class VulkanRender : IMyRender
                 break;
 
             case MyRenderMessageEnum.UnloadTextures:
-            {
-                var m = (MyRenderMessageUnloadTextures)message;
-                var count = 0;
-                foreach (var file in m.Files)
-                    count += textures.Unload(NormalizeAssetPath(file));
-                RenderLog.Info($"UnloadTextures: {count} of {m.Files.Count} resolved");
+                foreach (var file in ((MyRenderMessageUnloadTextures)message).Files)
+                    textures.Unload(NormalizeAssetPath(file));
                 break;
-            }
 
             case MyRenderMessageEnum.DeprioritizeTextures:
                 // No streaming priority: all textures use one unified cache; nothing to do.
@@ -1091,24 +1013,14 @@ public sealed class VulkanRender : IMyRender
             case MyRenderMessageEnum.SetCameraViewMatrix:
             {
                 var m = (MyRenderMessageSetCameraViewMatrix)message;
-                if (!camera.HasValue)
-                    RenderLog.Info($"Camera: FOV {m.FOV}, near {m.NearPlane}, far {m.FarPlane}, position {m.CameraPosition}");
                 camera.Set(m, BackBufferResolution);
                 break;
             }
 
             case MyRenderMessageEnum.UpdateRenderEnvironment:
-            {
-                var data = ((MyRenderMessageUpdateRenderEnvironment)message).Data;
-                if (!hasEnvironment)
-                    RenderLog.Info($"Environment: sun direction {data.EnvironmentLight.SunLightDirection}, " +
-                                   $"color {data.EnvironmentLight.SunColorRaw}, diffuse {data.EnvironmentLight.SunDiffuseFactor}, " +
-                                   $"ambient diffuse {data.EnvironmentLight.AmbientDiffuseFactor}, forward {data.EnvironmentLight.AmbientForwardPass}, " +
-                                   $"skybox '{data.Skybox}'");
-                environment = data;
+                environment = ((MyRenderMessageUpdateRenderEnvironment)message).Data;
                 hasEnvironment = true;
                 break;
-            }
 
             case MyRenderMessageEnum.CreateRenderEntity:
             {
@@ -1140,12 +1052,6 @@ public sealed class VulkanRender : IMyRender
             case MyRenderMessageEnum.SetCharacterTransforms:
             {
                 var m = (MyRenderMessageSetCharacterTransforms)message;
-                if (!reportedCharacterTransforms)
-                {
-                    reportedCharacterTransforms = true;
-                    RenderLog.Info($"First SetCharacterTransforms: id {m.CharacterID}, " +
-                                   $"{m.BoneAbsoluteTransforms?.Length ?? 0} transforms");
-                }
                 actors.SetCharacterTransforms(m);
                 break;
             }
@@ -1221,13 +1127,6 @@ public sealed class VulkanRender : IMyRender
                 actors.SetInstanceBuffer((MyRenderMessageSetInstanceBuffer)message);
                 break;
 
-            // Not implemented yet; report each kind once so the log shows what a world still needs.
-            case MyRenderMessageEnum.VoxelCreate:
-            case MyRenderMessageEnum.CreateRenderVoxelMaterials:
-            case MyRenderMessageEnum.UpdateRenderVoxelMaterials:
-                ReportOnce(message.MessageType);
-                break;
-
             case MyRenderMessageEnum.CollectGarbage:
             {
                 var gcWatch = Stopwatch.StartNew();
@@ -1256,12 +1155,6 @@ public sealed class VulkanRender : IMyRender
             // Everything else is not implemented yet. Ignoring is safe: the message is
             // disposed by MessageQueueProcessor once its frame is done.
         }
-    }
-
-    private void ReportOnce(MyRenderMessageEnum type)
-    {
-        if (reported.Add(type))
-            RenderLog.Info($"Message {type} is not implemented yet, ignoring it");
     }
 
     #endregion

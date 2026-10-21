@@ -219,7 +219,6 @@ internal sealed class TextureCache : IDisposable
         var image = GpuImage.Create2D(context, (uint)width, (uint)height, mips, 1, format,
             VkImageUsageFlags.Sampled | VkImageUsageFlags.TransferDst | VkImageUsageFlags.TransferSrc | VkImageUsageFlags.ColorAttachment);
 
-        RenderLog.Info($"Generated texture: {name} {width}x{height} {type} mips {generateMipmaps} ready {immediatelyReady}");
         var entry = new Entry(name)
         {
             IsGenerated = true,

@@ -180,7 +180,7 @@ Temporary lighting diagnostics and the flip env flags were removed. No shadow wo
    MRT pass) so TAA/FSR/GI can build on it.
 5. Remaining Phase 2: voxel cells, static/merge groups, world sprites/particles; remaining Phase 1 odds: options
    presets.
-6. When flying away, watch the `LOD histogram` in the 5-second `Scene:` log line to confirm LOD switching.
+6. When flying away, watch the LOD histogram in the diagnostics overlay to confirm LOD switching.
 
 **User preferences / rules (all sessions):**
 - Never run git commands. The user commits and pushes.
@@ -1267,6 +1267,15 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   `/tmp/vk_shadowface_off.png` (shadows off). Build, shader check and `VulkanSmokeTest --shadow` pass. Remaining:
   replace the floor with the real dynamic probe, contact shadows/SSAO, LOD1+ verification and a shadow quality
   slider. No git operations.
+
+- **2026-10-21 (logging cleanup)** — Removed routine log spam: the 5 s `Scene:` and `CPU ms` summaries, per-model
+  `Model loaded` / `Runtime model added`, per-generated-texture lines, per-actor skinning and no-skeleton lines,
+  material-refresh and missing-ColorMetal lines, character skeleton/transform lines and preload counts. Also
+  removed the per-run `UnloadTextures`, unimplemented voxel-message, LCD-budget, first camera/environment/
+  postprocess/environment-texture and swapchain lines. Warnings and errors remain, including frame-hitch, slow
+  part-cache rebuild, slow texture upload and failed-load reports; the diagnostics overlay carries the frame/CPU/
+  LOD data that the removed periodic lines duplicated. Build is clean and autoload runs produced no
+  removed-category lines. The `ntsync`/`LinuxCompat` lines in the game log come from the platform, not the renderer.
 
 - **2026-10-21 (cascade coverage)** — The remaining diagonal/diamond that cut across the long red blocks was the
   **shadow cascade coverage**, not the hull shadow: the 15/40/110 m light-space extents were smaller than the camera

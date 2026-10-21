@@ -192,7 +192,6 @@ internal sealed unsafe class ModelPass : IDisposable
     private readonly Matrix[] shadowViewProjections = new Matrix[ShadowMap.Count];
     private readonly List<SceneActor> directActors = new();
     private readonly List<TransparentDraw> transparentDraws = new();
-    private readonly HashSet<uint> reportedSkinning = new();
 
     private readonly List<CachedActor> cachedActors = new();
     private readonly List<GpuScenePart> cachedParts = new();
@@ -202,8 +201,6 @@ internal sealed unsafe class ModelPass : IDisposable
     private GpuSceneActor[] actorStates = [];
     private Matrix[] actorWorlds = [];
     private long instanceRevisionSeen = -1;
-    private static int reportedNullTextures;
-    private static int reportedLoadingTextures;
     private long materialTextureGeneration;
     private long allMaterialTargetGeneration;
     private bool allMaterialRefresh;
@@ -389,12 +386,7 @@ internal sealed unsafe class ModelPass : IDisposable
             if (skinTransforms == null || indexUInts == null || transforms == null || indexUInts.Length == 0)
             {
                 // Armor plates carry blend data but have no skeleton: they render from the static
-                // stream through the GPU path. Only complain about a model that really has SKINNED
-                // parts and is missing its skeleton.
-                if (lod.HasSkinnedParts && reportedSkinning.Add(actor.Id))
-                    RenderLog.Info($"Skinning: {model.Name} actor {actor.Id} has no skeleton data yet " +
-                                   $"(skin transforms {skinTransforms?.Length ?? 0}, " +
-                                   $"indices {indexUInts?.Length ?? 0}, transforms {transforms?.Length ?? 0})");
+                // stream through the GPU path.
                 continue;
             }
 
@@ -465,8 +457,6 @@ internal sealed unsafe class ModelPass : IDisposable
 
             actor.SkinnedVertexAddress = outputAllocation.Address;
             any = true;
-            if (reportedSkinning.Add(actor.Id))
-                RenderLog.Info($"Skinning: {model.Name} actor {actor.Id}, {lod.VertexCount} vertices, {indexCount} bones");
         }
 
         if (!any)
@@ -612,12 +602,6 @@ internal sealed unsafe class ModelPass : IDisposable
     {
         ResolveTextures(actor, part, out var cm, out var ng, out var ext, out var alpha);
 
-        if (cm == null && !string.IsNullOrEmpty(part.MaterialName) && reportedNullTextures++ < 20)
-            RenderLog.Info($"No ColorMetal for {actor.Model} part '{part.MaterialName}' (actor {actor.Id})");
-        else if (cm != null && TextureCache.SlotOf(cm) == (uint)BindlessDescriptors.TextureSlot.Transparent &&
-                 reportedLoadingTextures++ < 20)
-            RenderLog.Info($"ColorMetal still loading for {actor.Model} part '{part.MaterialName}': {cm.Path}");
-
         var material = BuildMaterial(actor, part, lod, instanced, cm, ng, ext, alpha,
             (materialFlags & RenderFlags.MetalnessColorable) != 0);
 
@@ -731,7 +715,6 @@ internal sealed unsafe class ModelPass : IDisposable
             allMaterialRefresh = true;
             allMaterialRefreshIndex = 0;
             allMaterialTargetGeneration = textures.ReadyGeneration;
-            RenderLog.Info($"Material texture refresh start: generation {allMaterialTargetGeneration}, {cachedActors.Count} cached actors");
         }
 
         if (allMaterialRefresh)
@@ -747,7 +730,6 @@ internal sealed unsafe class ModelPass : IDisposable
                 allMaterialRefresh = false;
                 allMaterialRefreshIndex = 0;
                 materialTextureGeneration = allMaterialTargetGeneration;
-                RenderLog.Info($"Material texture refresh done: generation {materialTextureGeneration}");
             }
         }
 

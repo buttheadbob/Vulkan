@@ -85,7 +85,6 @@ internal sealed unsafe class VulkanSwapchain : IDisposable
         Extent = extent;
         CreateImageResources();
 
-        RenderLog.Info($"Swapchain {extent.width}x{extent.height}, {Images.Length} images, {format}, {presentMode}");
     }
 
     private (VkFormat, VkColorSpaceKHR) ChooseFormat()

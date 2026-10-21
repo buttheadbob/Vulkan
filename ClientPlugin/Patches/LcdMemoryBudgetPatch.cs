@@ -25,6 +25,5 @@ internal static class LcdMemoryBudgetPatch
         }
 
         field.SetValue(__instance, Budget);
-        RenderLog.Info($"LCD generated-texture budget: {Budget / (1UL << 20)} MiB");
     }
 }

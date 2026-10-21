@@ -593,8 +593,6 @@ internal sealed class SceneActors
                 ? (uint)actor.SkeletonIndices[i]
                 : uint.MaxValue;
 
-        RenderLog.Info($"Character skeleton {message.CharacterID}: {actor.SkeletonBones.Length} bones, " +
-                       $"{actor.SkeletonIndices.Length} skin indices");
         if (!skinned.Contains(actor))
             skinned.Add(actor);
 
@@ -624,8 +622,6 @@ internal sealed class SceneActors
         if (first)
             actor.BoneTransforms = new Matrix[source.Length];
         Array.Copy(source, actor.BoneTransforms, source.Length);
-        if (first)
-            RenderLog.Info($"Character transforms {message.CharacterID}: {source.Length} bone transforms per frame");
     }
 
     public void SetInstanceBuffer(MyRenderMessageSetInstanceBuffer message)

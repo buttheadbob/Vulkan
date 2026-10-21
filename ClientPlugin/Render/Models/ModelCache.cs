@@ -256,18 +256,6 @@ internal sealed class ModelCache : IDisposable
         model.Entry.State = LoadState.Ready;
         version++;
 
-        var gpu = model.Gpu;
-        var distances = gpu.LodDistances.Length > 0 ? ", switch at " + string.Join(", ", gpu.LodDistances) : "";
-        var transparent = new List<string>();
-        foreach (var part in gpu.Lods[0].Parts)
-        {
-            if (part.Transparent != null)
-                transparent.Add(part.MaterialName + " -> " + part.Transparent.Id.String);
-        }
-
-        var skinned = gpu.Lods[0].Skinned ? $", skinned {gpu.Lods[0].VertexStride} B/vertex" : "";
-        RenderLog.Info($"Model loaded: {gpu.Name} ({gpu.LodCount} LODs, LOD0 {gpu.Lods[0].Parts.Length} parts{distances}{skinned})" +
-                       (transparent.Count > 0 ? "; transparent: " + string.Join(", ", transparent) : ""));
     }
 
     private void Load(Entry entry)
@@ -618,9 +606,6 @@ internal sealed class ModelCache : IDisposable
                 aliases[message.ReplacedModel] = gpu;
         }
 
-        RenderLog.Info($"Runtime model added: {message.Name} ({count} vertices, {indices.Length / 3} triangles, " +
-                       $"{parts.Count} sections" +
-                       (string.IsNullOrEmpty(message.ReplacedModel) ? "" : $", replaces {message.ReplacedModel}") + ")");
     }
 
     private MwmPartData ResolveRuntimeMaterial(string name)
