@@ -762,7 +762,7 @@ public sealed class VulkanRender : IMyRender
 
         var constants = camera.BuildFrameConstants(environment, skyboxSlot, iblSlot, brdfSlot, iblMips);
         constants.EmissiveScale = postprocessSettings.Data.BloomEmissiveness;
-        var lightData = sceneLights.Build(gpu, camera.Position);
+        var lightData = sceneLights.Build(gpu, camera.Position, actors);
         constants.Lights = lightData.Address;
         constants.LightCount = lightData.Count;
         constants.ShadowParams = new Vector4(1f, 0.00005f, 1f, 4f);
@@ -1069,8 +1069,12 @@ public sealed class VulkanRender : IMyRender
                 break;
 
             case MyRenderMessageEnum.SetParentCullObject:
-                actors.SetParentCullObject((MyRenderMessageSetParentCullObject)message);
+            {
+                var m = (MyRenderMessageSetParentCullObject)message;
+                sceneLights.SetParent(m.ID, m.CullObjectID);
+                actors.SetParentCullObject(m);
                 break;
+            }
 
             case MyRenderMessageEnum.UpdateRenderObject:
                 actors.Update((MyRenderMessageUpdateRenderObject)message);
@@ -1142,6 +1146,7 @@ public sealed class VulkanRender : IMyRender
                 var id = ((MyRenderMessageRemoveRenderObject)message).ID;
                 actors.Remove(id);
                 instanceBuffers.Remove(id);
+                sceneLights.Remove(id);
                 var type = MyRenderProxy.GetObjectType(id);
                 if (type != MyRenderProxy.ObjectType.Invalid)
                     MyRenderProxy.RemoveMessageId(id, type);

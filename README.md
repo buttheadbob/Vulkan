@@ -16,15 +16,17 @@ Implemented and verified in game:
   are stored but not drawn yet).
 - Pure alpha-masked and transparent materials, weighted OIT, GPU skinning.
 - Stock material/color pipeline with colorization: block paints and skins work (`ColorMaskHSV` is a
-  paint delta plus the stock `ColorizeHSV` conversion); per-vertex tangent normal mapping (derivative
-  fallback), face-normal lighting on beveled panels (the normal map supplies gloss only, and shadow
-  offset/bias use the face normal), an ambient floor standing in for the missing dynamic probe, and
-  Toksvig gloss are in place.
+  paint delta plus the stock `ColorizeHSV` conversion, using the shipped sRGB/HSV `ColorizeGray` path);
+  per-vertex tangent normal mapping (derivative fallback), face-normal lighting on beveled panels (the
+  normal map supplies gloss only, and shadow offset/bias use the face normal), an ambient floor standing
+  in for the missing dynamic probe, and Toksvig gloss are in place.
 - Cube instance buffers (generic instance buffers are stored but not drawn yet), per-actor LOD
   selection, frustum/view-distance culling.
 - GPU-driven opaque rendering: persistent part/material/LOD ranges, GPU LOD selection with stock
   hysteresis, indirect cull/no-cull buckets, including instanced cubes and static groups.
-- Static skybox IBL, dynamic point/spot lights, offscreen LCD/cockpit screens.
+- Static skybox IBL, dynamic point/spot lights, offscreen LCD/cockpit screens. Lights honor per-light
+  color/intensity, range, falloff, gloss/diffuse factors and spot aperture; block-local light transforms are
+  applied through their parent cull object and the nearest 64 are uploaded each frame.
 - Auto-exposure from the game's postprocess settings, Hable tonemapping, first HDR bloom pass, and
   live lighting/exposure/bloom sliders. Slider values are GPU-resident and updated only when changed.
 - Opt-in cascaded sun shadows: three 2048² reverse-Z maps (15/40/150 m splits, 23/55/200 m light-space extents
@@ -85,7 +87,7 @@ validation, frame limit, diagnostics overlay, sun shadows and lighting/exposure/
 For automated visual checks, the renderer supports `VULKAN_AUTOLOAD=<seconds>`,
 `VULKAN_SCREENSHOT=/path.png`, `VULKAN_SCREENSHOT_DELAY=<seconds>` and a long-duration test
 notification via `VULKAN_NOTIFICATION=<text>` with optional `VULKAN_NOTIFICATION_MS` (default 60000).
-Shadows: `VULKAN_SHADOWS=1` (`0` forces off for tests); debug views: `VULKAN_DEBUG_VIEW=6` (shadow factor) or `9` (raw cascade 0);
+Shadows: `VULKAN_SHADOWS=1` (`0` forces off for tests); debug views: `VULKAN_DEBUG_VIEW=6` (shadow factor), `7` (dynamic-light contribution), `8` (light count) or `9` (raw cascade 0);
 camera: `VULKAN_DEBUG_LOOKAT=<model|*>`, `VULKAN_DEBUG_DARK=1`, `VULKAN_DEBUG_TOP=1`,
 `VULKAN_DEBUG_DISTANCE=<m>`; stock reference capture: `VULKAN_STOCK_SCREENSHOT=/path.png`.
 See the roadmap.

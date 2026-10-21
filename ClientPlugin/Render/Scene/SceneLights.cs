@@ -25,72 +25,90 @@ internal sealed class SceneLights
     public const int MaxLights = 64;
 
     private readonly Dictionary<uint, UpdateRenderLightData> lights = new();
+    private readonly Dictionary<uint, uint> parents = new();
 
     public int LastCount { get; private set; }
 
     public void Create(uint id) => lights.TryAdd(id, default);
 
+    public void SetParent(uint id, uint parentId) => parents[id] = parentId;
+
+    public void Remove(uint id)
+    {
+        lights.Remove(id);
+        parents.Remove(id);
+    }
+
     public void Update(UpdateRenderLightData data) => lights[data.ID] = data;
 
-    public (ulong Address, uint Count) Build(GpuContext context, Vector3D cameraPosition)
+    public (ulong Address, uint Count) Build(GpuContext context, Vector3D cameraPosition, SceneActors actors)
     {
-        var candidates = 0;
+        var candidates = new List<(float Distance, GpuLight Light)>(lights.Count * 2);
         foreach (var data in lights.Values)
         {
+            var forward = data.SpotLight.Direction;
+            if (forward.LengthSquared() < 1e-8f)
+                forward = -Vector3.Forward;
+
+            var parentWorld = MatrixD.Identity;
+            if (parents.TryGetValue(data.ID, out var parentId) && parentId != 0)
+            {
+                var parent = actors.Find(parentId);
+                if (parent != null)
+                    parentWorld = actors.GetWorldMatrix(parent);
+            }
+
+            var pointLocal = data.Position + (Vector3D)forward * data.PointOffset;
+            var pointPosition = parentWorld == MatrixD.Identity
+                ? pointLocal
+                : Vector3D.Transform(pointLocal, parentWorld);
+            var spotPosition = parentWorld == MatrixD.Identity
+                ? data.Position
+                : Vector3D.Transform(data.Position, parentWorld);
+            var spotDirection = parentWorld == MatrixD.Identity
+                ? forward
+                : Vector3.TransformNormal(forward, parentWorld);
+
+            var pointDistance = (float)(pointPosition - cameraPosition).Length();
+            var spotDistance = (float)(spotPosition - cameraPosition).Length();
+
             if (data.PointLightOn && data.PointLight.Range > 0.01f)
-                candidates++;
+            {
+                var light = data.PointLight;
+                candidates.Add((pointDistance, new GpuLight
+                {
+                    PositionRange = new Vector4((Vector3)(pointPosition - cameraPosition), light.Range),
+                    ColorFalloff = new Vector4(light.Color, ConvertFalloff(light.Falloff)),
+                    Params = new Vector4(light.GlossFactor, light.DiffuseFactor, 0f, 0f),
+                    Direction = Vector4.Zero,
+                }));
+            }
+
             if (data.SpotLightOn && data.SpotLight.Light.Range > 0.01f)
-                candidates++;
+            {
+                var light = data.SpotLight.Light;
+                candidates.Add((spotDistance, new GpuLight
+                {
+                    PositionRange = new Vector4((Vector3)(spotPosition - cameraPosition), light.Range),
+                    ColorFalloff = new Vector4(light.Color, ConvertFalloff(light.Falloff)),
+                    Params = new Vector4(light.GlossFactor, light.DiffuseFactor,
+                        data.SpotLight.ApertureCos, 1f),
+                    Direction = new Vector4(spotDirection, 0f),
+                }));
+            }
         }
 
-        var count = Math.Min(candidates, MaxLights);
+        candidates.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+        var count = Math.Min(candidates.Count, MaxLights);
         LastCount = count;
         if (count == 0)
             return (0, 0);
 
         var allocation = context.Transient.Allocate<GpuLight>(count);
         var output = allocation.AsSpan<GpuLight>(count);
-        var write = 0;
-
-        foreach (var data in lights.Values)
-        {
-            if (write >= count)
-                break;
-
-            var position = (Vector3)(data.Position - cameraPosition);
-            if (data.PointLightOn && data.PointLight.Range > 0.01f)
-            {
-                var light = data.PointLight;
-                var falloff = ConvertFalloff(light.Falloff);
-                output[write++] = new GpuLight
-                {
-                    PositionRange = new Vector4(position, light.Range),
-                    ColorFalloff = new Vector4(light.Color, falloff),
-                    Params = new Vector4(light.GlossFactor, light.DiffuseFactor, 0f, 0f),
-                    Direction = Vector4.Zero,
-                };
-            }
-
-            if (write >= count)
-                break;
-
-            if (data.SpotLightOn && data.SpotLight.Light.Range > 0.01f)
-            {
-                var light = data.SpotLight.Light;
-                var falloff = ConvertFalloff(light.Falloff);
-                output[write++] = new GpuLight
-                {
-                    PositionRange = new Vector4(position, light.Range),
-                    ColorFalloff = new Vector4(light.Color, falloff),
-                    Params = new Vector4(light.GlossFactor, light.DiffuseFactor,
-                        data.SpotLight.ApertureCos, 1f),
-                    Direction = new Vector4(data.SpotLight.Direction, 0f),
-                };
-            }
-        }
-
-        LastCount = write;
-        return (allocation.Address, (uint)write);
+        for (var i = 0; i < count; i++)
+            output[i] = candidates[i].Light;
+        return (allocation.Address, (uint)count);
     }
 
     // MyLightComponent.UpdateData: falloff = 1 / (0.001 + (falloff / 1.5)^3)

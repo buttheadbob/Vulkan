@@ -47,9 +47,10 @@ one indirect command + per-draw data per part into cull/no-cull buckets. The CPU
 2 indirect). Instanced cube actors use the same buckets (the command carries the instance count and the draw data
 carries the instance pointer/range). Skinned actors and transparent parts keep the direct/OIT paths. **OIT is implemented**: transparent parts render order-independently into RGBA16F accumulation +
 R16F revealage targets (depth read-only), and the composite resolves them over the opaque HDR color; the CPU sort is
-gone. **Dynamic point/spot lights are implemented**: `CreateRenderLight`/`UpdateRenderLight` feed a bounded (64)
-camera-relative light buffer; the forward shader applies the stock attenuation/cone formulas and gloss/diffuse
-factors. `AddRuntimeModel` (mod runtime meshes, material lookup by name, replacement alias), `UnloadTextures` and
+gone. **Dynamic point/spot lights are implemented**: `CreateRenderLight`/`UpdateRenderLight` feed the 64 nearest
+camera-relative lights; block-local positions and directions are transformed through the parent cull object, and
+the forward shader applies each light's color/intensity, range, falloff, gloss/diffuse factors, point offset and
+spot cone. `AddRuntimeModel` (mod runtime meshes, material lookup by name, replacement alias), `UnloadTextures` and
 `DeprioritizeTextures` are handled too. **Exposure now follows the game's postprocess settings**: the constant/eye-
 adaptation formula from the shipped `CalculateExposure`, a sparse scene-luminance pass into a 1x1 exposure texture,
 Hable tonemapping with the world's white point, and world `BloomEmissiveness` (120 in the test world) multiplying
@@ -275,7 +276,7 @@ Pulsar client plugin, that:
 | Asset preload | `PreloadTextures`/`PreloadModel(s)`/`PreloadMaterials` start background decodes/parses immediately (mapping TextureType to the sampling kind), so GPU buffers/images are created during the loading screen rather than on first draw. Model texture dependencies also start when each model is parsed. `UnloadTextures` frees matching entries/slots (in-flight decodes are discarded) and `DeprioritizeTextures` is a no-op (no streaming priorities). `AddRuntimeModel` builds a one-LOD GPU mesh from `MyModelData`, resolves section material names through the model-material table, and registers the name (plus a `ReplacedModel` alias). |
 | Exposure / emissive | `UpdatePostprocessSettings` is cached. `Post/Exposure.slang` samples the HDR scene on a sparse grid, averages log-luminance, applies the shipped `CalculateExposure` (`LuminanceKeyValueCendos`) and writes a 1x1 R32F exposure texture; the composite samples it and applies Hable with the world's `WhitePoint`. The 0.025 calibration was removed (it made the world ~40x too dark); a user `ExposureScale` multiplier is applied and clamped to [0.02, 4]. Current default is 0.5, which is still too bright on the cockpit capture. Emissive radiance is `albedo * extras.y * Emissivity * BloomEmissiveness` (albedo already includes `1-metalness`); the test world uses `BloomEmissiveness=120`, which is what makes battery LEDs read in shadow. Full histogram eye adaptation, temporal smoothing and stock multi-scale bloom are still missing. |
 | LCD budget | Linux's platform renderer reports no generated-texture memory budget. `LcdMemoryBudgetPatch` sets `MySessionComponentPanels.m_memoryBudget` to 1 GiB after init; otherwise the panel manager's visible counter never reaches its threshold, `IsInRange` stays false, and every powered LCD keeps the default "Online" texture. |
-| Dynamic lights | `CreateRenderLight`/`UpdateRenderLight` are cached per ID. Each frame up to 64 point/spot lights are uploaded camera-relative (`GpuLight`, 64 B) through the transient allocator; `FrameConstants` carries the pointer/count. The game already multiplies intensity into the linear color; `MyLightComponent`'s falloff conversion and the stock hard/diffuse attenuation and spot cone are applied in `Model.slang`. Shadows, glare/flares and light culling (stock uses tiled forward) are not implemented. |
+| Dynamic lights | `CreateRenderLight`/`UpdateRenderLight` are cached per ID. Light positions, point offsets and spot directions are **block-local**, so `SetParentCullObject` supplies the parent cull object and the parent world matrix is applied before upload; this is the stock owner-world transform. Each frame the 64 nearest point/spot lights (by camera distance) are uploaded camera-relative (`GpuLight`, 64 B) through the transient allocator; `FrameConstants` carries the pointer/count. Per-light color (intensity already multiplied), range, falloff, gloss factor, diffuse factor and spot aperture are honored; the stock hard/diffuse attenuation and hard spot clip are applied, with the gloss factor feeding roughness and material AO. Never populated/zero-intensity lights contribute nothing. Shadows, glare/flares and stock tiled light culling are not implemented. |
 | Text / UI | **GPU text is implemented for the main target**: font atlas pages stay in the bindless array; a GPU font buffer holds codepoint→glyph metrics (cmap, advances, page/rect, kerning) uploaded once at font creation. `TextLayout.slang` shapes/lays out text from strings + style parameters into glyph `SpriteInstance` records (newlines, alignment, kerning; wrapping is not yet in the shader) and the sprite pipeline draws them. The CPU uploads run descriptions and strings each frame (per-frame caching is not implemented yet). HUD, chat, notifications and the diagnostics overlay all use this path; the diagnostics panel/graph rectangles and 60 s history sampling are CPU-side, its text is GPU. Offscreen LCD text keeps the CPU `RenderFont.DrawString` fallback; complex-script shaping is out of scope. |
 | Git | The user does all git operations. Sessions never run git commands. |
 
@@ -1276,6 +1277,18 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   part-cache rebuild, slow texture upload and failed-load reports; the diagnostics overlay carries the frame/CPU/
   LOD data that the removed periodic lines duplicated. Build is clean and autoload runs produced no
   removed-category lines. The `ntsync`/`LinuxCompat` lines in the game log come from the platform, not the renderer.
+
+- **2026-10-21 (dynamic lights and colors)** — Fixed two user-visible gaps against vanilla. Gray armor was rendering
+  red because `colorizeGray` was a non-stock HSV variant; it now uses the shipped `ColorizeGray` path (sRGB round-
+  trip, hue zeroed, mask added, then lerped by the extensions coloring factor), so gray/yellow/red match stock.
+  Dynamic lights were using the message's block-local `Position`/direction directly and therefore landed far from
+  the camera. `SetParentCullObject` is now recorded for light IDs, the parent cull object's world matrix transforms
+  positions and directions, `PointLightOffset` is applied along the light direction, and the nearest 64 point/spot
+  lights are uploaded. The shader now honors each light's color/intensity, range, falloff, gloss/diffuse factors and
+  spot aperture (hard stock cone clip), uses the gloss factor in roughness, applies AO, and keeps diffuse attenuation
+  separate from specular. Verified the room is lit with correct colors in `/tmp/vk_lights_parent.png` (stock colors
+  in `/tmp/vk_color_stockfix.png`); build is clean. Remaining: stock tiled light culling, spot shadows/glare and
+  per-light shadow support.
 
 - **2026-10-21 (cascade coverage)** — The remaining diagonal/diamond that cut across the long red blocks was the
   **shadow cascade coverage**, not the hull shadow: the 15/40/110 m light-space extents were smaller than the camera

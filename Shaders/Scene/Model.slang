@@ -164,27 +164,26 @@ float3 rgbToHsv(float3 rgb)
     return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
 }
 
-// Geometry/Materials/PixelUtilsMaterials.hlsli ColorizeGray. Stock operates on the linear
-// texel and adds the paint-mask HSV directly; converting to sRGB first shifts both hue and value.
+float3 srgbToRgb(float3 srgb)
+{
+    return lerp(srgb / 12.92, pow((abs(srgb) + 0.055) / 1.055, 2.4), step(0.04045, srgb));
+}
+
+float3 rgbToSrgb(float3 rgb)
+{
+    return lerp(rgb * 12.92, pow(abs(rgb), 1.0 / 2.4) * 1.055 - 0.055, step(0.0031308, rgb));
+}
+
+// Geometry/Materials/PixelUtilsMaterials.hlsli ColorizeGray.
 float3 colorizeGray(float3 texel, float3 hsvmask, float coloring)
 {
     if (coloring <= 0.0)
         return texel;
 
-    float3 coloringc = hsvToRgb(float3(hsvmask.x, 1.0, 1.0));
-    float3 hsv = rgbToHsv(lerp(texel, texel * coloringc, coloring));
-    hsv.x = 0.0;
-
-    float3 fhsv = hsv + hsvmask * float3(1.0, 1.0, 0.5);
-    fhsv.x = frac(fhsv.x);
-
-    float gray2 = 1.0 - saturate((hsvmask.y + 1.0) / 0.1);
-    fhsv.yz = lerp(saturate(fhsv.yz), saturate(hsv.yz + hsvmask.yz), gray2);
-
-    float gray3 = 1.0 - saturate((hsvmask.y + 0.9) / 0.1);
-    fhsv.y = lerp(saturate(fhsv.y), saturate(hsv.y + hsvmask.y), gray3);
-
-    return lerp(texel, hsvToRgb(fhsv), coloring);
+    float3 hsv = rgbToHsv(rgbToSrgb(texel));
+    hsv.xy = 0;
+    float3 finalHsv = saturate(hsv + hsvmask);
+    return lerp(texel, srgbToRgb(hsvToRgb(finalHsv)), coloring);
 }
 
 struct VertexOutput
@@ -638,6 +637,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
     // Dynamic point/spot lights. The game's light component already multiplies intensity into the
     // linear color; falloff is the converted polynomial from MyLightComponent.
+    float3 dynamicLight = 0.0;
     if (push.frame.lightCount != 0)
     {
         GpuLight* lights = push.frame.lights;
@@ -659,11 +659,14 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
 
             if (light.params.w > 0.5)
             {
-                // Stock LightSpot.hlsl: clip when -dot(L, direction) < apertureCos
-                float cosAngle = -dot(L, normalize(light.direction.xyz));
-                float cone = saturate((cosAngle - light.params.z) / max(1.0 - light.params.z, 1e-3));
-                cone = cone * cone * (3.0 - 2.0 * cone);
-                attenuationHard *= cone;
+                // Stock LightSpot.hlsl: clip when -dot(L, direction) < apertureCos.
+                float3 spotDirection = light.direction.xyz;
+                float directionLength = length(spotDirection);
+                if (directionLength < 1e-5)
+                    continue;
+                float cosAngle = -dot(L, spotDirection / directionLength);
+                if (cosAngle < light.params.z)
+                    continue;
             }
 
             float nolLight = saturate(dot(faceNormal, L));
@@ -673,17 +676,20 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
             float3 halfLight = normalize(L + toCamera);
             float nohLight = saturate(dot(n, halfLight));
             float vohLight = saturate(dot(toCamera, halfLight));
-            float specularLight = distributionGGX(nohLight, alpha) *
-                                  visibilitySmithGGX(nov, nolLight, alpha);
+            float lightGloss = saturate(gloss * light.params.x);
+            float lightRoughness = max(1.0 - lightGloss, 0.04);
+            float lightAlpha = lightRoughness * lightRoughness;
+            float specularLight = distributionGGX(nohLight, lightAlpha) *
+                                  visibilitySmithGGX(nov, nolLight, lightAlpha);
             float3 fresnelLight = fresnelSchlick(f0, vohLight);
 
-            float3 lightColor = light.colorFalloff.rgb * attenuationHard * attenuationDiffuse * renderSettings[0].tuning1.y;
-            float3 lightDiffuse = albedo * (nolLight / PI) * light.params.y * lightColor;
-            float3 lightSpecular = fresnelLight * specularLight * nolLight *
-                                   light.params.x * lightColor;
-            direct += lightDiffuse + lightSpecular;
+            float3 lightColor = light.colorFalloff.rgb * attenuationHard * ao * renderSettings[0].tuning1.y;
+            float3 lightDiffuse = albedo * (nolLight / PI) * light.params.y * attenuationDiffuse * lightColor;
+            float3 lightSpecular = fresnelLight * specularLight * nolLight * lightColor;
+            dynamicLight += lightDiffuse + lightSpecular;
         }
     }
+    direct += dynamicLight;
 
     // Stock: shaded += albedo * emissive * BloomEmissiveness. LCD screen materials use the
     // ScreenArea_add/CockpitScreen_add emissive channel, so the display does not depend on scene
@@ -721,5 +727,9 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         return float4(albedo, 1.0);
     if (debugView == 6)
         return float4(shadowFactor.xxx, 1.0);
+    if (debugView == 7)
+        return float4(saturate(dynamicLight * 10.0), 1.0);
+    if (debugView == 8)
+        return float4((float)push.frame.lightCount / 64.0, (float)push.frame.lightCount / 64.0, 0.0, 1.0);
     return float4(direct + ambient + ambientSpecular + emissiveColor, 1.0);
 }
