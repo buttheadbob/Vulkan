@@ -16,8 +16,10 @@ Implemented and verified in game:
   are stored but not drawn yet).
 - Pure alpha-masked and transparent materials, weighted OIT, GPU skinning.
 - Stock material/color pipeline with colorization: block paints and skins work (`ColorMaskHSV` is a
-  paint delta plus the stock `ColorizeHSV` conversion); derivative tangent normal mapping and Toksvig
-  gloss are in place.
+  paint delta plus the stock `ColorizeHSV` conversion); per-vertex tangent normal mapping (derivative
+  fallback), face-normal lighting on beveled panels (the normal map supplies gloss only, and shadow
+  offset/bias use the face normal), an ambient floor standing in for the missing dynamic probe, and
+  Toksvig gloss are in place.
 - Cube instance buffers (generic instance buffers are stored but not drawn yet), per-actor LOD
   selection, frustum/view-distance culling.
 - GPU-driven opaque rendering: persistent part/material/LOD ranges, GPU LOD selection with stock
@@ -25,6 +27,15 @@ Implemented and verified in game:
 - Static skybox IBL, dynamic point/spot lights, offscreen LCD/cockpit screens.
 - Auto-exposure from the game's postprocess settings, Hable tonemapping, first HDR bloom pass, and
   live lighting/exposure/bloom sliders. Slider values are GPU-resident and updated only when changed.
+- Opt-in cascaded sun shadows: three 2048² reverse-Z maps (15/40/150 m splits, 23/55/200 m light-space extents
+  sized to cover the view frustum), 16-tap Poisson PCF with bilinear depth, face-normal offset/bias, alpha-tested
+  casters and back-face culling. Shadow casters
+  come from a separate **LOD0 bucket**, so a ship switching to LOD1+ does not lose its shadows. Two-sided
+  lighting flips the camera-oriented face normal; the normal map supplies gloss only, so normal-map detail cannot
+  flicker the front/back boundary at grazing angles. Enable with **Graphics > Vulkan Renderer > Shadows** (restart required) or
+  `VULKAN_SHADOWS=1` (`VULKAN_SHADOWS=0` forces it off for tests). Validated on a test platform and the user's
+  close-up view; contact shadows/SSAO, LOD1+ visual verification and RT shadows
+  remain.
 - GPU text layout for HUD, chat, notifications and diagnostics; a 60 s diagnostics overlay with
   frame-generation time, GPU counts, GPU memory and a rolling graph; frame limits (30/60/120/240/unlimited).
 - Asynchronous asset uploads on a dedicated transfer queue (timeline semaphore), worker-side model GPU
@@ -33,8 +44,9 @@ Implemented and verified in game:
 
 Known rendering gaps (see the roadmap): exposure/specular/reflection calibration against stock and the
 missing dynamic scene probe (shadowed faces are too dark). `DECAL_CUTOUT` paneling/decals are now rendered;
-blended and projected decals are not. Still open: voxel cells/planets, shadows, dynamic environment probe,
-SSAO/GTAO, billboards/particles, TAA/FSR 3, HDR output, video playback, Windows test pass.
+blended and projected decals are not. Still open: voxel cells/planets, contact shadows/SSAO, LOD1+ shadow
+verification, the dynamic scene probe, skinned/transparent casters, SSAO/GTAO,
+billboards/particles, TAA/FSR 3, HDR output, video playback, Windows test pass.
 
 ## Requirements
 
@@ -67,13 +79,16 @@ cd ~/.local/share/PulsarRelease
 ```
 
 The plugin configuration is in `~/.config/SpaceEngineers/Storage/Vulkan.cfg` (renderer choice,
-validation, frame limit, diagnostics overlay, lighting/exposure/bloom tuning). The in-game
-**Graphics > Vulkan Renderer** screen edits the same settings.
+validation, frame limit, diagnostics overlay, sun shadows and lighting/exposure/bloom tuning). The in-game
+**Graphics > Vulkan Renderer** screen edits the same settings; the shadows toggle needs a restart.
 
 For automated visual checks, the renderer supports `VULKAN_AUTOLOAD=<seconds>`,
 `VULKAN_SCREENSHOT=/path.png`, `VULKAN_SCREENSHOT_DELAY=<seconds>` and a long-duration test
-notification via `VULKAN_NOTIFICATION=<text>` with optional `VULKAN_NOTIFICATION_MS` (default 60000);
-see the roadmap.
+notification via `VULKAN_NOTIFICATION=<text>` with optional `VULKAN_NOTIFICATION_MS` (default 60000).
+Shadows: `VULKAN_SHADOWS=1` (`0` forces off for tests); debug views: `VULKAN_DEBUG_VIEW=6` (shadow factor) or `9` (raw cascade 0);
+camera: `VULKAN_DEBUG_LOOKAT=<model|*>`, `VULKAN_DEBUG_DARK=1`, `VULKAN_DEBUG_TOP=1`,
+`VULKAN_DEBUG_DISTANCE=<m>`; stock reference capture: `VULKAN_STOCK_SCREENSHOT=/path.png`.
+See the roadmap.
 
 ## Documentation
 

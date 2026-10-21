@@ -100,8 +100,7 @@ internal struct TransparentPushConstants
     public uint InstanceStart;
 }
 
-// Must match Shaders/Scene/Shadow.slang
-// Must match Shaders/Scene/Model.slang
+// Must match Shaders/Scene/Model.slang (main and shadow entry points)
 [StructLayout(LayoutKind.Sequential)]
 internal struct ModelPushConstants
 {
@@ -187,9 +186,10 @@ internal sealed unsafe class ModelPass : IDisposable
     private readonly TextureCache textures;
     private readonly GpuSceneDraws gpuDraws;
     private readonly bool shadowsEnabled;
-    private readonly ShadowMap shadowMap;
+    private readonly ShadowMap[] shadowMaps;
     private readonly VkPipeline shadowPipeline;
     private readonly VkPipeline shadowPipelineNoCull;
+    private readonly Matrix[] shadowViewProjections = new Matrix[ShadowMap.Count];
     private readonly List<SceneActor> directActors = new();
     private readonly List<TransparentDraw> transparentDraws = new();
     private readonly HashSet<uint> reportedSkinning = new();
@@ -246,18 +246,26 @@ internal sealed unsafe class ModelPass : IDisposable
         this.textures = textures;
         gpuDraws = new GpuSceneDraws(context);
 
-        // Off by default: the shadow pass still needs a safe validation cycle. The lighting model
-        // changes (stock colourisation/IBL) are independent and always active.
-        shadowsEnabled = Environment.GetEnvironmentVariable("VULKAN_SHADOWS") == "1";
+        // Opt-in from the settings dialog (restart required). VULKAN_SHADOWS explicitly overrides it
+        // for automated tests: "1" force on, "0" force off, unset use the settings dialog.
+        // The lighting model changes (stock colourisation/IBL) are independent and always active.
+        var shadowOverride = Environment.GetEnvironmentVariable("VULKAN_SHADOWS");
+        shadowsEnabled = shadowOverride == "1"
+                         || (shadowOverride != "0" && ClientPlugin.Config.Current.Shadows);
         if (shadowsEnabled)
         {
-            shadowMap = new ShadowMap(context);
-            shadowMap.Ensure();
+            shadowMaps = new ShadowMap[ShadowMap.Count];
+            for (var i = 0; i < shadowMaps.Length; i++)
+            {
+                shadowMaps[i] = new ShadowMap(context, ShadowMap.Extents[i]);
+                shadowMaps[i].Ensure();
+            }
 
             GraphicsPipelineBuilder ShadowBuilder(VkCullModeFlags cullMode) => new()
             {
                 Code = ShaderBytecode.Model.Code.ToArray(),
                 VertexEntry = ShaderBytecode.Model.ShadowMain,
+                FragmentEntry = ShaderBytecode.Model.ShadowFragment,
                 ColorFormats = [],
                 DepthFormat = SceneTargets.DepthFormat,
                 DepthTest = true,
@@ -266,7 +274,7 @@ internal sealed unsafe class ModelPass : IDisposable
                 CullMode = cullMode,
                 FrontFace = VkFrontFace.Clockwise,
             };
-            shadowPipeline = ShadowBuilder(VkCullModeFlags.None).Build(context, "shadow");
+            shadowPipeline = ShadowBuilder(VkCullModeFlags.Back).Build(context, "shadow");
             shadowPipelineNoCull = ShadowBuilder(VkCullModeFlags.None).Build(context, "shadow-nocull");
         }
 
@@ -484,82 +492,32 @@ internal sealed unsafe class ModelPass : IDisposable
     }
 
     public int GpuPartCount => cachedPartCount;
-    public Matrix ShadowViewProjection { get; private set; } = Matrix.Identity;
-    public uint ShadowSlot => shadowMap?.Slot ?? 0;
-    public bool ShadowsReady => shadowsEnabled && shadowMap is { Ready: true };
-
-    public string CacheDiagnostics(SceneActors actors)
+    public static int ShadowCascadeCount => ShadowMap.Count;
+    public static float[] ShadowSplitEnds => ShadowMap.SplitEnds;
+    public uint ShadowSlot => shadowMaps?[0].Slot ?? 0;
+    public uint ShadowSlotAt(int cascade) => shadowMaps?[cascade].Slot ?? 0;
+    public Matrix ShadowViewProjectionAt(int cascade) => shadowViewProjections[cascade];
+    public float ShadowExtentAt(int cascade) => ShadowMap.Extents[cascade];
+    public bool ShadowsReady
     {
-        int total = 0, cached = 0, direct = 0, deferred = 0, visible = 0, noParts = 0;
-        int zeroIndices = 0, totalIndices = 0;
-        var stateInfo = "";
-        foreach (var actor in actors.All)
+        get
         {
-            var model = actor.Model;
-            if (model == null || (!model.Contains("GatlingTurret", StringComparison.OrdinalIgnoreCase) &&
-                                  !model.Contains("HangarDoor_door", StringComparison.OrdinalIgnoreCase) &&
-                                  !model.Contains("SlideDoorLeft", StringComparison.OrdinalIgnoreCase) &&
-                                  !model.Contains("SlideDoorRight", StringComparison.OrdinalIgnoreCase) &&
-                                  !model.Contains("OffsetDoorLeft", StringComparison.OrdinalIgnoreCase) &&
-                                  !model.Contains("OffsetDoorRight", StringComparison.OrdinalIgnoreCase)))
-                continue;
-
-            total++;
-            if (actor.Visible) visible++;
-            if (cachedByActor.TryGetValue(actor.Id, out var indices))
+            if (!shadowsEnabled || shadowMaps == null)
+                return false;
+            foreach (var map in shadowMaps)
             {
-                cached++;
-                var parts = 0;
-                var zero = 0;
-                var indicesTotal = 0;
-                stateInfo = $"bounds {actorStates[indices[0]].Bounds.X:F2},{actorStates[indices[0]].Bounds.Y:F2},{actorStates[indices[0]].Bounds.Z:F2} r {actorStates[indices[0]].Bounds.W:F2} ";
-                foreach (var index in indices)
-                {
-                    var cachedActor = cachedActors[index];
-                    parts += cachedActor.PartCount;
-                    var partEnd = cachedActor.PartStart + cachedActor.PartCount;
-                    for (var p = cachedActor.PartStart; p < partEnd; p++)
-                    {
-                        if (cachedParts[p].IndexCount == 0) zero++;
-                        else indicesTotal += (int)cachedParts[p].IndexCount;
-                    }
-                }
-                if (parts == 0) noParts++;
-                noParts += 0;
-                zeroIndices += zero;
-                totalIndices += indicesTotal;
+                if (!map.Ready)
+                    return false;
             }
-            else if (directActors.Contains(actor)) direct++;
-            else if (deferredActors.Contains(actor)) deferred++;
+            return true;
         }
-
-        var sample = new System.Text.StringBuilder();
-        int shown = 0;
-        foreach (var actor in actors.All)
-        {
-            if (shown >= 3) break;
-            if (actor.Model == null || !actor.Model.Contains("GatlingTurret.mwm", StringComparison.OrdinalIgnoreCase) &&
-                !actor.Model.Contains("HangarDoor_door", StringComparison.OrdinalIgnoreCase) &&
-                !actor.Model.Contains("SlideDoorLeft", StringComparison.OrdinalIgnoreCase))
-                continue;
-            var world = actors.GetWorldMatrix(actor);
-            var parent = actor.ParentId != 0 ? actors.Find(actor.ParentId) : null;
-            var state = cachedByActor.TryGetValue(actor.Id, out var sampleIndices) && sampleIndices.Count > 0
-                ? actorStates[sampleIndices[0]]
-                : default;
-            sample.Append($" [{actor.Model} id {actor.Id} parent {actor.ParentId} " +
-                          $"bounds {state.Bounds.X:F2},{state.Bounds.Y:F2},{state.Bounds.Z:F2} r {state.Bounds.W:F2} flags {state.Flags} " +
-                          $"world {world.Translation.X:F2},{world.Translation.Y:F2},{world.Translation.Z:F2} " +
-                          $"msgtx {actor.WorldMatrix.Translation.X:F2},{actor.WorldMatrix.Translation.Y:F2},{actor.WorldMatrix.Translation.Z:F2} " +
-                          $"local {actor.LocalMatrix.Translation.X:F2},{actor.LocalMatrix.Translation.Y:F2},{actor.LocalMatrix.Translation.Z:F2} " +
-                          $"parentWorld {(parent != null ? actors.GetWorldMatrix(parent).Translation.ToString() : "none")}]");
-            shown++;
-        }
-
-        return $"subparts {total} (visible {visible}, cached {cached}, direct {direct}, deferred {deferred}, noParts {noParts}, zeroIndices {zeroIndices}, indices {totalIndices}); " +
-               $"cache {cachedActors.Count}/{cachedByActor.Count} actors, direct {directActors.Count}, deferred {deferredActors.Count}, localUpdates {actors.LocalMatrixUpdates}" +
-               sample;
     }
+
+    // True only when the depth map was actually recorded this frame. The frame constants must not
+    // enable shadow sampling on frames where the map is still in an undefined/unwritten state
+    // (for example before the first opaque actor exists).
+    public bool ShadowPassRecorded { get; private set; }
+
     public GpuDiagnosticsCounters Diagnostics => gpuDraws.Counters;
 
     // CPU profiling for the diagnostics log.
@@ -1287,11 +1245,25 @@ internal sealed unsafe class ModelPass : IDisposable
     public void RecordPrepare(VkCommandBuffer commands, int frameSlot, CameraState camera,
         MyNewLoddingSettings lodding, SceneActors actors, Vector3D sunDirection)
     {
+        ShadowPassRecorded = false;
         var profile = Stopwatch.StartNew();
         EnsureCache(actors);
         LastEnsureMs = profile.Elapsed.TotalMilliseconds;
         if (shadowsEnabled)
-            ShadowViewProjection = ShadowMap.BuildViewProjection(sunDirection);
+        {
+            var cameraForward = -new Vector3(camera.ViewAt0.M31, camera.ViewAt0.M32, camera.ViewAt0.M33);
+            if (cameraForward.LengthSquared() < 1e-8f)
+                cameraForward = -Vector3.Forward;
+            cameraForward.Normalize();
+            for (var cascade = 0; cascade < ShadowMap.Count; cascade++)
+            {
+                var near = cascade == 0 ? 0f : ShadowMap.SplitEnds[cascade - 1];
+                var far = ShadowMap.SplitEnds[cascade];
+                var center = cameraForward * ((near + far) * 0.5f);
+                shadowViewProjections[cascade] =
+                    ShadowMap.BuildViewProjection(sunDirection, center, ShadowMap.Extents[cascade]);
+            }
+        }
         var loopStart = profile.Elapsed;
         UpdateDirtyActorStates(actors);
         UpdateDirtyMaterials(actors);
@@ -1388,94 +1360,99 @@ internal sealed unsafe class ModelPass : IDisposable
         gpuSubmitted = true;
     }
 
-    // Records the sun depth map. Reuses the opaque pass draw data (same culled/LOD-selected set),
-    // so it costs one extra vertex-only pass and no second culling dispatch.
+    // Records the sun depth map. Reuses the opaque pass draw data (same culled set, LOD0 caster
+    // bucket), so it costs one extra vertex-only pass per cascade and no CPU-side draw loop.
     public unsafe void RecordShadow(VkCommandBuffer commands, CameraState camera)
     {
-        if (!shadowsEnabled || !gpuSubmitted || shadowMap is not { Ready: true })
+        if (!shadowsEnabled || !gpuSubmitted || !ShadowsReady)
             return;
 
         var api = context.Device.Api;
-        var image = shadowMap.Image;
-
-        var firstUse = shadowMap.Layout == VkImageLayout.Undefined;
-        var toAttachment = new VkImageMemoryBarrier2
-        {
-            srcStageMask = firstUse ? VkPipelineStageFlags2.None : VkPipelineStageFlags2.FragmentShader,
-            srcAccessMask = firstUse ? VkAccessFlags2.None : VkAccessFlags2.ShaderSampledRead,
-            dstStageMask = VkPipelineStageFlags2.EarlyFragmentTests,
-            dstAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
-            oldLayout = shadowMap.Layout,
-            newLayout = VkImageLayout.DepthAttachmentOptimal,
-            image = image.Handle,
-            subresourceRange = image.FullRange,
-            srcQueueFamilyIndex = uint.MaxValue,
-            dstQueueFamilyIndex = uint.MaxValue,
-        };
-        var toAttachmentInfo = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &toAttachment };
-        api.vkCmdPipelineBarrier2(commands, &toAttachmentInfo);
-
-        var depthAttachment = new VkRenderingAttachmentInfo
-        {
-            imageView = image.View,
-            imageLayout = VkImageLayout.DepthAttachmentOptimal,
-            loadOp = VkAttachmentLoadOp.Clear,
-            storeOp = VkAttachmentStoreOp.Store,
-            clearValue = new VkClearValue { depthStencil = new VkClearDepthStencilValue(0f, 0) },
-        };
-        var renderingInfo = new VkRenderingInfo
-        {
-            renderArea = new VkRect2D(0, 0, ShadowMap.Size, ShadowMap.Size),
-            layerCount = 1,
-            colorAttachmentCount = 0,
-            pDepthAttachment = &depthAttachment,
-        };
-        api.vkCmdBeginRendering(commands, &renderingInfo);
-
         var viewport = new VkViewport(0, 0, ShadowMap.Size, ShadowMap.Size, 0, 1);
         var scissor = new VkRect2D(0, 0, ShadowMap.Size, ShadowMap.Size);
-        api.vkCmdSetViewport(commands, 0, 1, &viewport);
-        api.vkCmdSetScissor(commands, 0, 1, &scissor);
 
-        var vp = Matrix.Transpose(ShadowViewProjection);
-        for (var bucket = 0; bucket < 2; bucket++)
+        for (var cascade = 0; cascade < shadowMaps.Length; cascade++)
         {
-            api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics,
-                bucket == 0 ? shadowPipeline : shadowPipelineNoCull);
-            context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
-            var push = new ModelPushConstants
+            var map = shadowMaps[cascade];
+            var image = map.Image;
+            var firstUse = map.Layout == VkImageLayout.Undefined;
+            var toAttachment = new VkImageMemoryBarrier2
             {
-                World0 = new Vector4(vp.M11, vp.M12, vp.M13, vp.M14),
-                World1 = new Vector4(vp.M21, vp.M22, vp.M23, vp.M24),
-                World2 = new Vector4(vp.M31, vp.M32, vp.M33, vp.M34),
-                World3 = new Vector4(vp.M41, vp.M42, vp.M43, vp.M44),
-                DrawData = gpuDraws.DrawDataAddress(bucket),
+                srcStageMask = firstUse ? VkPipelineStageFlags2.None : VkPipelineStageFlags2.FragmentShader,
+                srcAccessMask = firstUse ? VkAccessFlags2.None : VkAccessFlags2.ShaderSampledRead,
+                dstStageMask = VkPipelineStageFlags2.EarlyFragmentTests,
+                dstAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
+                oldLayout = map.Layout,
+                newLayout = VkImageLayout.DepthAttachmentOptimal,
+                image = image.Handle,
+                subresourceRange = image.FullRange,
+                srcQueueFamilyIndex = uint.MaxValue,
+                dstQueueFamilyIndex = uint.MaxValue,
             };
-            api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
-                0, (uint)sizeof(ModelPushConstants), &push);
-            api.vkCmdDrawIndirectCount(commands, gpuDraws.BucketBuffer(bucket),
-                (ulong)GpuSceneDraws.CommandOffset, gpuDraws.BucketBuffer(bucket), 0,
-                gpuDraws.MaxParts, 16);
+            var toAttachmentInfo = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &toAttachment };
+            api.vkCmdPipelineBarrier2(commands, &toAttachmentInfo);
+
+            var depthAttachment = new VkRenderingAttachmentInfo
+            {
+                imageView = image.View,
+                imageLayout = VkImageLayout.DepthAttachmentOptimal,
+                loadOp = VkAttachmentLoadOp.Clear,
+                storeOp = VkAttachmentStoreOp.Store,
+                clearValue = new VkClearValue { depthStencil = new VkClearDepthStencilValue(0f, 0) },
+            };
+            var renderingInfo = new VkRenderingInfo
+            {
+                renderArea = new VkRect2D(0, 0, ShadowMap.Size, ShadowMap.Size),
+                layerCount = 1,
+                colorAttachmentCount = 0,
+                pDepthAttachment = &depthAttachment,
+            };
+            api.vkCmdBeginRendering(commands, &renderingInfo);
+            api.vkCmdSetViewport(commands, 0, 1, &viewport);
+            api.vkCmdSetScissor(commands, 0, 1, &scissor);
+
+            var vp = Matrix.Transpose(shadowViewProjections[cascade]);
+            for (var bucket = 2; bucket < 4; bucket++)
+            {
+                api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics,
+                    bucket == 2 ? shadowPipeline : shadowPipelineNoCull);
+                context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
+                var push = new ModelPushConstants
+                {
+                    World0 = new Vector4(vp.M11, vp.M12, vp.M13, vp.M14),
+                    World1 = new Vector4(vp.M21, vp.M22, vp.M23, vp.M24),
+                    World2 = new Vector4(vp.M31, vp.M32, vp.M33, vp.M34),
+                    World3 = new Vector4(vp.M41, vp.M42, vp.M43, vp.M44),
+                    DrawData = gpuDraws.DrawDataAddress(bucket),
+                };
+                api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
+                    0, (uint)sizeof(ModelPushConstants), &push);
+                api.vkCmdDrawIndirectCount(commands, gpuDraws.BucketBuffer(bucket),
+                    (ulong)GpuSceneDraws.CommandOffset, gpuDraws.BucketBuffer(bucket), 0,
+                    gpuDraws.MaxParts, 16);
+            }
+
+            api.vkCmdEndRendering(commands);
+
+            var toSampled = new VkImageMemoryBarrier2
+            {
+                srcStageMask = VkPipelineStageFlags2.LateFragmentTests,
+                srcAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
+                dstStageMask = VkPipelineStageFlags2.FragmentShader,
+                dstAccessMask = VkAccessFlags2.ShaderSampledRead,
+                oldLayout = VkImageLayout.DepthAttachmentOptimal,
+                newLayout = VkImageLayout.ShaderReadOnlyOptimal,
+                image = image.Handle,
+                subresourceRange = image.FullRange,
+                srcQueueFamilyIndex = uint.MaxValue,
+                dstQueueFamilyIndex = uint.MaxValue,
+            };
+            var toSampledInfo = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &toSampled };
+            api.vkCmdPipelineBarrier2(commands, &toSampledInfo);
+            map.Layout = VkImageLayout.ShaderReadOnlyOptimal;
         }
 
-        api.vkCmdEndRendering(commands);
-
-        var toSampled = new VkImageMemoryBarrier2
-        {
-            srcStageMask = VkPipelineStageFlags2.LateFragmentTests,
-            srcAccessMask = VkAccessFlags2.DepthStencilAttachmentWrite,
-            dstStageMask = VkPipelineStageFlags2.FragmentShader,
-            dstAccessMask = VkAccessFlags2.ShaderSampledRead,
-            oldLayout = VkImageLayout.DepthAttachmentOptimal,
-            newLayout = VkImageLayout.ShaderReadOnlyOptimal,
-            image = image.Handle,
-            subresourceRange = image.FullRange,
-            srcQueueFamilyIndex = uint.MaxValue,
-            dstQueueFamilyIndex = uint.MaxValue,
-        };
-        var toSampledInfo = new VkDependencyInfo { imageMemoryBarrierCount = 1, pImageMemoryBarriers = &toSampled };
-        api.vkCmdPipelineBarrier2(commands, &toSampledInfo);
-        shadowMap.Layout = VkImageLayout.ShaderReadOnlyOptimal;
+        ShadowPassRecorded = true;
     }
 
     // Records all opaque actors into the scene targets. Returns the number of draws recorded.
@@ -1943,7 +1920,11 @@ internal sealed unsafe class ModelPass : IDisposable
 
         var api = context.Device.Api;
         gpuDraws.Dispose();
-        shadowMap?.Dispose();
+        if (shadowMaps != null)
+        {
+            foreach (var map in shadowMaps)
+                map.Dispose();
+        }
         if (shadowPipeline != VkPipeline.Null)
             context.Release(() => context.Device.Api.vkDestroyPipeline(shadowPipeline, null));
         if (shadowPipelineNoCull != VkPipeline.Null)

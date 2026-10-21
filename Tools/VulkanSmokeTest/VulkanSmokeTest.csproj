@@ -15,6 +15,7 @@
     <Compile Include="../../ClientPlugin/Render/Platform/Sdl3.cs" Link="Linked/Platform/Sdl3.cs" />
     <Compile Include="../../ClientPlugin/Render/Textures/DdsLoader.cs" Link="Linked/Textures/DdsLoader.cs" />
     <Compile Include="../../ClientPlugin/Render/Textures/TextureData.cs" Link="Linked/Textures/TextureData.cs" />
+    <Compile Include="../../ClientPlugin/Render/Shaders/ShaderBytecode.g.cs" Link="Linked/Shaders/ShaderBytecode.g.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -72,17 +72,33 @@ internal struct FrameConstants
     // x: SunDiscInnerDot, y: SunDiscOuterDot, z: SunBillboardEnabled
     public Vector4 SunDiscDots;
 
-    // Sun shadow map: light view-projection rows, bindless slot, size in texels, and
-    // (x: strength, y: depth bias, z: enabled).
+    // Sun shadow cascades: light view-projection rows, bindless slots, size in texels, enabled flag,
+    // and (x: strength, y: depth bias, z: PCF texel scale, w: filter width).
     public Vector4 ShadowMatrix0;
     public Vector4 ShadowMatrix1;
     public Vector4 ShadowMatrix2;
     public Vector4 ShadowMatrix3;
-    public uint ShadowMap;
+    public uint ShadowMap;      // cascade 0 bindless slot
     public uint ShadowSize;
     public uint ShadowEnabled;
     public uint ShadowPad;
-    public Vector4 ShadowParams;
+    public Vector4 ShadowParams; // x: strength, y: depth bias, z: PCF texel scale, w: softness
+
+    // Cascades 1 and 2, plus the split/extent table. Cascade 0 uses the fields above.
+    public Vector4 ShadowMatrix1_0;
+    public Vector4 ShadowMatrix1_1;
+    public Vector4 ShadowMatrix1_2;
+    public Vector4 ShadowMatrix1_3;
+    public Vector4 ShadowMatrix2_0;
+    public Vector4 ShadowMatrix2_1;
+    public Vector4 ShadowMatrix2_2;
+    public Vector4 ShadowMatrix2_3;
+    public Vector4 ShadowSplits;         // x,y,z: far view distance of each cascade; w: count
+    public Vector4 ShadowCascadeParams;  // x,y,z: light-space extent; w: reserved
+    public uint ShadowMap1;
+    public uint ShadowMap2;
+    public uint ShadowPad1;
+    public uint ShadowPad2;
 }
 
 // Camera from MyRenderMessageSetCameraViewMatrix, plus the stock projection and camera-relative setup.

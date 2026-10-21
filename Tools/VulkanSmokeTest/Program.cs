@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ClientPlugin.Render.Platform;
+using ClientPlugin.Render.Shaders;
 using ClientPlugin.Render.Vulkan;
 using Vortice.Vulkan;
 using VRageMath;
@@ -26,6 +27,7 @@ internal static unsafe class Program
             return DdsSurvey.Run(args[ddsIndex + 1]);
 
         var validation = Array.IndexOf(args, "--validation") >= 0;
+        var shadowTest = Array.IndexOf(args, "--shadow") >= 0;
         var secondsIndex = Array.IndexOf(args, "--seconds");
         var seconds = secondsIndex >= 0 ? double.Parse(args[secondsIndex + 1]) : 3.0;
 
@@ -71,6 +73,10 @@ internal static unsafe class Program
                 return Fail("SDL_Vulkan_CreateSurface: " + Sdl3.GetError());
 
             using var device = VulkanDevice.Create(instance, surface, null);
+
+            if (shadowTest)
+                return RunShadowPipelineTest(instance, device);
+
             var swapchain = new VulkanSwapchain(instance, device, surface);
             swapchain.Recreate(new Vector2I(1280, 720), vsync: true);
             var frameLoop = new FrameLoop(device, swapchain);
@@ -120,6 +126,32 @@ internal static unsafe class Program
             destroyWindow(window);
             quit();
         }
+    }
+
+    // Creates the exact depth-only pipeline ModelPass uses for the sun shadow map. This is the
+    // operation that previously crashed RADV; keep it out of the game until it passes here with
+    // --validation.
+    private static int RunShadowPipelineTest(VulkanInstance instance, VulkanDevice device)
+    {
+        using var context = new GpuContext(instance, device);
+        var builder = new GraphicsPipelineBuilder
+        {
+            Code = ShaderBytecode.Model.Code.ToArray(),
+            VertexEntry = ShaderBytecode.Model.ShadowMain,
+            FragmentEntry = ShaderBytecode.Model.ShadowFragment,
+            ColorFormats = [],
+            DepthFormat = VkFormat.D32Sfloat,
+            DepthTest = true,
+            DepthWrite = true,
+            DepthCompare = VkCompareOp.GreaterOrEqual, // Reverse Z
+            CullMode = VkCullModeFlags.Back,
+            FrontFace = VkFrontFace.Clockwise,
+        };
+
+        var pipeline = builder.Build(context, "shadow-smoke");
+        device.Api.vkDestroyPipeline(pipeline, null);
+        Console.WriteLine("OK: shadow depth-only pipeline created");
+        return 0;
     }
 
     private static int Fail(string message)

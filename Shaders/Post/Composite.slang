@@ -9,6 +9,8 @@ struct PushConstants
     uint oitReveal;         // Bindless slot of the OIT revealage target
     uint exposureTexture;   // Bindless slot of the 1x1 auto-exposure target
     uint bloomTexture;      // Bindless slot of the blurred HDR bloom target
+    uint shadowMap;         // Bindless slot of the sun shadow map
+    uint shadowDebug;       // 1: show the raw shadow map instead of the scene
     float whitePoint;       // Hable tonemapping white point
 };
 
@@ -63,6 +65,15 @@ float3 hable(float3 x, float whitePoint)
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target0
 {
+    // Validation view: show the raw sun shadow map (reverse-Z depth) stretched over the screen.
+    // Empty texels are 0; casters are brighter towards the near plane.
+    if (push.shadowDebug != 0)
+    {
+        float depth = sampleTexture(push.shadowMap, SamplerSlot.PointClamp, input.uv).r;
+        float value = saturate(depth * 4.0);
+        return float4(value.xxx, 1.0);
+    }
+
     float3 color = sampleTexture(push.sceneTexture, SamplerSlot.PointClamp, input.uv).rgb;
 
     // Order-independent transparency: accum holds premultiplied color/alpha sums, reveal is the

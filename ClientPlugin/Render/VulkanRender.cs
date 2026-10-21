@@ -65,7 +65,12 @@ public sealed class VulkanRender : IMyRender
     private MyPostprocessSettings postprocessSettings = MyPostprocessSettings.Default;
     private readonly string debugLookAtModel = Environment.GetEnvironmentVariable("VULKAN_DEBUG_LOOKAT");
     private readonly bool debugLookAtDark = Environment.GetEnvironmentVariable("VULKAN_DEBUG_DARK") == "1";
+    private readonly bool debugLookAtTop = Environment.GetEnvironmentVariable("VULKAN_DEBUG_TOP") == "1";
+    private readonly float debugLookAtDistance = ParseDebugFloat("VULKAN_DEBUG_DISTANCE", 9f);
+    private readonly bool debugShadowMap = Environment.GetEnvironmentVariable("VULKAN_DEBUG_VIEW") == "9";
     private bool reportedDebugLookAt;
+    private SceneActor debugTarget;
+    private Vector3D debugTargetCenter;
     private string postprocessStatus = "";
     private MyEnvironmentData environment;
     private bool hasEnvironment;
@@ -343,41 +348,79 @@ public sealed class VulkanRender : IMyRender
 
     #endregion
 
+    private static float ParseDebugFloat(string name, float fallback)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        return float.TryParse(value, out var result) && result > 0f ? result : fallback;
+    }
+
     // Development/test helper for visual verification without user input: VULKAN_DEBUG_LOOKAT=<model
-    // substring> frames the first matching actor from the sunlit (or VULKAN_DEBUG_DARK=1 shadowed) side.
+    // substring> frames the matching actor nearest to the current camera from the sunlit (or
+    // VULKAN_DEBUG_DARK=1 shadowed) side. VULKAN_DEBUG_DISTANCE scales the framing distance and
+    // VULKAN_DEBUG_TOP=1 looks straight down instead.
     private void ApplyDebugCamera()
     {
         if (string.IsNullOrEmpty(debugLookAtModel) || !hasEnvironment)
             return;
 
-        foreach (var actor in actors.All)
+        // Choose the target once, using the game's saved camera position; later frames run with the
+        // debug camera and would otherwise pick a different block every frame.
+        if (debugTarget == null)
         {
-            if (actor.Model == null || !actor.Model.Contains(debugLookAtModel, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var model = models.Get(actor.Model);
-            if (model == null)
-                continue;
-
-            var world = actors.GetWorldMatrix(actor);
-            var localCenter = (model.Bounds.Min + model.Bounds.Max) * 0.5f;
-            var center = (Vector3D)Vector3.Transform(localCenter, (Matrix)world);
-            var sun = (Vector3)environment.EnvironmentLight.SunLightDirection;
-            if (sun.LengthSquared() < 1e-6f)
-                sun = new Vector3(0.4f, 0.8f, 0.2f);
-            sun.Normalize();
-            var direction = debugLookAtDark ? sun : -sun;
-            var eye = center + (Vector3D)direction * 9.0 + Vector3D.Up * 1.5;
-            camera.SetDebugLookAt(eye, center, BackBufferResolution);
-
-            if (!reportedDebugLookAt)
+            var bestDistance = double.MaxValue;
+            foreach (var actor in actors.All)
             {
-                reportedDebugLookAt = true;
-                RenderLog.Info($"Debug camera: model '{actor.Model}' actor {actor.Id}, eye {eye}, target {center}, " +
-                               $"side {(debugLookAtDark ? "dark" : "sun")}");
-            }
+                if (actor.Model == null)
+                    continue;
+                if (debugLookAtModel == "*")
+                {
+                    // Wildcard picks the nearest non-character mesh, normally the platform block
+                    // under the player; characters would otherwise win and fill the frame.
+                    if (actor.SkeletonBones != null)
+                        continue;
+                }
+                else if (!actor.Model.Contains(debugLookAtModel, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
 
+                var model = models.Get(actor.Model);
+                if (model == null)
+                    continue;
+
+                var world = actors.GetWorldMatrix(actor);
+                var localCenter = (model.Bounds.Min + model.Bounds.Max) * 0.5f;
+                var center = (Vector3D)Vector3.Transform(localCenter, (Matrix)world);
+                var distance = (center - camera.Position).LengthSquared();
+                if (distance >= bestDistance)
+                    continue;
+
+                bestDistance = distance;
+                debugTarget = actor;
+                debugTargetCenter = center;
+            }
+        }
+
+        if (debugTarget == null)
             return;
+
+        var target = debugTarget;
+        var targetCenter = debugTargetCenter;
+        var sun = (Vector3)environment.EnvironmentLight.SunLightDirection;
+        if (sun.LengthSquared() < 1e-6f)
+            sun = new Vector3(0.4f, 0.8f, 0.2f);
+        sun.Normalize();
+        var direction = debugLookAtDark ? sun : -sun;
+        var eye = debugLookAtTop
+            ? targetCenter + Vector3D.Up * debugLookAtDistance
+            : targetCenter + (Vector3D)direction * debugLookAtDistance + Vector3D.Up * 1.5;
+        camera.SetDebugLookAt(eye, targetCenter, BackBufferResolution);
+
+        if (!reportedDebugLookAt)
+        {
+            reportedDebugLookAt = true;
+            RenderLog.Info($"Debug camera: model '{target.Model}' actor {target.Id}, eye {eye}, target {targetCenter}, " +
+                           $"{(debugLookAtTop ? "top" : debugLookAtDark ? "dark" : "sun")} side, distance {debugLookAtDistance}");
         }
     }
 
@@ -668,7 +711,8 @@ public sealed class VulkanRender : IMyRender
             };
 
             api.vkCmdBeginRendering(commands, &oitInfo);
-            lastDrawnActors += modelPass.RecordTransparent(commands, sceneTargets, frameConstants);
+            if (Environment.GetEnvironmentVariable("VULKAN_NO_TRANSPARENT") != "1")
+                lastDrawnActors += modelPass.RecordTransparent(commands, sceneTargets, frameConstants);
             api.vkCmdEndRendering(commands);
 
             frameLoop.Barrier(sceneTargets.OitAccum.Handle, sceneTargets.OitAccum.FullRange,
@@ -695,7 +739,6 @@ public sealed class VulkanRender : IMyRender
                            $"{sceneLights.LastCount} lights, " +
                            $"instance buffers {instanceBuffers.Count} ({instanceBuffers.TotalInstances} instances), " +
                            $"camera {camera.HasValue}, environment {hasEnvironment}");
-            RenderLog.Info($"Cache: {modelPass.CacheDiagnostics(actors)}");
 
             var gcPause = GC.GetTotalPauseDuration();
             var gc0 = GC.CollectionCount(0);
@@ -784,19 +827,34 @@ public sealed class VulkanRender : IMyRender
         var lightData = sceneLights.Build(gpu, camera.Position);
         constants.Lights = lightData.Address;
         constants.LightCount = lightData.Count;
-        constants.ShadowParams = new Vector4(1f, 0.0015f, 2f, 0f);
+        constants.ShadowParams = new Vector4(1f, 0.00005f, 1f, 4f);
 
-        if (modelPass.ShadowsReady)
+        if (modelPass.ShadowsReady && modelPass.ShadowPassRecorded)
         {
-            var shadow = Matrix.Transpose(modelPass.ShadowViewProjection);
-            constants.ShadowMatrix0 = new Vector4(shadow.M11, shadow.M12, shadow.M13, shadow.M14);
-            constants.ShadowMatrix1 = new Vector4(shadow.M21, shadow.M22, shadow.M23, shadow.M24);
-            constants.ShadowMatrix2 = new Vector4(shadow.M31, shadow.M32, shadow.M33, shadow.M34);
-            constants.ShadowMatrix3 = new Vector4(shadow.M41, shadow.M42, shadow.M43, shadow.M44);
-            constants.ShadowMap = modelPass.ShadowSlot;
+            var shadow0 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(0));
+            var shadow1 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(1));
+            var shadow2 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(2));
+            constants.ShadowMatrix0 = new Vector4(shadow0.M11, shadow0.M12, shadow0.M13, shadow0.M14);
+            constants.ShadowMatrix1 = new Vector4(shadow0.M21, shadow0.M22, shadow0.M23, shadow0.M24);
+            constants.ShadowMatrix2 = new Vector4(shadow0.M31, shadow0.M32, shadow0.M33, shadow0.M34);
+            constants.ShadowMatrix3 = new Vector4(shadow0.M41, shadow0.M42, shadow0.M43, shadow0.M44);
+            constants.ShadowMatrix1_0 = new Vector4(shadow1.M11, shadow1.M12, shadow1.M13, shadow1.M14);
+            constants.ShadowMatrix1_1 = new Vector4(shadow1.M21, shadow1.M22, shadow1.M23, shadow1.M24);
+            constants.ShadowMatrix1_2 = new Vector4(shadow1.M31, shadow1.M32, shadow1.M33, shadow1.M34);
+            constants.ShadowMatrix1_3 = new Vector4(shadow1.M41, shadow1.M42, shadow1.M43, shadow1.M44);
+            constants.ShadowMatrix2_0 = new Vector4(shadow2.M11, shadow2.M12, shadow2.M13, shadow2.M14);
+            constants.ShadowMatrix2_1 = new Vector4(shadow2.M21, shadow2.M22, shadow2.M23, shadow2.M24);
+            constants.ShadowMatrix2_2 = new Vector4(shadow2.M31, shadow2.M32, shadow2.M33, shadow2.M34);
+            constants.ShadowMatrix2_3 = new Vector4(shadow2.M41, shadow2.M42, shadow2.M43, shadow2.M44);
+            constants.ShadowMap = modelPass.ShadowSlotAt(0);
+            constants.ShadowMap1 = modelPass.ShadowSlotAt(1);
+            constants.ShadowMap2 = modelPass.ShadowSlotAt(2);
             constants.ShadowSize = ShadowMap.Size;
             constants.ShadowEnabled = 1;
-            constants.ShadowParams = new Vector4(1f, 0.0015f, 2f, 0f);
+            var splits = ModelPass.ShadowSplitEnds;
+            constants.ShadowSplits = new Vector4(splits[0], splits[1], splits[2], ModelPass.ShadowCascadeCount);
+            constants.ShadowCascadeParams = new Vector4(
+                modelPass.ShadowExtentAt(0), modelPass.ShadowExtentAt(1), modelPass.ShadowExtentAt(2), 0f);
         }
 
         var allocation = gpu.Transient.Allocate<FrameConstants>();
@@ -869,7 +927,7 @@ public sealed class VulkanRender : IMyRender
             }
 
             composite.Record(commands, sceneTargets, extent, exposurePass.Slot, bloomPass.Slot,
-                postprocessSettings.Data.WhitePoint);
+                modelPass.ShadowSlot, debugShadowMap, postprocessSettings.Data.WhitePoint);
         }
 
         gui.RecordMain(commands, swapchain.Format, BackBufferResolution, extent);

@@ -7,14 +7,14 @@
 
 ## Start here
 
-**Current state (2026-10-18 session):** Phase 0 and Phase 1 done (menus, HUD, text, Vulkan settings dialog all
+**Current state (through 2026-10-21):** Phase 0 and Phase 1 done (menus, HUD, text, Vulkan settings dialog all
 verified by the user; world load/save/reload works). Phase 2 first slice is implemented, builds clean and is
 **verified in game by frame capture**: camera + environment state, actor registry, background MWM loader (LOD0),
 texture kinds (model CM/Extensions sRGB, normal maps and alphamasks linear), forward opaque model pass with sun +
 ambient, cube-grid instancing (2 instance buffers, 18 instances captured; astronaut, armor blocks, cockpit and grid
 geometry all render, log clean), and an early placeholder ACES tonemap (superseded by the exposure/bloom path
 below). The renderer now has IBL/eye adaptation, transparency/OIT, skinning, culling/LOD and the GPU-driven path;
-shadows, voxels and the dynamic probe remain open. **Monitor selection fixed and verified by the user across restarts** (2026-10-17): the adapter (game
+voxels and the dynamic probe remain open; sun shadows are now opt-in and validated below. **Monitor selection fixed and verified by the user across restarts** (2026-10-17): the adapter (game
 "Video Adapter", an adapter+output pair) is now forwarded on adapter changes too, and the SDL window targets the
 matching display so fullscreen lands on the selected monitor. The world correctness pass is also in: all MWM LODs
 load (SquarePlate 2, Cockpit 4, astronaut 3, EdgeStraight 3; zero warnings), per-actor LOD selection with the
@@ -62,11 +62,43 @@ and every working screen stayed on the Online texture. A Harmony patch sets the 
 retry while a generated target is still being created. The persistent opaque part cache and GPU LOD selection are in
 place; skinned actors and transparent parts keep the direct/OIT paths, and the per-frame actor state is still
 uploaded from the CPU. **Automated tests** now work via
-`VULKAN_AUTOLOAD=<seconds>`; `VULKAN_DEBUG_LOOKAT=<model substring>` (+ `VULKAN_DEBUG_DARK=1`) frames the first
-matching actor for visual checks. A first **HDR bloom pass** is in (half-resolution bright pass + separable blur +
+`VULKAN_AUTOLOAD=<seconds>`; `VULKAN_DEBUG_LOOKAT=<model substring>` (or `*` for the nearest non-character mesh)
+frames the nearest matching actor for visual checks, with `VULKAN_DEBUG_DARK=1`, `VULKAN_DEBUG_TOP=1` and
+`VULKAN_DEBUG_DISTANCE=<m>`; `VULKAN_STOCK_SCREENSHOT=<path>` captures the active renderer for stock references.
+A first **HDR bloom pass** is in (half-resolution bright pass + separable blur +
 composite add; `BloomScale` slider); matching stock's multi-scale prefilter/cascaded blur remains. Still missing by
-design: dynamic scene probe (the hard sun terminator on the dark side stays dark until it exists) and shadows.
+design: dynamic scene probe (the hard sun terminator on the dark side stays dark until it exists).
 Never run git; the user commits.
+
+**Sun shadows: cascaded and LOD-stable (2026-10-21).** Close-up feedback (blocky edges, LOD pop, dither)
+replaced the single 100 m map with **three 2048² reverse-Z cascades** (splits 15/40/150 m, light-space half-extents
+23/55/200 m). Each extent must cover the camera frustum slice at its split; the original 15/40/110 m extents were
+smaller than the slice (~19/50/187 m half-width at the test FOV/aspect), so part of the receiver fell outside the
+map and returned lit, producing a diagonal/diamond edge that cut across the long blocks. The widened extents remove
+that edge. A **separate GPU caster bucket uses LOD0 regardless of the forward LOD**, so a ship at LOD1+ keeps its
+shadow silhouette. Sampling is a **fixed 16-tap Poisson PCF with bilinear depth** (4/3.2/2.4-texel radius by
+cascade), slope-scaled bias and the **camera-oriented face normal** for offset/bias; per-pixel stochastic rotation
+was removed because without TAA it read as static. Casters are alpha-tested (`shadowFragment`), the main shadow
+pipeline back-face culls, and a no-cull variant handles two-sided parts. Matrices are texel-snapped.
+
+The **diamond/line on individual red panels** was bad model vertex normals: across the bevel they point away from
+the sun, so a large area read unlit. Diffuse, specular, IBL/ambient-specular and the shadow offset/bias now all use
+the camera-oriented triangle face normal; the normal map supplies Toksvig gloss only. The old two-sided
+geometric-normal flip is gone. An `albedo * 0.25 * AmbientScale` floor stands in for the missing dynamic probe and
+makes the **Ambient** slider effective. The two-sided front/back choice uses the face normal, so grazing angles no
+longer dither. Verified in `/tmp/vk_faceall.png`, `/tmp/vk_ambient25.png`, `/tmp/vk_shadowface.png`/`_off.png` and
+the final cascade capture `/tmp/vk_wide_restored.png`.
+
+Remaining: verify LOD1+ on the user's ship, contact shadows/SSAO for vertical junctions, near-cascade
+resolution/quality slider, skinned/transparent casters; RT shadows later. Captures: `/tmp/vk_fixed.png` and
+`/tmp/vk_fixed_shadows.png` (after the face-normal fix, shadows off/on), `/tmp/vk_facediffuse2.png` (same, with
+ambient floor), `/tmp/vk_ambient_same.png` (ambient proof), `/tmp/vk_faceall.png` (face normal for all lighting),
+`/tmp/vk_ambient25.png` (0.25 floor), `/tmp/vk_shadowface.png` / `_off.png` (face-normal shadow offset, shadows
+on/off), `/tmp/vk_twosided_geom.png` (cascaded close-up after the two-sided fix),
+`/tmp/vk_geomnormal_factor.png` (factor view), `/tmp/vk_lod60_factor.png` (60 m sun-side factor),
+`/tmp/vk_lod60_dark.png` (60 m dark side), `/tmp/vk_test_shadow_on.png` / `_off.png` (on/off),
+`/tmp/vk_shadow_side_sun3.png` (test platform), `/tmp/vk_wide.png` (first wide-extent capture) and
+`/tmp/vk_wide_restored.png` (same camera after restoring the extents).
 
 **Latest text/UI and diagnostics state (2026-10-18):** GPU text is live for HUD, chat, notifications and the
 diagnostics overlay; the overlay has a rolling 60 s history, GPU triangle/part/cull counts, device-local GPU
@@ -116,7 +148,8 @@ that reference: our unlit faces are much darker (no dynamic scene probe yet) and
 shadow side because the MWM normal belongs to the authored front face, while no-back-face-cull actors also
 draw the visible back face with that same normal. `Model.slang` now aligns the normal with the view vector
 after the normal map (`if (dot(n, toCamera) < 0) n = -n`) before evaluating sun/ambient lobes. This is
-per-visible-surface two-sided lighting, not a shadow pass: correctly authored front faces are unchanged.
+per-visible-surface two-sided lighting, not a shadow pass: the side is chosen from the camera-oriented face normal, so
+normal-map detail cannot flicker the front/back decision; correctly authored front faces are unchanged.
 `FrontFace=Clockwise` is retained; a CCW experiment swapped every door face and was reverted. An IBL
 diffuse-ambient experiment washed the whole grid out and was reverted; the stock `AmbientForwardPass` /
 `AmbientMinClamp` floor (0.02) remains. Verified with the debug dark/sun-side cameras: direct-only hangar
@@ -127,8 +160,12 @@ Temporary lighting diagnostics and the flip env flags were removed. No shadow wo
 **Immediate next steps:**
 1. Calibrate exposure/specular/reflection against the stock reference with a lit camera (ideally on the
    respawn pod front), then set the defaults.
-2. **Dynamic environment probe** (scene cubemap capture + prefilter) to lift shadowed faces and interiors.
-3. Resume the larger roadmap items below.
+2. **Shadow quality follow-up**: verify the new LOD0 caster bucket at LOD1+ on the user's ship; tune near-cascade
+   resolution/filter width; add contact shadows/SSAO for vertical junctions; add the dynamic probe for the dark
+   side; then skinned/transparent casters and a quality slider. The cascaded
+   pass is opt-in and documented above.
+3. **Dynamic environment probe** (scene cubemap capture + prefilter) to lift shadowed faces and interiors.
+4. Resume the larger roadmap items below.
 
 **Next tasks, in order:**
 1. **Lighting calibration** (above) against the stock reference, then the dynamic probe.
@@ -166,11 +203,13 @@ Temporary lighting diagnostics and the flip env flags were removed. No shadow wo
 |------|--------------------|
 | Build plugin + tools | `dotnet build Vulkan.sln -c Debug` (must stay warning/error free) |
 | Compile shaders | `dotnet run --project Tools/ShaderCompiler` after editing `Shaders/`; commit the generated `ClientPlugin/Render/Shaders/ShaderBytecode.g.cs`. `-- --check` verifies it is current. First run downloads pinned slangc into `Tools/ShaderCompiler/.slang/` (git-ignored). |
-| Vulkan smoke test (no game) | `dotnet run --project Tools/VulkanSmokeTest -- [--validation] [--seconds N]` — opens an SDL3 window, runs the plugin's device layer |
+| Vulkan smoke test (no game) | `dotnet run --project Tools/VulkanSmokeTest -- [--validation] [--seconds N] [--shadow]` — opens an SDL3 window, runs the plugin's device layer; `--shadow` creates the depth-only shadow pipeline |
+| Shadow debug / validation | `VULKAN_SHADOWS=1` enables the opt-in shadow pass; `VULKAN_DEBUG_VIEW=6` shows the per-fragment shadow factor, `9` shows the raw shadow map. `VULKAN_DEBUG_LOOKAT=<model or *>`, `VULKAN_DEBUG_DARK=1`, `VULKAN_DEBUG_TOP=1`, `VULKAN_DEBUG_DISTANCE=<m>` position the debug camera. |
 | DDS loader survey | `dotnet run --project Tools/VulkanSmokeTest -- --dds ~/.local/share/Steam/steamapps/common/SpaceEngineers/Content/Textures` (expect 1 failure: a PSD misnamed `.dds`) |
 | Run the game | `cd ~/.local/share/PulsarRelease && ./Interim.bin -sources` (Pulsar **v2.4.3** official release). Steam launch option alternative: `/home/sentorx/.local/share/PulsarRelease/Interim.bin %command% -sources` with Proton disabled. Pulsar recompiles the plugin from `~/Development/Vulkan` when files change (debug build). |
 | Frame capture | Run with `VULKAN_SCREENSHOT=/tmp/x.png VULKAN_SCREENSHOT_DELAY=25` (env vars); the renderer writes one PNG after the delay. View it with the Read tool. This is how to verify rendering without the user. |
 | Automatic test | Add `VULKAN_AUTOLOAD=<seconds>` to press **Continue Game** on the main menu automatically (last session), then combine with the frame capture env vars. Fully headless of user input: no clicking needed. |
+| Stock reference capture | `VULKAN_STOCK_SCREENSHOT=/tmp/stock.png` (+ optional `VULKAN_STOCK_SCREENSHOT_DELAY=<s>`) captures through the active renderer (DX11 or Vulkan) after auto-load, for side-by-side calibration. |
 | Stop the game | `kill -TERM $(pgrep Interim)`. **Never `pkill -f <pattern>`** — it matches the invoking shell's own command line and kills the tool shell instead. |
 | Logs | Game log (has `[Vulkan]` lines): newest `~/.config/SpaceEngineers/SpaceEngineers_*.log`; console: `~/.config/SpaceEngineers/Console_*.log` or redirect stdout. Pulsar log: `~/.local/share/PulsarRelease/Legacy/info.log` (plugin compile errors appear here). |
 | Pulsar dev folder config | `~/.local/share/PulsarRelease/Legacy/Sources/sources.xml` (`<LocalPlugin>` Folder=repo, File=`Vulkan.xml`) and `Legacy/Profiles/Current.xml` (`<DevFolder><LocalFolderConfig><Id>7C5A605C-1041-4C94-988A-5DF95F3145F8</Id>`). Already set up. |
@@ -226,6 +265,7 @@ Pulsar client plugin, that:
 | Normal mapping | Opaque normal maps use the stock **derivative** tangent basis (`Geometry/PixelUtils.hlsli NormalBuildTangent` + `PixelTangentSpace`) ported to `Model.slang`, with `adjust_normalmap_no_precomputed_tangents` (`normalMap.x *= -1`) and stock `ToksvigGloss`. This deliberately ignores the per-vertex tangent/`tangent.w` path (`Normal()`), because the cockpit's mirrored UV halves produced a hard centre seam with it. The derivative path is verified clean on the battery front; the respawn pod front still needs a lit capture. |
 | Opaque lighting | Direct sun uses a GGX specular + Lambert diffuse model with stock `SurfaceAlbedo = baseColor * (1 - metalness)` and `SurfaceF0 = lerp(0.04, baseColor, metalness)`; ambient is the game's probe floor times the same albedo; IBL uses the prefiltered skybox + split-sum BRDF. Stock's Forward pass is Lambert-only, but the reference screenshot comes from the deferred PBR path, so specular/reflection are enabled by default (`SpecularScale=1`, `ReflectionScale=1`). Exposure default is provisionally `0.5`; the current captures are too bright versus the stock reference and still need calibration. |
 | Static decals | `DECAL_CUTOUT` parts (cockpit/battery `Paneling*`, `Decals`, etc.) render as alpha-masked opaque geometry through the same `Model.slang` pipeline: `clip(alphamask - 0.5)`, `MaterialFlags.AlphaMasked | Decal`, and the stock `+0.0001` clip-space depth nudge. They use the derivative normal path and are part of the persistent GPU-driven part cache. Blended (`DECAL`) and projected screen-space decals (`Decals.hlsl`) are still not implemented. |
+| Shadows | Three 2048² reverse-Z sun cascades (splits 15/40/150 m; extents 23/55/200 m, light 600 units away), opt-in via **Graphics > Vulkan Renderer > Shadows** or `VULKAN_SHADOWS=1` (restart required). A separate LOD0 GPU caster bucket prevents shadows from disappearing when the forward pass switches to LOD1+; casters are camera-culled opaque parts with back-face culling for cull-enabled actors and an alpha-tested `shadowFragment`. Sampling is fixed 16-tap Poisson PCF with bilinear depth (4/3.2/2.4-texel radius), texel-snapped cascade centres, face-normal offset and slope-scaled bias. Still open: LOD1+ visual verification, near-cascade resolution tuning, contact shadows/SSAO, the dark-side dynamic probe, skinned/transparent casters, a quality slider; RT shadows are Phase 6. The two-sided side decision uses the camera-oriented face normal, not the normal-mapped normal. |
 | User settings | All lighting/exposure/bloom sliders live in a persistent one-element `GpuRenderSettings` storage buffer (set 0 binding 3) once per device, not in per-frame constants. `Config.PropertyChanged` only sets a dirty flag; the render thread uploads the 48-byte block when it changes. Shaders read `renderSettings[0]` (sun/ambient/specular/metalness, emissive/lights/reflection/screen, exposure/bloom). Slider tuning has no per-frame CPU reads or transfers; the frame limit and diagnostics visibility are polled per frame. Defaults: Exposure 0.5, Specular 1, Reflections 1, Sun/Ambient/Metalness/Emissive/Lights 1, Screen 4, Bloom 0.2 (provisional until calibrated against the stock screenshot). |
 | Uploads | Dedicated transfer queue + timeline semaphore when the device exposes a transfer family different from graphics (RADV: family 1); resources use concurrent sharing so copies need no ownership transfer. The graphics submission waits on the batch timeline value (`FrameLoop.EndFrame`), so the copy engine overlaps the previous frame and the CPU never spins. No separate queue: copies fall back into the graphics command buffer. Model GPU building and staging run on workers (max 3); textures are finished on the render thread under a 4 ms/frame budget. |
 | GPU buffers | No UBOs by design: per-frame/per-draw constants go through push constants plus host-visible transient buffers read via buffer device addresses (the modern SSBO style). Persistent device-local buffers hold model vertices/indices, instance data, textures and the skinned streams; a small host-visible `GpuRenderSettings` storage buffer (set 0 binding 3) holds user tuning and is written only on changes. Compute writes/reads (skinning, palette, culling) use the same BDA path. Indirect buffers are host-visible storage buffers with `Indirect` usage. Storage images/RW buffers and acceleration structures are still reserved for OIT, GI/RT. |
@@ -274,11 +314,12 @@ Pulsar client plugin, that:
 | `Render/Vulkan/TransientAllocator.cs` | `GpuContext.Transient`: per-frame linear host-visible scratch with device addresses (frame constants, per-draw data, instances). Reset in `GpuContext.BeginFrame`. |
 | `Render/Scene/SceneTargets.cs` | HDR color (R16G16B16A16_SFLOAT) + depth (D32_SFLOAT, reverse Z, cleared to 0) at the game resolution, bindless slots; recreated on resize. |
 | `Render/Scene/SkyboxPass.cs` | Depth-less fullscreen background sampling the environment cubemap along the view ray. |
+| `Render/Scene/ShadowMap.cs` | Three 2048² reverse-Z sun cascades (15/40/150 m splits; 23/55/200 m extents), texel-snapped light matrices and bindless slots. |
 | `Render/Scene/CameraState.cs` | Camera matrices incl. the stock unflipped culling matrix, `FrameConstants` (view-projection, inverse for rays, skybox orientation, sun, ambient, IBL slots/params, paint conversion `ColorizeHsv`), LOD coefficient. |
 | `Render/Scene/GpuRenderSettings.cs` | Persistent one-element setting block: sun/ambient/specular/metalness, emissive/lights/reflection/screen, exposure/bloom. Uploaded only when `Config` changes. |
 | `Render/Scene/SceneActors.cs` | Render-object registry: create/update/remove, visibility, model change, per-material overrides/flags, `ChangeMaterialTexture` changes, static groups, manual cull-object hierarchy (parent->children map), instance ranges/bounds, max view distance, per-actor LOD; `Revision` drives persistent part-cache rebuilds, `DirtyActors` drives per-actor GPU state refresh, cached world matrices use `transformRevision`, and `Skinned`/`VisibilityUpdates` avoid full scans. Pending pre-create colour/skin state is applied at creation. |
 | `Render/Scene/Frustum.cs` | Five-plane infinite-far-plane culling from the stock view-projection. |
-| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: persistent part cache + GPU LOD/culling for opaque non-skinned actors (incl. static groups/cubes), direct path for skinned/transparent, cull-back/no-cull pipelines, bindless materials, IBL + sun shading; GPU skinning compute pre-pass; visible-object reporting (`VisibleObjectsWrite`). Per-actor GPU records are built once per cache rebuild, refreshed only for dirty actors/instance-buffer changes, and copied to transient memory per frame; the culling shader subtracts the camera. The full part-cache rebuild waits for a quiet frame (max once per 0.75 s, forced after 1.5 s). |
+| `Render/Scene/ModelPass.cs` | Forward opaque MWM pass: persistent part cache + GPU LOD/culling for opaque non-skinned actors (incl. static groups/cubes), direct path for skinned/transparent, cull-back/no-cull pipelines, bindless materials, IBL + sun shading; GPU skinning compute pre-pass; the sun shadow pass (`RecordShadow`, soft PCF, alpha-tested casters, opt-in); visible-object reporting (`VisibleObjectsWrite`). Per-actor GPU records are built once per cache rebuild, refreshed only for dirty actors/instance-buffer changes, and copied to transient memory per frame; the culling shader subtracts the camera. The full part-cache rebuild waits for a quiet frame (max once per 0.75 s, forced after 1.5 s). |
 | `Render/Scene/GpuSceneDraws.cs` | Wire-format structs for persistent parts/LOD ranges/actor state, the cull compute dispatch, and the two indirect cull/no-cull buckets. |
 | `Render/Scene/BloomPass.cs` | Half-resolution HDR bloom: bright-pass, separable blur targets, resize/slot lifetime. |
 | `Render/Scene/InstanceBuffers.cs` | GPU instance buffers for cube/generic ranges. Updates are coalesced: the newest message per buffer is kept (`AddRef`) and uploaded once per frame through `TransferSystem`, replacing the old buffer for frames-in-flight safety. |
@@ -295,8 +336,9 @@ Pulsar client plugin, that:
 | `Render/Sprites/DiagnosticsOverlay.cs` | 60 s diagnostics panel: rolling timestamped 0.5 s buckets, GPU/frame/memory/text stats, GPU text lines, CPU panel/graph rectangles. |
 | `Render/Scene/GpuDiagnostics.cs` | `GpuDiagnosticsCounters` shared with `Scene/Culling.slang`. |
 | `Testing/TestNotification.cs` | `VULKAN_NOTIFICATION` long-duration notification for automated visual checks. |
+| `Testing/StockScreenshot.cs` | `VULKAN_STOCK_SCREENSHOT` reference capture through the active renderer, scheduled after the automated Continue Game. |
 | `Render/Shaders/ShaderBytecode.g.cs` | Generated SPIR-V. Do not edit. |
-| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays + `RenderSettings` storage buffer, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Sprites/TextLayout.slang`, `Post/Composite.slang`, `Scene/Model.slang`, `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Post/Bloom.slang`, `Scene/Culling.slang` (compute), `Scene/Skinning.slang` (compute), `Scene/BonePalette.slang` (compute), `Common/SkinningCommon.slang` (shared layouts); `shaders.json` manifest. |
+| `Shaders/` | Slang sources: `Common/Bindless.slang` (2D + cube arrays + `RenderSettings` storage buffer, must match `BindlessDescriptors`), `Common/Color.slang`, `Common/Environment.slang` (shared `FrameConstants` + skybox orientation/IBL lookups), `Sprites/Sprite.slang`, `Sprites/TextLayout.slang`, `Post/Composite.slang` (includes the raw-shadow-map debug view), `Scene/Model.slang` (`vertexMain`/`fragmentMain` plus `shadowMain`/`shadowFragment`), `Scene/Skybox.slang`, `Scene/Transparent.slang`, `Post/Bloom.slang`, `Scene/Culling.slang` (compute), `Scene/Skinning.slang` (compute), `Scene/BonePalette.slang` (compute), `Common/SkinningCommon.slang` (shared layouts); `shaders.json` manifest. |
 | `Tools/ShaderCompiler`, `Tools/VulkanSmokeTest` | Dev tools (not in `<SourceDirectories>`, never shipped). |
 
 ## Architecture
@@ -677,17 +719,17 @@ Known gaps from Phase 0:
       (format, blend) and allocates instances linearly per frame. `UploadQueue` uses dedicated staging outside an
       open frame. Verified by the cockpit LCD in the user's world (DangerZone background + text).
 - [x] Preload messages: PreloadTextures, PreloadModel(s), PreloadMaterials (background start, GPU work during load)
-- [ ] Texture messages: UnloadTexture(s), DeprioritizeTextures
+- [x] Texture messages: UnloadTexture(s), DeprioritizeTextures (implemented; deprioritize is a no-op)
 - [x] World load / save / reload on Vulkan works (user, 2026-10-17): HUD, menus and "World loaded" text show,
       no errors in the log; the game does not block on render outputs we do not send yet
 - [ ] Video: stubbed (`IsVideoValid` false; the menu shows its static background). Real playback in Phase 7
       (LinuxCompat already has an FFmpeg-based `MyLinuxVideoPlayer` behind `IVideoPlayer`, but it uploads to D3D11)
-- [~] "Vulkan" options screen, first version: `ClientPlugin/Gui/GraphicsOptionsPatch.cs` adds a "Vulkan Renderer"
-      button to the Graphics options screen (verified by frame capture) that opens the plugin's settings dialog
-      (`Plugin.OpenConfigDialog`): Status section (active renderer + fallback reason, GPU, ray tracing / mesh shader
-      support via `RendererStatus` and the new read-only `[Info]` settings element) and Renderer section (renderer
-      choice, validation). Dialog contents not yet seen by the user. Still to do: presets, per-feature options as
-      features land, greyed-out unsupported items with reasons.
+- [x] "Vulkan" options screen, first version: `ClientPlugin/Gui/GraphicsOptionsPatch.cs` adds a "Vulkan Renderer"
+      button to the Graphics options screen (verified by frame capture and by the user) that opens the plugin's
+      settings dialog (`Plugin.OpenConfigDialog`): Status section (active renderer + fallback reason, GPU, ray tracing /
+      mesh shader support via `RendererStatus` and the new read-only `[Info]` settings element) and Renderer section
+      (renderer choice, validation, frame limit, diagnostics, shadows and lighting tuning). Still to do: presets,
+      per-feature options as features land, greyed-out unsupported items with reasons.
 - **Milestone:** full main menu and options usable on Vulkan.
 
 ### Phase 2 — World geometry (in progress)
@@ -701,9 +743,10 @@ Known gaps from Phase 0:
 - [x] Actors/render entities, MWM meshes, cube-grid instancing, static groups
 - [x] Materials (standard + alpha-masked) on bindless textures, stock decodes and colorize;
       block paints and skins verified in game (green capture, user red-paint confirmation)
-- [~] Transparent models (glass, holo, shield): implemented with `MyTransparentMaterials`, premultiplied blend,
-      depth read-only, back-to-front sorting; visual verification pending
-- [ ] Triplanar materials, decals and OIT/dithering
+- [x] Transparent models (glass, holo, shield): implemented with `MyTransparentMaterials`, weighted OIT
+      (accumulation + revealage, no CPU sort), depth read-only; verified in game
+- [~] Triplanar materials and dithering remain; `DECAL_CUTOUT` static decals are in, blended/projected decals are not;
+      OIT is done
 - [x] Skinned characters: GPU compute deformation, GPU bone palette, skeleton/transforms, visibility output;
       character appears correctly posed and animates (third-person capture). First-person head hiding uses the
       game's per-material visibility flags.
@@ -714,9 +757,10 @@ Known gaps from Phase 0:
 - **Milestone:** load a world; grids, characters and planets render.
 
 ### Phase 3 — Lighting and shadows
-- [~] PBR lighting (GGX, energy-conserving), sun + static skybox IBL (done); dynamic scene probe and eye
-      adaptation still open
-- [ ] Cascaded shadow maps (+ PCSS option, contact shadows), spot shadow pool
+- [~] PBR lighting (GGX, energy-conserving), sun + static skybox IBL (done); dynamic scene probe still open, sparse
+      auto-exposure is in (full histogram adaptation remains)
+- [~] Cascaded sun shadows with soft PCF, LOD0 casters and alpha-tested casters (opt-in, 2026-10-21); LOD1+
+      visual verification, contact shadows, the dark-side probe and the spot shadow pool remain
 - [~] Dynamic point/spot lights (`CreateRenderLight`/`UpdateRenderLight` implemented; clustered light culling later)
 - [ ] Dynamic environment probe + prefiltering (scene capture, close/far blend), SSR
 - [ ] SSAO / GTAO
@@ -1167,3 +1211,66 @@ CometWorks/linux-compat) into a scratch dir such as `/tmp/vk-research/`; never v
   red and lit) and `/tmp/vk_lighting_final.png` (player view, ~2.9 ms CPU / 4.7 ms GPU). Removed the temporary
   `DominantNormal`/`LightingDiagnostics` instrumentation and `VULKAN_FLIP_MODEL_NORMALS`/`VULKAN_FLIP_SUN` flags.
   Build and `ShaderCompiler --check` clean. No shadow work, no git operations.
+- **2026-10-20** — Shadow validation started. Added `VulkanSmokeTest --shadow`, which builds the exact
+  depth-only model pipeline used by the shadow pass; it passes on RADV (the Khronos validation layer is not
+  installed on this machine). The in-game pass now runs with `VULKAN_SHADOWS=1` without the earlier GPU reset
+  (the standalone module/color-attachment defects are fixed). Corrected the reverse-Z comparison from
+  `stored >= ndc.z - bias` (opposite direction) to `ndc.z >= stored - bias`. Frame constants, the bindless
+  slot and depth samples reach the shader, but cast shadows were not visually confirmed on the turret/hangar
+  captures, so the pass remains gated and off by default. Removed the temporary debug views and frame logs.
+  Build and shader check clean. Next: read back/dump the shadow map, then verify the light-space projection
+  and caster depths. No git operations.
+- **2026-10-20 (continued)** — Sun shadow validation complete on the user's test platform. Added `Model.slang`
+  `shadowFragment` (alpha-masked casters), back-face culling for the shadow pass, a 100 m map extent, 12-tap
+  Poisson soft PCF (3-texel radius), slope-scaled bias and `ShadowPassRecorded` gating; exposed an opt-in
+  **Shadows** checkbox (restart required) with the `VULKAN_SHADOWS=1` test override. The shadow-factor view shows
+  the platform shadow at the blue pillar's foot is correct but the pillar's visible face is outside the red
+  pillar's cast-shadow volume; the vertical junction needs contact shadows/SSAO, not a bias change. Verified
+  on/off (`/tmp/vk_test_shadow_on.png`, `/tmp/vk_test_shadow_off.png`), soft
+  PCF (`/tmp/vk_shadow_soft2.png`), shadow factor (`/tmp/vk_shadow_factor2.png`) and a 60 m sun-side view
+  (`/tmp/vk_shadow_side_sun3.png`); added raw-map debug view 9 and `VULKAN_DEBUG_DISTANCE`/`TOP` camera options.
+  Removed the `CacheDiagnostics` dump, the skin-ready log and the cockpit-part dump. Build, shader check and
+  `VulkanSmokeTest --shadow` pass. Remaining: cascades/PCSS, contact shadows/SSAO for vertical junctions, texel
+  snapping, skinned/transparent casters and a quality slider; RT shadows later. No git operations.
+
+- **2026-10-21** — Shadows reworked after the user's close-up feedback (blocky, LOD pop, dither, false-looking
+  edges). Replaced the single 100 m map with **three cascaded 2048² maps** (15/40/150 m splits; initially 15/40/110 m
+  light-space extents, widened to 23/55/200 m in the cascade-coverage fix below) and texel-snapped cascade centres. Added **separate LOD0 shadow caster buckets** to
+  `GpuSceneDraws`/`Culling.slang`, so the forward pass can switch to LOD1 without losing the shadow silhouette.
+  Replaced the 12-tap fixed PCF with a **16-tap Poisson PCF using bilinear depth**, cascade-scaled width
+  (4/3.2/2.4 texels) and a stable per-cascade rotation; the earlier PCSS blocker search and per-pixel rotation
+  were removed because without TAA they produced speckled/static edges. Shadow offset/bias use the
+  **camera-oriented face normal**, not the normal-mapped or vertex normal. Verified the close-up shadow factor is smooth
+  (`/tmp/vk_geomnormal_factor.png`) and captured cascaded close-up (`/tmp/vk_twosided_geom.png`) and 60 m views
+  (`/tmp/vk_lod60*.png`). The noisy dark edge on the large red panel was initially the **two-sided front/back decision** using the
+  normal-mapped normal, which flickered at grazing angles; that side decision now uses the face normal. The
+  remaining diagonal across the long blocks was cascade coverage (see the cascade-coverage entry below). Also
+  fixed `VULKAN_SHADOWS=0` so it actually forces shadows off for tests (previously only `1` overrode the setting),
+  and added `VULKAN_NO_TRANSPARENT=1` for isolating transparent geometry. The dark side still needs the dynamic
+  probe. Investigated the remaining diagonal line on the user's panel: it survives shadows-off, transparent-off,
+  no-cull forward, LOD0 and per-vertex tangents, and an ambient floor turns it dark red (so it is diffuse). Root
+  cause: the model's vertex normals point away across the panel bevel. Diffuse now uses the triangle face normal
+  (camera-oriented for two-sided panels); the normal map was later reduced to gloss only. The sunlit diamond is
+  gone in `/tmp/vk_fixed.png`. Reverted the no-cull/ambient/LOD experiments. Build, shader check and
+  `VulkanSmokeTest --shadow` pass. Remaining: verify LOD1+ on the user's ship, contact shadows/SSAO, near-cascade
+  tuning, the terminator/ambient probe, skinned/transparent casters and a quality slider. No git operations.
+
+- **2026-10-21 (continued)** — Finished the red-panel diamond. The face-normal diffuse fix removed the sunlit
+  diamond, but the user still saw a diagonal on flat panels and lines inside shadows. Two remaining paths used the
+  bad model normal: **specular/ambient-specular** through the normal map, and the **shadow normal offset/bias**.
+  The shader now sets `n = faceNormal` for all lighting (the normal map only provides Toksvig gloss), and the
+  shadow lookup offsets/biases along the camera-oriented face normal instead of the vertex normal. The old
+  two-sided `geometricNormal` flip is gone because the face normal is already camera-oriented. Added an
+  `albedo * 0.25 * AmbientScale` ambient floor as a stand-in for the missing dynamic probe, which also makes the
+  **Ambient** slider effective (it previously multiplied a zero ambient). Verified at the user's camera:
+  `/tmp/vk_faceall.png`, `/tmp/vk_ambient25.png`, `/tmp/vk_shadowface.png` (shadows on) and
+  `/tmp/vk_shadowface_off.png` (shadows off). Build, shader check and `VulkanSmokeTest --shadow` pass. Remaining:
+  replace the floor with the real dynamic probe, contact shadows/SSAO, LOD1+ verification and a shadow quality
+  slider. No git operations.
+
+- **2026-10-21 (cascade coverage)** — The remaining diagonal/diamond that cut across the long red blocks was the
+  **shadow cascade coverage**, not the hull shadow: the 15/40/110 m light-space extents were smaller than the camera
+  frustum slice at the 15/40/150 m splits, so the shadow map's UV border returned lit on part of the receiver.
+  Widened the extents to **23/55/200 m** (near ~2.2 cm/texel, mid ~5.4 cm, far ~19.5 cm). The shadow now continues
+  across each split and the diagonal/diamond is gone in `/tmp/vk_wide.png` and `/tmp/vk_wide_restored.png` (same
+  camera as `/tmp/vk_new.png`). Build, shader check and `VulkanSmokeTest --shadow` pass. Remaining unchanged.

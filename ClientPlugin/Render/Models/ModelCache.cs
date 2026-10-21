@@ -268,14 +268,6 @@ internal sealed class ModelCache : IDisposable
         var skinned = gpu.Lods[0].Skinned ? $", skinned {gpu.Lods[0].VertexStride} B/vertex" : "";
         RenderLog.Info($"Model loaded: {gpu.Name} ({gpu.LodCount} LODs, LOD0 {gpu.Lods[0].Parts.Length} parts{distances}{skinned})" +
                        (transparent.Count > 0 ? "; transparent: " + string.Join(", ", transparent) : ""));
-        if (gpu.Name.Contains("Cockpit", StringComparison.OrdinalIgnoreCase))
-        {
-            foreach (var part in gpu.Lods[0].Parts)
-            {
-                RenderLog.Info($"Cockpit part '{part.MaterialName}' ({part.IndexCount} idx, {part.Technique}): " +
-                               $"cm '{part.ColorMetal?.Path}', ng '{part.NormalGloss?.Path}', ext '{part.Extensions?.Path}'");
-            }
-        }
     }
 
     private void Load(Entry entry)

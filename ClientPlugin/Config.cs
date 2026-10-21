@@ -41,6 +41,7 @@ public class Config : INotifyPropertyChanged
     private float screenScale = 4f;
     private float lightScale = 1f;
     private float bloomScale = 0.2f;
+    private bool shadows = false;
 
     #endregion
 
@@ -89,6 +90,15 @@ public class Config : INotifyPropertyChanged
     {
         get => diagnostics;
         set => SetField(ref diagnostics, value);
+    }
+
+    [Separator("Shadows")]
+
+    [Checkbox(label: "Sun shadows (restart required)", description: "Experimental cascaded sun shadows with soft PCF and alpha-tested casters. Restart required. Contact shadows, LOD1+ verification and quality options are planned.")]
+    public bool Shadows
+    {
+        get => shadows;
+        set => SetField(ref shadows, value);
     }
 
     [Separator("World lighting tuning")]

@@ -99,6 +99,18 @@ static const float3 PACKED_DIR[6] =
     float3(1, 0, 0), float3(0, 1, 0), float3(0, -1, 0)
 };
 
+// Unit-disk sample set for the soft PCF penumbra. The disk is rotated per cascade so the fixed
+// pattern does not line up across the three maps.
+static const float2 SHADOW_DISK[16] =
+{
+    float2(-0.326, -0.406), float2(-0.840, -0.074), float2(-0.696, 0.457),
+    float2(-0.203, 0.621), float2(0.962, -0.195), float2(0.473, -0.480),
+    float2(0.519, 0.767), float2(0.185, -0.893), float2(0.507, 0.064),
+    float2(0.896, 0.412), float2(-0.322, -0.933), float2(-0.792, -0.598),
+    float2(-0.050, 0.930), float2(0.760, 0.700), float2(-0.950, 0.150),
+    float2(0.120, -0.220)
+};
+
 [[vk::push_constant]] ConstantBuffer<PushConstants> push;
 
 // VF_Packer.UnpackNormal / VertexTransformations.hlsli unpack_normal
@@ -364,9 +376,17 @@ float3 addDirectionalLight(float3 n, float3 albedo, float3 f0, float gloss, floa
 // Sun shadow depth pass. Reuses the opaque ShaderBytecode.Model module (a standalone vertex-only
 // module crashes RADV's pipeline compiler). The four "world" push constants carry the light
 // view-projection rows instead of an object matrix.
+struct ShadowVertexOutput
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    nointerpolation uint alphamask : TEXCOORD1;
+    nointerpolation uint flags : TEXCOORD2;
+};
+
 [shader("vertex")]
-float4 shadowMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID,
-    uint drawIndex : SV_DrawIndex) : SV_Position
+ShadowVertexOutput shadowMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID,
+    uint drawIndex : SV_DrawIndex)
 {
     DrawData draw = push.drawData[drawIndex];
     uint index = draw.indices[draw.indexStart + vertexId];
@@ -387,8 +407,97 @@ float4 shadowMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID,
 
     float4 world = float4(dot(position, draw.world0), dot(position, draw.world1),
                          dot(position, draw.world2), 1.0);
-    return float4(dot(world, push.world0), dot(world, push.world1),
-                  dot(world, push.world2), dot(world, push.world3));
+
+    ShadowVertexOutput output;
+    output.position = float4(dot(world, push.world0), dot(world, push.world1),
+                             dot(world, push.world2), dot(world, push.world3));
+    output.uv = vertex.texcoord;
+    output.alphamask = draw.material.alphamask;
+    output.flags = draw.material.flags;
+    return output;
+}
+
+// Alpha-masked casters (DECAL_CUTOUT, fences, grilles) keep their cutout silhouette in the
+// shadow map instead of casting a full quad. Opaque casters still pay one fragment stage;
+// the branch only samples the alphamask for alpha-masked materials.
+[shader("fragment")]
+void shadowFragment(ShadowVertexOutput input)
+{
+    if ((input.flags & uint(MaterialFlags.AlphaMasked)) != 0 &&
+        (input.flags & uint(MaterialFlags.HasAlphamask)) != 0)
+    {
+        float alpha = sampleTexture(input.alphamask, SamplerSlot.LinearClamp, input.uv).r;
+        if (alpha < 0.5)
+            discard;
+    }
+}
+
+struct ShadowCascadeSample
+{
+    float4x4 matrix;
+    uint slot;
+    float extent;
+};
+
+ShadowCascadeSample getShadowCascade(int cascade)
+{
+    ShadowCascadeSample result;
+    if (cascade == 0)
+    {
+        result.matrix = float4x4(push.frame.shadowMatrix0, push.frame.shadowMatrix1,
+                                 push.frame.shadowMatrix2, push.frame.shadowMatrix3);
+        result.slot = push.frame.shadowMap;
+        result.extent = push.frame.shadowCascadeParams.x;
+    }
+    else if (cascade == 1)
+    {
+        result.matrix = float4x4(push.frame.shadowMatrix1_0, push.frame.shadowMatrix1_1,
+                                 push.frame.shadowMatrix1_2, push.frame.shadowMatrix1_3);
+        result.slot = push.frame.shadowMap1;
+        result.extent = push.frame.shadowCascadeParams.y;
+    }
+    else
+    {
+        result.matrix = float4x4(push.frame.shadowMatrix2_0, push.frame.shadowMatrix2_1,
+                                 push.frame.shadowMatrix2_2, push.frame.shadowMatrix2_3);
+        result.slot = push.frame.shadowMap2;
+        result.extent = push.frame.shadowCascadeParams.z;
+    }
+    return result;
+}
+
+// Soft shadow lookup for one cascade. A fixed wide Poisson kernel is used instead of a stochastic
+// blocker search: without temporal accumulation, per-pixel blocker variance reads as dither/static.
+float sampleShadowCascade(float4x4 matrix, uint slot, float extent, float3 worldPosition, float3 n,
+    float nol, float softness, float rotation)
+{
+    float texelWorld = 2.0 * extent / max((float)push.frame.shadowSize, 1.0);
+    // One-texel normal offset suppresses self-shadowing on thin/edge geometry.
+    float4 light = float4(worldPosition + n * texelWorld, 1.0);
+    float4 shadowPos = float4(dot(light, matrix[0]), dot(light, matrix[1]),
+                              dot(light, matrix[2]), dot(light, matrix[3]));
+    float3 ndc = shadowPos.xyz / max(shadowPos.w, 1e-6);
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0) || ndc.z < 0.0 || ndc.z > 1.0)
+        return 1.0;
+
+    float texel = push.frame.shadowParams.z / max((float)push.frame.shadowSize, 1.0);
+    float bias = push.frame.shadowParams.y / max(nol, 0.25);
+    float cs = cos(rotation);
+    float sn = sin(rotation);
+    float2x2 rot = float2x2(cs, -sn, sn, cs);
+    float radius = texel * max(softness, 1.0);
+
+    float lit = 0.0;
+    [unroll]
+    for (int j = 0; j < 16; j++)
+    {
+        float2 offset = mul(SHADOW_DISK[j], rot) * radius;
+        // Linear depth filtering turns the 16 taps into a smoother penumbra than point sampling.
+        float stored = sampleTextureLevel(slot, SamplerSlot.LinearClamp, uv + offset, 0.0).r;
+        lit += ndc.z >= stored - bias ? 1.0 : 0.0; // reverse-Z: nearer fragment has larger depth
+    }
+    return lit / 16.0;
 }
 
 [shader("fragment")]
@@ -438,12 +547,19 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     if ((flags & uint(MaterialFlags.HasNormalGloss)) != 0)
     {
         float3 normalMap = ng.xyz * 2.0 - 1.0;
-        // Geometry/PixelUtils.hlsli NormalBuildTangent. Rebuild the tangent basis from the
-        // screen-space UV derivatives instead of trusting per-vertex tangents: the cockpit's
-        // mirrored UV halves otherwise receive opposite bitangents and shade as two panels.
-        normalMap.x *= -1.0;
         float normalLength = length(normalMap);
-        n = normalize(mul(normalMap, pixelTangentSpace(n, input.worldPosition, input.uv)));
+        if (dot(input.tangent.xyz, input.tangent.xyz) > 1e-8)
+        {
+            normalMap.y *= -1.0;
+            float3 tangent = normalize(input.tangent.xyz - n * dot(n, input.tangent.xyz));
+            float3 bitangent = cross(n, tangent) * input.tangent.w;
+            n = normalize(mul(normalMap, float3x3(tangent, bitangent, n)));
+        }
+        else
+        {
+            normalMap.x *= -1.0;
+            n = normalize(mul(normalMap, pixelTangentSpace(n, input.worldPosition, input.uv)));
+        }
 
         gloss = toksvigGloss(ng.w, min(normalLength, 1.0));
     }
@@ -452,16 +568,14 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float emissive = saturate(extras.y - 1.0 / 255.0) * material.colorMulEmissive.w;
 
     float3 toCamera = normalize(-input.worldPosition);
-    // Two-sided lighting: open panels (doors, hangar doors) are visible from both sides, but the
-    // MWM normal belongs to only one side. The shaded side is the one facing the viewer, so align
-    // the normal with the view vector before evaluating the sun/ambient lobes.
-    if (dot(n, toCamera) < 0.0)
-        n = -n;
-
     float3 toSun = -normalize(push.frame.sunDirection.xyz);
     float3 sunColor = push.frame.sunColor.rgb * push.frame.sunDirection.w * renderSettings[0].tuning0.x;
 
-    float nol = saturate(dot(n, toSun));
+    float3 faceNormal = normalize(cross(ddx(input.worldPosition), ddy(input.worldPosition)));
+    if (dot(faceNormal, toCamera) < 0.0)
+        faceNormal = -faceNormal;
+    float nol = saturate(dot(faceNormal, toSun));
+    n = faceNormal;
     float3 halfVector = normalize(toSun + toCamera);
     float noh = saturate(dot(n, halfVector));
     float voh = saturate(dot(toCamera, halfVector));
@@ -476,35 +590,49 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 diffuse = albedo * (nol / PI);
     float3 direct = (diffuse + fresnel * specular * nol * renderSettings[0].tuning0.z) * sunColor;
 
-    // Sun shadow map (reverse-Z, 3x3 PCF). Only the main directional light is shadowed; stock
-    // applies the same map scale/AO split to the fill lights separately.
+    // Sun shadow cascades (reverse-Z). Three maps: a tight near cascade for close-up texel density,
+    // a mid cascade and a far cascade. The filter narrows with distance so the far map does not turn
+    // into visible dither, and neighbouring cascades overlap across a split to avoid a pop.
+    float shadowFactor = 1.0;
     if (push.frame.shadowEnabled != 0)
     {
-        float4 light = float4(input.worldPosition, 1.0);
-        float4 shadowPos = float4(dot(light, push.frame.shadowMatrix0),
-                                  dot(light, push.frame.shadowMatrix1),
-                                  dot(light, push.frame.shadowMatrix2),
-                                  dot(light, push.frame.shadowMatrix3));
-        float3 ndc = shadowPos.xyz / max(shadowPos.w, 1e-6);
-        float2 uv = ndc.xy * 0.5 + 0.5;
-        if (all(uv >= 0.0) && all(uv <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0)
+        float viewDistance = length(input.worldPosition);
+        float split0 = push.frame.shadowSplits.x;
+        float split1 = push.frame.shadowSplits.y;
+        float split2 = push.frame.shadowSplits.z;
+
+        int cascade = viewDistance < split0 ? 0 : (viewDistance < split1 ? 1 : 2);
+        if (viewDistance < split2)
         {
-            float texel = push.frame.shadowParams.z / max((float)push.frame.shadowSize, 1.0);
-            float bias = push.frame.shadowParams.y;
-            float lit = 0.0;
-            [unroll]
-            for (int y = -1; y <= 1; y++)
+            float nolGeometric = saturate(dot(faceNormal, toSun));
+
+            // Stable per-cascade rotation and filter width. The near cascade gets the widest
+            // filter (in its smaller texels); distant cascades need less screen-space dither.
+            ShadowCascadeSample current = getShadowCascade(cascade);
+            float softness = push.frame.shadowParams.w *
+                (cascade == 0 ? 1.0 : (cascade == 1 ? 0.8 : 0.6));
+            shadowFactor = sampleShadowCascade(current.matrix, current.slot, current.extent,
+                input.worldPosition, faceNormal, nolGeometric, softness, (float)cascade * 1.1);
+
+            // Blend into the next cascade near each split so the wider filter/texel grid does not
+            // pop as the camera crosses a cascade boundary.
+            float blend = 0.0;
+            if (cascade == 0 && viewDistance > split0 * 0.88)
+                blend = smoothstep(split0 * 0.88, split0, viewDistance);
+            else if (cascade == 1 && viewDistance > split1 * 0.90)
+                blend = smoothstep(split1 * 0.90, split1, viewDistance);
+
+            if (blend > 0.0)
             {
-                [unroll]
-                for (int x = -1; x <= 1; x++)
-                {
-                    float stored = sampleTextureLevel(push.frame.shadowMap, SamplerSlot.PointClamp,
-                        uv + float2(x, y) * texel, 0.0).r;
-                    lit += stored >= ndc.z - bias ? 1.0 : 0.0;
-                }
+                ShadowCascadeSample next = getShadowCascade(cascade + 1);
+                float nextSoftness = push.frame.shadowParams.w * (cascade == 0 ? 0.8 : 0.6);
+                float nextShadow = sampleShadowCascade(next.matrix, next.slot, next.extent,
+                    input.worldPosition, faceNormal, nolGeometric, nextSoftness,
+                    (float)(cascade + 1) * 1.1);
+                shadowFactor = lerp(shadowFactor, nextShadow, blend);
             }
-            lit /= 9.0;
-            direct *= lerp(1.0, lit, saturate(push.frame.shadowParams.x));
+
+            direct *= lerp(1.0, shadowFactor, saturate(push.frame.shadowParams.x));
         }
     }
 
@@ -538,7 +666,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
                 attenuationHard *= cone;
             }
 
-            float nolLight = saturate(dot(n, L));
+            float nolLight = saturate(dot(faceNormal, L));
             if (attenuationHard <= 0.0 || nolLight <= 0.0)
                 continue;
 
@@ -568,6 +696,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     // AmbientForwardPass is the stock forward ambient and avoids washing albedo out to white.
     float3 ambient = albedo * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
                      renderSettings[0].tuning0.y * ao;
+    ambient += albedo * renderSettings[0].tuning0.y * 0.25;
     float3 ambientSpecular = 0;
     if (push.frame.iblCube != 0 && renderSettings[0].tuning1.z > 0.0)
     {
@@ -590,6 +719,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         return float4(emissiveColor, 1.0);
     if (debugView == 5)
         return float4(albedo, 1.0);
-
+    if (debugView == 6)
+        return float4(shadowFactor.xxx, 1.0);
     return float4(direct + ambient + ambientSpecular + emissiveColor, 1.0);
 }

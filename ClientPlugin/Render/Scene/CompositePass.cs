@@ -19,6 +19,8 @@ internal sealed unsafe class CompositePass : IDisposable
         public uint OitReveal;
         public uint ExposureTexture;
         public uint BloomTexture;
+        public uint ShadowMap;
+        public uint ShadowDebug;
         public float WhitePoint;
     }
 
@@ -38,7 +40,7 @@ internal sealed unsafe class CompositePass : IDisposable
     }
 
     public void Record(VkCommandBuffer commands, SceneTargets targets, VkExtent2D backbuffer,
-        uint exposureTexture, uint bloomTexture, float whitePoint)
+        uint exposureTexture, uint bloomTexture, uint shadowMap, bool shadowDebug, float whitePoint)
     {
         var api = context.Device.Api;
         api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics, pipeline);
@@ -56,6 +58,8 @@ internal sealed unsafe class CompositePass : IDisposable
             OitReveal = targets.OitRevealSlot,
             ExposureTexture = exposureTexture,
             BloomTexture = bloomTexture,
+            ShadowMap = shadowMap,
+            ShadowDebug = shadowDebug ? 1u : 0u,
             WhitePoint = whitePoint,
         };
         api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All, 0, (uint)sizeof(PushConstants), &push);

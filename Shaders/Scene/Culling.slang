@@ -1,6 +1,6 @@
 // GPU-driven opaque scene culling over persistent actor/part/LOD data. One thread per actor selects
-// the LOD (stock hysteresis), then appends one command + draw data per visible part into one of two
-// buckets (cull/no-cull). The CPU submits one vkCmdDrawIndirectCount per bucket.
+// the camera LOD (stock hysteresis) for the forward buckets, then appends the LOD0 parts to the
+// shadow caster buckets. The CPU submits one vkCmdDrawIndirectCount per bucket.
 //
 // Layouts must match ClientPlugin/Render/Scene/GpuSceneDraws.cs and Scene/Model.slang.
 
@@ -67,7 +67,7 @@ struct LodRange
     uint count;
 };
 
-// Must match CullParams (64 bytes)
+// Must match CullParams (GpuSceneDraws.cs)
 struct CullParams
 {
     float lodCoefficient;
@@ -82,6 +82,8 @@ struct CullParams
     uint pad0;
     uint64_t bucket0;
     uint64_t bucket1;
+    uint64_t bucket2;
+    uint64_t bucket3;
     uint64_t diagnostics;
     float4 cameraPosition;
 };
@@ -295,5 +297,55 @@ void main(uint3 threadId : SV_DispatchThreadID)
         draw.pad2 = 0;
         draw.pad3 = 0;
         draws[slot] = draw;
+    }
+
+    // Shadow casters are a separate LOD0 draw list: the forward pass may use a higher LOD, but the
+    // shadow map must keep a consistent silhouette at distance or shadows pop when crossing a LOD.
+    LodRange shadowRange = push.ranges[actor.rangeBase];
+    if (shadowRange.count == 0)
+        return;
+
+    uint64_t shadowBase = (actor.flags & 1u) != 0 ? params.bucket3 : params.bucket2;
+    uint* shadowCounter = (uint*)shadowBase;
+    DrawCommand* shadowCommands = (DrawCommand*)(shadowBase + CommandOffset);
+    DrawData* shadowDraws = (DrawData*)(shadowBase + CommandOffset + (uint64_t)params.maxParts * 16);
+
+    for (uint partIndex = 0; partIndex < shadowRange.count; partIndex++)
+    {
+        ScenePart part = push.parts[shadowRange.start + partIndex];
+
+        uint slot;
+        InterlockedAdd(shadowCounter[0], 1, slot);
+
+        uint instanceCount = max(actor.instanceCount, 1u);
+        DrawCommand command;
+        command.vertexCount = part.indexCount;
+        command.instanceCount = instanceCount;
+        command.firstVertex = 0;
+        command.firstInstance = 0;
+        shadowCommands[slot] = command;
+
+        DrawData draw;
+        draw.world0 = actor.world0;
+        draw.world1 = actor.world1;
+        draw.world2 = actor.world2;
+        draw.world3 = actor.world3;
+        draw.world0.w -= camera.x;
+        draw.world1.w -= camera.y;
+        draw.world2.w -= camera.z;
+        draw.colorMaskHsv = actor.colorMaskHsv;
+        draw.material = part.material;
+        draw.vertices = part.vertices;
+        draw.indices = part.indices;
+        draw.indexStart = part.indexStart;
+        draw.indexCount = part.indexCount;
+        draw.pad0 = 0;
+        draw.pad1 = 0;
+        draw.instances = (CubeInstance*)actor.instances;
+        draw.instanceStart = actor.instanceStart;
+        draw.instanceCount = actor.instanceCount;
+        draw.pad2 = 0;
+        draw.pad3 = 0;
+        shadowDraws[slot] = draw;
     }
 }

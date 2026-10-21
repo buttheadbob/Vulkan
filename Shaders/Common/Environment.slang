@@ -72,7 +72,23 @@ public struct FrameConstants
     public uint shadowSize;
     public uint shadowEnabled;
     public uint shadowPad;
-    public float4 shadowParams; // x: strength, y: depth bias, z: PCF texel scale
+    public float4 shadowParams; // x: strength, y: depth bias, z: PCF texel scale, w: softness
+
+    // Cascades 1 and 2; cascade 0 uses shadowMatrix0..3 and shadowMap above.
+    public float4 shadowMatrix1_0;
+    public float4 shadowMatrix1_1;
+    public float4 shadowMatrix1_2;
+    public float4 shadowMatrix1_3;
+    public float4 shadowMatrix2_0;
+    public float4 shadowMatrix2_1;
+    public float4 shadowMatrix2_2;
+    public float4 shadowMatrix2_3;
+    public float4 shadowSplits;         // x,y,z: far view distance; w: count
+    public float4 shadowCascadeParams;  // x,y,z: light-space extent
+    public uint shadowMap1;
+    public uint shadowMap2;
+    public uint shadowPad1;
+    public uint shadowPad2;
 
     // User tuning lives in the persistent GPU settings buffer (Bindless.renderSettings).
 };

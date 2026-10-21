@@ -453,7 +453,6 @@ internal sealed class SceneActors
         if (message.Data.HasLocalMatrix)
         {
             actor.LocalMatrix = message.Data.LocalMatrix;
-            LocalMatrixUpdates++;
             transformRevision++;
             MarkDirtyTree(actor);
         }
@@ -463,8 +462,6 @@ internal sealed class SceneActors
             MarkDirty(actor);
         }
     }
-
-    public long LocalMatrixUpdates { get; private set; }
 
     public void SetVisible(uint id, bool visible, bool near)
     {

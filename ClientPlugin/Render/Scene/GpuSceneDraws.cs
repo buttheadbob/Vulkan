@@ -77,6 +77,8 @@ internal struct CullParams
     public uint Pad0;
     public ulong Bucket0;
     public ulong Bucket1;
+    public ulong Bucket2;
+    public ulong Bucket3;
     public ulong Diagnostics;
     public Vector4 CameraPosition;
 }
@@ -121,8 +123,9 @@ internal struct CullPushConstants
 }
 
 // GPU-driven opaque path. The persistent part/range/LOD-state buffers are owned by ModelPass and
-// rebuilt only on render messages; this class owns the per-frame indirect buckets and submits one
-// draw per bucket.
+// rebuilt only on render messages; this class owns the per-frame indirect buckets: forward cull and
+// no-cull, plus LOD0 shadow caster cull and no-cull. The shadow buckets are always LOD0 so a ship
+// switching to LOD1 does not lose its shadows.
 internal sealed unsafe class GpuSceneDraws : IDisposable
 {
     public const int CommandOffset = 64;
@@ -130,7 +133,7 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
     private const int InitialCapacity = 8192;
 
     private readonly GpuContext context;
-    private readonly GpuBuffer[,] bucketBuffers = new GpuBuffer[FrameLoop.FramesInFlight, 2];
+    private readonly GpuBuffer[,] bucketBuffers = new GpuBuffer[FrameLoop.FramesInFlight, 4];
     private readonly GpuBuffer[] diagnosticsBuffers = new GpuBuffer[FrameLoop.FramesInFlight];
     private readonly int[] capacities = new int[FrameLoop.FramesInFlight];
     private readonly VkPipeline pipeline;
@@ -184,7 +187,7 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
         Counters = *(GpuDiagnosticsCounters*)diagnosticsBuffers[slot].Mapped;
         *(GpuDiagnosticsCounters*)diagnosticsBuffers[slot].Mapped = default;
         EnsureCapacity(maxDraws);
-        for (var bucket = 0; bucket < 2; bucket++)
+        for (var bucket = 0; bucket < 4; bucket++)
             *(uint*)bucketBuffers[slot, bucket].Mapped = 0;
     }
 
@@ -196,7 +199,7 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
 
         var newCapacity = Math.Max(Math.Max(needed, InitialCapacity), capacity * 2);
         var bucketSize = (ulong)(CommandOffset + newCapacity * 16 + newCapacity * DrawStride);
-        for (var bucket = 0; bucket < 2; bucket++)
+        for (var bucket = 0; bucket < 4; bucket++)
         {
             bucketBuffers[slot, bucket]?.Dispose();
             bucketBuffers[slot, bucket] = GpuBuffer.Create(context, bucketSize,
@@ -247,6 +250,8 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
             MaxParts = (uint)capacities[slot],
             Bucket0 = bucketBuffers[slot, 0].DeviceAddress,
             Bucket1 = bucketBuffers[slot, 1].DeviceAddress,
+            Bucket2 = bucketBuffers[slot, 2].DeviceAddress,
+            Bucket3 = bucketBuffers[slot, 3].DeviceAddress,
             Diagnostics = diagnosticsBuffers[slot].DeviceAddress,
             CameraPosition = new Vector4((Vector3)cameraPosition, 0),
         };

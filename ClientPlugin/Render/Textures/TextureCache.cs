@@ -351,8 +351,6 @@ internal sealed class TextureCache : IDisposable
 
             entry.Status = State.Ready;
             ReadyGeneration++;
-            if (entry.Path.Contains("Skins", StringComparison.OrdinalIgnoreCase))
-                RenderLog.Info($"Skin texture ready: {entry.Path} slot {entry.Slot}");
         }
     }
 
