@@ -150,6 +150,7 @@ internal sealed unsafe class ModelPass : IDisposable
         public bool HasTransparent;
         public int PartStart;
         public int PartCount;
+        public bool Skinned;
         public bool Dead;
     }
 
@@ -191,6 +192,7 @@ internal sealed unsafe class ModelPass : IDisposable
     private readonly VkPipeline shadowPipelineNoCull;
     private readonly Matrix[] shadowViewProjections = new Matrix[ShadowMap.Count];
     private readonly List<SceneActor> directActors = new();
+    private readonly List<SceneActor> drawActors = new();
     private readonly List<TransparentDraw> transparentDraws = new();
 
     private readonly List<CachedActor> cachedActors = new();
@@ -228,12 +230,15 @@ internal sealed unsafe class ModelPass : IDisposable
     private bool gpuSubmitted;
     private readonly VkPipeline pipeline;
     private readonly VkPipeline pipelineNoCull;
+    private readonly VkPipeline probePipeline;
+    private readonly VkPipeline probePipelineNoCull;
     private readonly VkPipeline pipelineTransparent;
     private readonly VkPipeline pipelineTransparentNoCull;
     private readonly VkPipeline skinningPipeline;
     private readonly VkPipeline palettePipeline;
 
-    public ModelPass(GpuContext context, ModelCache models, InstanceBuffers instanceBuffers, TextureCache textures)
+    public ModelPass(GpuContext context, ModelCache models, InstanceBuffers instanceBuffers, TextureCache textures,
+        VkSampleCountFlags samples)
     {
         Array.Fill(slotCacheVersion, -1L);
         Array.Fill(slotPartsVersion, -1L);
@@ -275,13 +280,14 @@ internal sealed unsafe class ModelPass : IDisposable
             shadowPipelineNoCull = ShadowBuilder(VkCullModeFlags.None).Build(context, "shadow-nocull");
         }
 
-        GraphicsPipelineBuilder Builder(VkCullModeFlags cullMode) => new()
+        GraphicsPipelineBuilder Builder(VkCullModeFlags cullMode, VkSampleCountFlags sampleCount) => new()
         {
             Code = ShaderBytecode.Model.Code.ToArray(),
             VertexEntry = ShaderBytecode.Model.VertexMain,
             FragmentEntry = ShaderBytecode.Model.FragmentMain,
-            ColorFormats = [SceneTargets.ColorFormat],
+            ColorFormats = [SceneTargets.ColorFormat, SceneTargets.GBufferFormat, SceneTargets.GBufferFormat],
             DepthFormat = SceneTargets.DepthFormat,
+            Samples = sampleCount,
             DepthTest = true,
             DepthWrite = true,
             DepthCompare = VkCompareOp.GreaterOrEqual, // Reverse Z
@@ -309,8 +315,12 @@ internal sealed unsafe class ModelPass : IDisposable
             FrontFace = VkFrontFace.Clockwise,
         };
 
-        pipeline = Builder(VkCullModeFlags.Back).Build(context, "model");
-        pipelineNoCull = Builder(VkCullModeFlags.None).Build(context, "model-nocull");
+        pipeline = Builder(VkCullModeFlags.Back, samples).Build(context, "model");
+        pipelineNoCull = Builder(VkCullModeFlags.None, samples).Build(context, "model-nocull");
+        // Probe faces are single-sample, so they cannot use the main MSAA pipelines.
+        probePipeline = Builder(VkCullModeFlags.Back, VkSampleCountFlags.Count1).Build(context, "model-probe");
+        probePipelineNoCull = Builder(VkCullModeFlags.None, VkSampleCountFlags.Count1)
+            .Build(context, "model-probe-nocull");
         pipelineTransparent = TransparentBuilder(VkCullModeFlags.Back).Build(context, "transparent");
         pipelineTransparentNoCull = TransparentBuilder(VkCullModeFlags.None).Build(context, "transparent-nocull");
         skinningPipeline = BuildComputePipeline(context, ShaderBytecode.Skinning.Code,
@@ -357,7 +367,7 @@ internal sealed unsafe class ModelPass : IDisposable
     {
         var profile = Stopwatch.StartNew();
         var api = context.Device.Api;
-        var settings = lodding.Global;
+        var settings = MyGlobalLoddingSettings.Default;
         var any = false;
 
         foreach (var actor in actors.Skinned)
@@ -605,14 +615,16 @@ internal sealed unsafe class ModelPass : IDisposable
         var material = BuildMaterial(actor, part, lod, instanced, cm, ng, ext, alpha,
             (materialFlags & RenderFlags.MetalnessColorable) != 0);
 
+        var hasBuffers = lod.Vertices is { DeviceAddress: not 0 } &&
+                         lod.Indices is { DeviceAddress: not 0 };
         return new GpuScenePart
         {
             Material = material,
-            Vertices = lod.Vertices.DeviceAddress,
-            Indices = lod.Indices.DeviceAddress,
+            Vertices = hasBuffers ? lod.Vertices.DeviceAddress : 0,
+            Indices = hasBuffers ? lod.Indices.DeviceAddress : 0,
             IndexStart = (uint)part.IndexStart,
-            // Hidden parts keep their slot (stable part indices) but draw nothing.
-            IndexCount = visible ? (uint)part.IndexCount : 0u,
+            // Hidden/empty parts keep their slot but draw nothing.
+            IndexCount = visible && hasBuffers ? (uint)part.IndexCount : 0u,
         };
     }
 
@@ -646,7 +658,9 @@ internal sealed unsafe class ModelPass : IDisposable
 
                 if (part.Technique.IsTransparent())
                 {
-                    if (visible && part.Transparent != null)
+                    if (visible && part.Transparent != null && !cached.Skinned &&
+                        lod.Vertices is { DeviceAddress: not 0 } &&
+                        lod.Indices is { DeviceAddress: not 0 })
                         transparent.Add(new CachedTransparentPart { Lod = lod, Part = part });
                     continue;
                 }
@@ -901,7 +915,7 @@ internal sealed unsafe class ModelPass : IDisposable
 
     private void AddCachedActor(SceneActors actors, SceneActor actor, GpuModel model, uint rangeBase,
         int staticIndex, List<CachedTransparentPart>[] transparentByLod, bool hasTransparent,
-        int partStart, int partCount)
+        int partStart, int partCount, bool skinned)
     {
         var index = cachedActors.Count;
         var cached = new CachedActor
@@ -915,6 +929,7 @@ internal sealed unsafe class ModelPass : IDisposable
             HasTransparent = hasTransparent,
             PartStart = partStart,
             PartCount = partCount,
+            Skinned = skinned,
         };
 
         cachedActors.Add(cached);
@@ -929,8 +944,8 @@ internal sealed unsafe class ModelPass : IDisposable
         indices.Add(index);
     }
 
-    // Appends one actor to the persistent cache. Returns false for skinned/not-ready actors, which
-    // stay on the direct/deferred paths.
+    // Appends one actor to the persistent cache. Skinned actors are cached too; the culling
+    // shader overrides their vertex pointer with the skinning pass output.
     private bool AddActorToCache(SceneActors actors, SceneActor actor)
     {
         if (cachedByActor.ContainsKey(actor.Id))
@@ -951,11 +966,14 @@ internal sealed unsafe class ModelPass : IDisposable
             return false;
         }
 
-        var skinned = false;
+        var skinnedModel = false;
         foreach (var lod in model.Lods)
-            skinned |= lod.Skinned;
-        var hasSkeleton = actor.SkinTransforms != null && actor.SkeletonIndexUInts != null;
-        if (skinned && hasSkeleton)
+            skinnedModel |= lod.Skinned;
+
+        // Keep skinned actors hidden from the forward/main view on the direct path so the
+        // first-person self actor is not resurrected by the static fallback.
+        if (skinnedModel &&
+            (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) != 0)
         {
             if (!directActors.Contains(actor))
                 directActors.Add(actor);
@@ -983,7 +1001,9 @@ internal sealed unsafe class ModelPass : IDisposable
 
                 if (part.Technique.IsTransparent())
                 {
-                    if (visible && part.Transparent != null)
+                    // Skinned transparent parts are not supported by the CPU transparent path yet;
+                    // keep the previous behavior of not drawing them rather than drawing bind pose.
+                    if (visible && part.Transparent != null && !skinnedModel)
                         transparent.Add(new CachedTransparentPart { Lod = lod, Part = part });
                     continue;
                 }
@@ -1018,13 +1038,13 @@ internal sealed unsafe class ModelPass : IDisposable
             for (var staticIndex = 0; staticIndex < staticCount; staticIndex++)
             {
                 AddCachedActor(actors, actor, model, rangeBase, staticIndex, transparentByLod,
-                    hasTransparent, partStart, partCount);
+                    hasTransparent, partStart, partCount, false);
             }
         }
         else
         {
             AddCachedActor(actors, actor, model, rangeBase, -1, transparentByLod,
-                hasTransparent, partStart, partCount);
+                hasTransparent, partStart, partCount, skinnedModel);
         }
 
         directActors.Remove(actor);
@@ -1160,6 +1180,8 @@ internal sealed unsafe class ModelPass : IDisposable
             flags |= GpuSceneActor.DrawOutsideViewDistance;
         if (visible)
             flags |= GpuSceneActor.Visible;
+        if (cached.Skinned)
+            flags |= GpuSceneActor.Skinned;
 
         actorStates[index] = new GpuSceneActor
         {
@@ -1173,16 +1195,17 @@ internal sealed unsafe class ModelPass : IDisposable
             LodDistances0 = lodDistances0,
             LodDistances1 = lodDistances1,
             Instances = instanceAddress,
+            SkinnedVertices = 0,
             InstanceStart = (uint)instanceStart,
             InstanceCount = (uint)instanceCount,
             Flags = flags,
             RangeBase = cached.RangeBase,
             LodStateIndex = cached.LodStateIndex,
             LodCount = (uint)lodCount,
+            ForcedLod = 0,
             MaxViewDistance = (actor.Flags & RenderFlags.DrawOutsideViewDistance) != 0
                 ? float.MaxValue
                 : actor.MaxViewDistance,
-            Pad0 = 0,
         };
     }
 
@@ -1223,9 +1246,47 @@ internal sealed unsafe class ModelPass : IDisposable
         actors.TrimDirty(processed);
     }
 
+    // The skinning pass runs before this: point cached skinned actors at their deformed vertex
+    // buffer and force the LOD that buffer was built for. The GPU cull shader then handles them
+    // exactly like static actors, for both the main view and the reflection probe.
+    private void UpdateSkinnedActorStates()
+    {
+        for (var i = 0; i < cachedActors.Count; i++)
+        {
+            var cached = cachedActors[i];
+            if (!cached.Skinned || cached.Dead)
+                continue;
+
+            var actor = cached.Actor;
+            var state = actorStates[cached.LodStateIndex];
+            var skip = (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) != 0;
+            if (!actor.Visible || skip)
+                state.Flags &= ~GpuSceneActor.Visible;
+            else
+                state.Flags |= GpuSceneActor.Visible;
+
+            var lod = Math.Clamp(actor.Lod, 0, cached.Model.LodCount - 1);
+            var lodModel = cached.Model.Lods[lod];
+            if (lodModel.Skinned && actor.SkinnedVertexAddress != 0)
+            {
+                state.Flags |= GpuSceneActor.Skinned;
+                state.SkinnedVertices = actor.SkinnedVertexAddress;
+                state.ForcedLod = (uint)lod;
+            }
+            else
+            {
+                state.Flags &= ~GpuSceneActor.Skinned;
+                state.SkinnedVertices = 0;
+                state.ForcedLod = 0;
+            }
+            actorStates[cached.LodStateIndex] = state;
+        }
+    }
+
     // Builds per-frame actor state and dispatches the GPU culling/LOD compute. Parts/materials are persistent.
     public void RecordPrepare(VkCommandBuffer commands, int frameSlot, CameraState camera,
-        MyNewLoddingSettings lodding, SceneActors actors, Vector3D sunDirection)
+        MyNewLoddingSettings lodding, SceneActors actors, Vector3D sunDirection,
+        bool publishVisibility = true)
     {
         ShadowPassRecorded = false;
         var profile = Stopwatch.StartNew();
@@ -1233,6 +1294,7 @@ internal sealed unsafe class ModelPass : IDisposable
         LastEnsureMs = profile.Elapsed.TotalMilliseconds;
         if (shadowsEnabled)
         {
+            ShadowMap.Configure(ClientPlugin.Config.Current.ShadowDistance);
             var cameraForward = -new Vector3(camera.ViewAt0.M31, camera.ViewAt0.M32, camera.ViewAt0.M33);
             if (cameraForward.LengthSquared() < 1e-8f)
                 cameraForward = -Vector3.Forward;
@@ -1242,6 +1304,7 @@ internal sealed unsafe class ModelPass : IDisposable
                 var near = cascade == 0 ? 0f : ShadowMap.SplitEnds[cascade - 1];
                 var far = ShadowMap.SplitEnds[cascade];
                 var center = cameraForward * ((near + far) * 0.5f);
+                ShadowMap.Extents[cascade] = ShadowMap.FitExtent(camera, near, far, sunDirection);
                 shadowViewProjections[cascade] =
                     ShadowMap.BuildViewProjection(sunDirection, center, ShadowMap.Extents[cascade]);
             }
@@ -1254,18 +1317,22 @@ internal sealed unsafe class ModelPass : IDisposable
             EnsureCache(actors);
             UpdateDirtyActorStates(actors);
         }
+        UpdateSkinnedActorStates();
 
-        var settings = lodding.Global;
+        var settings = MyGlobalLoddingSettings.Default;
         var frustum = new Frustum(camera.CullingViewProjection);
         transparentDraws.Clear();
         gpuSubmitted = false;
         gpuDraws.Begin(frameSlot, Math.Max(cachedPartCount, 1));
 
         // The game calls Render.Draw only for IDs reported visible; publish them once per frame.
-        foreach (var actor in actors.VisibilityUpdates)
+        if (publishVisibility)
         {
-            if (actor.Visible && (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) == 0)
-                MyRenderProxy.VisibleObjectsWrite.Add(actor.Id);
+            foreach (var actor in actors.VisibilityUpdates)
+            {
+                if (actor.Visible && (actor.Flags & (RenderFlags.SkipInMainView | RenderFlags.SkipInForward)) == 0)
+                    MyRenderProxy.VisibleObjectsWrite.Add(actor.Id);
+            }
         }
 
         // Transparent parts keep the direct path and still need a CPU LOD/cull selection.
@@ -1336,10 +1403,98 @@ internal sealed unsafe class ModelPass : IDisposable
         var allocation = context.Transient.Allocate<GpuSceneActor>(actorCount);
         actorStates.AsSpan(0, actorCount).CopyTo(allocation.AsSpan<GpuSceneActor>(actorCount));
 
-        gpuDraws.Dispatch(commands, camera.CullingViewProjection, camera.Position, camera.LodCoefficient,
+        gpuDraws.Dispatch(commands, camera.CullingViewProjection, camera.Position,
+            camera.LodCoefficient / Math.Max(Config.Current.ModelDetail, 0.01f),
             allocation.Address, (uint)actorCount, partBuffers[frameSlot].DeviceAddress,
             rangeBuffers[frameSlot].DeviceAddress, lodStateBuffers[frameSlot].DeviceAddress, lodding);
         gpuSubmitted = true;
+    }
+
+    private static bool IsEnvironmentModel(string model) =>
+        !string.IsNullOrEmpty(model) &&
+        (model.Contains("Models\\Environment", StringComparison.OrdinalIgnoreCase) ||
+         model.Contains("Models/Environment", StringComparison.OrdinalIgnoreCase) ||
+         model.Contains("Tree", StringComparison.OrdinalIgnoreCase));
+
+    // Uploads the actor state once for a whole-cube capture. All six probe faces share it.
+    public ulong PrepareProbeActorStates(int frameSlot, out uint actorCount)
+    {
+        actorCount = 0;
+        if (cachedActors.Count == 0 || cachedPartCount == 0 || partBuffers[frameSlot] == null ||
+            rangeBuffers[frameSlot] == null || lodStateBuffers[frameSlot] == null)
+            return 0;
+
+        // Environment vegetation is numerous and some planet tree models are not safe to capture
+        // in a cube face during streaming; they contribute little to ship reflections. Skip them
+        // unless explicitly requested for diagnostics.
+        var includeEnvironment = Environment.GetEnvironmentVariable("VULKAN_PROBE_ENVIRONMENT") == "1";
+        var probeCount = 0;
+        for (var i = 0; i < cachedActors.Count; i++)
+        {
+            if (!includeEnvironment && IsEnvironmentModel(cachedActors[i].Actor.Model))
+                continue;
+            probeCount++;
+        }
+        actorCount = (uint)probeCount;
+        var allocation = context.Transient.Allocate<GpuSceneActor>(Math.Max(1, probeCount));
+        var destination = allocation.AsSpan<GpuSceneActor>(Math.Max(1, probeCount));
+        var write = 0;
+        for (var i = 0; i < cachedActors.Count; i++)
+        {
+            if (!includeEnvironment && IsEnvironmentModel(cachedActors[i].Actor.Model))
+                continue;
+            destination[write++] = actorStates[i];
+        }
+        return allocation.Address;
+    }
+
+    // Builds a small, independent cull list for a reflection-probe face. It deliberately skips
+    // shadow/extent/material maintenance; the main view did those earlier this frame.
+    public void RecordProbePrepare(VkCommandBuffer commands, int frameSlot, CameraState camera,
+        MyNewLoddingSettings lodding, ulong actors, uint actorCount, Vector3 skinnedOffset)
+    {
+        if (actorCount == 0)
+            return;
+
+        gpuDraws.DispatchProbe(commands, camera.CullingViewProjection, camera.Position,
+            camera.LodCoefficient / Math.Max(Config.Current.ModelDetail, 0.01f),
+            actors, actorCount, partBuffers[frameSlot].DeviceAddress,
+            rangeBuffers[frameSlot].DeviceAddress, lodStateBuffers[frameSlot].DeviceAddress, lodding,
+            skinnedOffset);
+        gpuSubmitted = true;
+    }
+
+    public int RecordProbe(VkCommandBuffer commands, SceneTargets targets, ulong frameConstants)
+    {
+        if (!gpuSubmitted)
+            return 0;
+
+        var api = context.Device.Api;
+        var viewport = new VkViewport(0, 0, targets.Extent.width, targets.Extent.height, 0, 1);
+        var scissor = new VkRect2D(0, 0, targets.Extent.width, targets.Extent.height);
+        api.vkCmdSetViewport(commands, 0, 1, &viewport);
+        api.vkCmdSetScissor(commands, 0, 1, &scissor);
+
+        var draws = 0;
+        for (var bucket = 4; bucket < 6; bucket++)
+        {
+            api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics,
+                bucket == 4 ? probePipeline : probePipelineNoCull);
+            context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
+            var push = new ModelPushConstants
+            {
+                Frame = frameConstants,
+                DrawData = gpuDraws.DrawDataAddress(bucket),
+            };
+            api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
+                0, (uint)sizeof(ModelPushConstants), &push);
+            api.vkCmdDrawIndirectCount(commands, gpuDraws.BucketBuffer(bucket),
+                (ulong)GpuSceneDraws.CommandOffset, gpuDraws.BucketBuffer(bucket), 0,
+                gpuDraws.MaxParts, 16);
+            draws++;
+        }
+
+        return draws;
     }
 
     // Records the sun depth map. Reuses the opaque pass draw data (same culled set, LOD0 caster
@@ -1437,13 +1592,29 @@ internal sealed unsafe class ModelPass : IDisposable
         ShadowPassRecorded = true;
     }
 
+    // Skinned actors are normally in directActors, but a character can receive its skeleton after
+    // the actor cache pass; include any visible skinned actor that is not already GPU-cached.
+    private void CollectDrawActors(SceneActors actors)
+    {
+        drawActors.Clear();
+        drawActors.AddRange(directActors);
+        foreach (var actor in actors.Skinned)
+        {
+            if (cachedByActor.ContainsKey(actor.Id))
+                continue;
+            if (!drawActors.Contains(actor))
+                drawActors.Add(actor);
+        }
+    }
+
     // Records all opaque actors into the scene targets. Returns the number of draws recorded.
     public int Record(VkCommandBuffer commands, SceneTargets targets, CameraState camera,
-        MyNewLoddingSettings lodding, SceneActors actors, ulong frameConstants, out int culled)
+        MyNewLoddingSettings lodding, SceneActors actors, ulong frameConstants, out int culled,
+        bool publishVisibility = true)
     {
         var profile = Stopwatch.StartNew();
         var frustum = new Frustum(camera.CullingViewProjection);
-        var loddingSettings = lodding.Global;
+        var loddingSettings = MyGlobalLoddingSettings.Default;
 
         var api = context.Device.Api;
         VkPipeline boundPipeline = VkPipeline.Null;
@@ -1539,10 +1710,13 @@ internal sealed unsafe class ModelPass : IDisposable
             }
 
             var lodModel = SelectLod(model, distance, actor.Scale, camera, loddingSettings, ref actor.Lod);
+            if (lodModel.Vertices is not { DeviceAddress: not 0 } ||
+                lodModel.Indices is not { DeviceAddress: not 0 })
+                continue;
 
             // The game calls Render.Draw only for IDs reported visible; this is what makes skinned
             // entities send SetCharacterTransforms (and other per-frame render logic run).
-            if (actor.VisibilityUpdates)
+            if (publishVisibility && actor.VisibilityUpdates)
                 MyRenderProxy.VisibleObjectsWrite.Add(actor.Id);
 
             var actorPipeline = (actor.Flags & RenderFlags.NoBackFaceCulling) != 0 ? pipelineNoCull : pipeline;
@@ -1640,6 +1814,149 @@ internal sealed unsafe class ModelPass : IDisposable
         return draws;
     }
 
+    // Direct (skinned/model-less) actors are not in the GPU opaque buckets, so they need an explicit
+    // draw into the reflection probe. Skinned vertices were deformed relative to the current camera;
+    // shift them to the probe's captured position.
+    public int RecordProbeActors(VkCommandBuffer commands, SceneTargets targets, CameraState camera,
+        CameraState currentCamera, SceneActors actors, MyNewLoddingSettings lodding, ulong frameConstants)
+    {
+        CollectDrawActors(actors);
+        if (drawActors.Count == 0)
+            return 0;
+
+        var api = context.Device.Api;
+        var frustum = new Frustum(camera.CullingViewProjection);
+        var delta = (Vector3)(currentCamera.Position - camera.Position);
+        var boundPipeline = VkPipeline.Null;
+        var draws = 0;
+
+        foreach (var actor in drawActors)
+        {
+            if (!actor.Visible || (actor.Flags & RenderFlags.SkipInForward) != 0)
+                continue;
+
+            var model = models.Get(actor.Model);
+            if (model == null)
+                continue;
+
+            var instances = (InstanceBuffer)null;
+            var instanceStart = 0;
+            var instanceCount = 1;
+            if (actor.HasInstances)
+            {
+                instances = instanceBuffers.Get(actor.InstanceBufferId);
+                if (instances?.Buffer == null || instances.Type != MyRenderInstanceBufferType.Cube)
+                    continue;
+
+                instanceStart = actor.InstanceStart;
+                instanceCount = Math.Min(actor.InstanceCount, instances.Count - instanceStart);
+                if (instanceCount <= 0)
+                    continue;
+            }
+
+            var staticCount = 1;
+            var world = default(Matrix);
+            if (actor.StaticMatrices != null)
+                staticCount = actor.StaticMatrices.Length;
+            else
+                world = BuildWorld(actors.GetWorldMatrix(actor), actor.Scale, camera.Position);
+
+            var cameraRelative = actor.StaticMatrices != null
+                ? (Vector3)(actor.StaticTranslation - camera.Position)
+                : world.Translation;
+            var distance = cameraRelative.Length();
+
+            var localBounds = actor.LocalAabb ?? model.Bounds;
+            var worldBounds = actor.StaticMatrices == null ? localBounds.Transform(world) : localBounds;
+            var radius = (worldBounds.Max - worldBounds.Min).Length() * 0.5f;
+
+            if ((actor.Flags & RenderFlags.DrawOutsideViewDistance) == 0 &&
+                actor.MaxViewDistance < float.MaxValue && distance - radius > actor.MaxViewDistance)
+                continue;
+
+            if (actor.StaticMatrices == null && !frustum.Intersects(worldBounds))
+                continue;
+
+            // The local astronaut surrounds a first-person probe; rendering it would fill the
+            // reflection with the inside of the helmet. Keep it for third-person distances.
+            if ((actor.SkeletonBones != null || actor.SkinTransforms != null) && distance - radius < 0.5f)
+                continue;
+
+            var lodModel = SelectLod(model, distance, actor.Scale, camera,
+                MyGlobalLoddingSettings.Default, ref actor.Lod);
+            if (lodModel.Vertices is not { DeviceAddress: not 0 } ||
+                lodModel.Indices is not { DeviceAddress: not 0 })
+                continue;
+            var actorPipeline = (actor.Flags & RenderFlags.NoBackFaceCulling) != 0
+                ? probePipelineNoCull
+                : probePipeline;
+            if (actorPipeline != boundPipeline)
+            {
+                api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics, actorPipeline);
+                context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
+                boundPipeline = actorPipeline;
+            }
+
+            api.vkCmdBindIndexBuffer(commands, lodModel.Indices.Handle, 0, VkIndexType.Uint32);
+
+            for (var instance = 0; instance < staticCount; instance++)
+            {
+                var matrix = staticCount == 1 ? world : BuildStaticWorld(actor, camera.Position, instance);
+                var colorMask = new Vector4(actor.ColorMaskHsv, 0);
+
+                foreach (var part in lodModel.Parts)
+                {
+                    if (part.IndexCount == 0)
+                        continue;
+
+                    var materialFlags = SceneActors.GetMaterialFlags(actor, part.MaterialName);
+                    if ((materialFlags & RenderFlags.Visible) == 0)
+                        continue;
+
+                    var drawMatrix = matrix;
+                    var verticesAddress = lodModel.Vertices.DeviceAddress;
+                    if (lodModel.Skinned && actor.SkinnedVertexAddress != 0)
+                    {
+                        drawMatrix = Matrix.CreateTranslation(delta);
+                        verticesAddress = actor.SkinnedVertexAddress;
+                    }
+
+                    if (!IsOpaque(part.Technique))
+                        continue;
+
+                    ResolveTextures(actor, part, out var cm, out var ng, out var ext, out var alpha);
+                    var material = BuildMaterial(actor, part, lodModel, instances != null, cm, ng, ext, alpha,
+                        (materialFlags & RenderFlags.MetalnessColorable) != 0);
+                    var materialAllocation = context.Transient.Allocate<DrawMaterial>();
+                    materialAllocation.As<DrawMaterial>() = material;
+
+                    var worldT = Matrix.Transpose(drawMatrix);
+                    var push = new ModelPushConstants
+                    {
+                        World0 = new Vector4(worldT.M11, worldT.M12, worldT.M13, worldT.M14),
+                        World1 = new Vector4(worldT.M21, worldT.M22, worldT.M23, worldT.M24),
+                        World2 = new Vector4(worldT.M31, worldT.M32, worldT.M33, worldT.M34),
+                        World3 = new Vector4(worldT.M41, worldT.M42, worldT.M43, worldT.M44),
+                        ColorMaskHsv = colorMask,
+                        Frame = frameConstants,
+                        Material = materialAllocation.Address,
+                        Vertices = verticesAddress,
+                        Instances = instances?.Buffer.DeviceAddress ?? 0,
+                        InstanceStart = (uint)instanceStart,
+                    };
+
+                    api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.All,
+                        0, (uint)sizeof(ModelPushConstants), &push);
+                    api.vkCmdDrawIndexed(commands, (uint)part.IndexCount, (uint)instanceCount,
+                        (uint)part.IndexStart, 0, 0);
+                    draws++;
+                }
+            }
+        }
+
+        return draws;
+    }
+
     // Transparent pass into the OIT accumulation/reveal targets. Order-independent, so the CPU no
     // longer sorts; the composite pass resolves it over the opaque color.
     public int RecordTransparent(VkCommandBuffer commands, SceneTargets targets, ulong frameConstants)
@@ -1662,6 +1979,9 @@ internal sealed unsafe class ModelPass : IDisposable
 
         foreach (var draw in transparentDraws)
         {
+            if (draw.Lod.Indices == null || draw.Lod.Indices.Handle == VkBuffer.Null ||
+                draw.Vertices == 0)
+                continue;
             var transparent = draw.Part.Transparent;
             var actorPipeline = transparent.TriangleFaceCulling
                 ? pipelineTransparent
@@ -1733,7 +2053,8 @@ internal sealed unsafe class ModelPass : IDisposable
         MyGlobalLoddingSettings settings, ref int actorLod)
     {
         var normalizedScale = scale > 0f ? scale : 1f;
-        var lodDistance = (distance / normalizedScale * camera.LodCoefficient + settings.ObjectDistanceAdd)
+        var lodDistance = (distance / normalizedScale * camera.LodCoefficient /
+                           Math.Max(Config.Current.ModelDetail, 0.01f) + settings.ObjectDistanceAdd)
                           * settings.ObjectDistanceMult;
 
         GpuLod lod;
@@ -1913,6 +2234,8 @@ internal sealed unsafe class ModelPass : IDisposable
             context.Release(() => context.Device.Api.vkDestroyPipeline(shadowPipelineNoCull, null));
         var cullHandle = pipeline;
         var noCullHandle = pipelineNoCull;
+        var probeHandle = probePipeline;
+        var probeNoCullHandle = probePipelineNoCull;
         var transparentCull = pipelineTransparent;
         var transparentNoCull = pipelineTransparentNoCull;
         var skinning = skinningPipeline;
@@ -1921,6 +2244,8 @@ internal sealed unsafe class ModelPass : IDisposable
         {
             api.vkDestroyPipeline(cullHandle, null);
             api.vkDestroyPipeline(noCullHandle, null);
+            api.vkDestroyPipeline(probeHandle, null);
+            api.vkDestroyPipeline(probeNoCullHandle, null);
             api.vkDestroyPipeline(transparentCull, null);
             api.vkDestroyPipeline(transparentNoCull, null);
             api.vkDestroyPipeline(skinning, null);

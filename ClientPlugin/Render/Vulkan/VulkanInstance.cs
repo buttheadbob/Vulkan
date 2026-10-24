@@ -56,6 +56,8 @@ internal sealed unsafe class VulkanInstance : IDisposable
 
     public static VulkanInstance Create(IEnumerable<string> requiredExtensions, bool validation)
     {
+        validation = validation ||
+                     Environment.GetEnvironmentVariable("VULKAN_VALIDATION") == "1";
         var available = VkNames.ToSet(EnumerateInstanceExtensions());
         var extensions = requiredExtensions.Distinct().ToList();
 
@@ -65,17 +67,26 @@ internal sealed unsafe class VulkanInstance : IDisposable
 
         var layers = new List<string>();
         var debugUtils = VkNames.ToString(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        var gpuAssistedValidation = Environment.GetEnvironmentVariable("VULKAN_VALIDATION_GPU") == "1";
+        var validationFeaturesExt = "VK_EXT_validation_features";
         if (validation)
         {
             if (EnumerateLayers().Contains(ValidationLayer) && available.Contains(debugUtils))
             {
                 layers.Add(ValidationLayer);
                 extensions.Add(debugUtils);
+                if (gpuAssistedValidation)
+                {
+                    // Layer-provided instance extensions are not in the loader's layer-less
+                    // enumeration. Enable it explicitly; the loader resolves it from the layer.
+                    extensions.Add(validationFeaturesExt);
+                }
             }
             else
             {
                 RenderLog.Warning("Validation requested, but the Khronos validation layer is not installed");
                 validation = false;
+                gpuAssistedValidation = false;
             }
         }
 
@@ -101,6 +112,22 @@ internal sealed unsafe class VulkanInstance : IDisposable
             enabledLayerCount = layerNames.Length,
             ppEnabledLayerNames = layerNames,
         };
+        VkValidationFeaturesEXT validationFeatures;
+        if (gpuAssistedValidation)
+        {
+            var enabledFeatures = stackalloc VkValidationFeatureEnableEXT[3]
+            {
+                VkValidationFeatureEnableEXT.GpuAssisted,
+                VkValidationFeatureEnableEXT.GpuAssistedReserveBindingSlot,
+                VkValidationFeatureEnableEXT.SynchronizationValidation,
+            };
+            validationFeatures = new VkValidationFeaturesEXT
+            {
+                enabledValidationFeatureCount = 3,
+                pEnabledValidationFeatures = enabledFeatures,
+            };
+            createInfo.pNext = &validationFeatures;
+        }
 
         VkInstance instance;
         vkCreateInstance(&createInfo, &instance).CheckResult("vkCreateInstance");

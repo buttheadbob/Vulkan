@@ -10,7 +10,8 @@ internal static unsafe class MipGenerator
 {
     // mip0Layout/Stage/Access: how level 0 was last written; the other levels' contents are discarded
     public static void Record(VkDeviceApi api, VkCommandBuffer commands, GpuImage image,
-        VkImageLayout mip0Layout, VkPipelineStageFlags2 mip0Stage, VkAccessFlags2 mip0Access)
+        VkImageLayout mip0Layout, VkPipelineStageFlags2 mip0Stage, VkAccessFlags2 mip0Access,
+        bool transferQueue = false)
     {
         var layers = image.ArrayLayers;
         var barriers = stackalloc VkImageMemoryBarrier2[2];
@@ -51,8 +52,18 @@ internal static unsafe class MipGenerator
             Submit(api, commands, barriers, 1);
         }
 
-        barriers[0] = Barrier(image, 0, image.MipLevels, VkPipelineStageFlags2.Blit, VkAccessFlags2.TransferRead, VkImageLayout.TransferSrcOptimal,
-            VkPipelineStageFlags2.AllCommands, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
+        // On the dedicated transfer queue, graphics-only stages/access are invalid. The timeline
+        // semaphore wait on the graphics queue provides the cross-queue visibility; this barrier
+        // only completes the layout transition on the transfer queue.
+        barriers[0] = transferQueue
+            ? Barrier(image, 0, image.MipLevels, VkPipelineStageFlags2.Blit,
+                VkAccessFlags2.TransferRead, VkImageLayout.TransferSrcOptimal,
+                VkPipelineStageFlags2.AllTransfer, VkAccessFlags2.None,
+                VkImageLayout.ShaderReadOnlyOptimal)
+            : Barrier(image, 0, image.MipLevels, VkPipelineStageFlags2.Blit,
+                VkAccessFlags2.TransferRead, VkImageLayout.TransferSrcOptimal,
+                VkPipelineStageFlags2.AllCommands, VkAccessFlags2.ShaderSampledRead,
+                VkImageLayout.ShaderReadOnlyOptimal);
         Submit(api, commands, barriers, 1);
     }
 

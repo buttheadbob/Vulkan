@@ -20,8 +20,8 @@ internal sealed class RenderFont
     private readonly Dictionary<int, TextureCache.Entry> pages = new();
     private readonly bool premultipliedAlpha;
 
-    private readonly List<MyGlyphInfo> glyphs = new();
-    private List<int> lineOffsets = new();
+    private readonly List<MyGlyphInfo> glyphs = [];
+    private List<int> lineOffsets = [];
 
     public string Path { get; }
 

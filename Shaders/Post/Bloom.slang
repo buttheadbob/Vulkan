@@ -8,6 +8,8 @@ struct PushConstants
     uint source;       // bindless slot of the source color target
     float threshold;   // linear HDR bright-pass threshold
     float2 direction;  // texel-space blur direction
+    uint oitAccum;
+    uint oitReveal;
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> push;
@@ -53,6 +55,11 @@ float3 blur(float2 uv, float2 direction)
 float4 prefilterMain(VertexOutput input) : SV_Target0
 {
     float3 color = sampleTexture(push.source, SamplerSlot.LinearClamp, input.uv).rgb;
+    float4 accum = sampleTexture(push.oitAccum, SamplerSlot.LinearClamp, input.uv);
+    float reveal = saturate(sampleTexture(push.oitReveal, SamplerSlot.LinearClamp, input.uv).r);
+    float3 oitColor = accum.rgb / max(accum.a, 1e-4);
+    float oitAlpha = 1.0 - reveal;
+    color = color * (1.0 - oitAlpha) + oitColor * oitAlpha;
     return float4(brightPass(color), 1.0);
 }
 

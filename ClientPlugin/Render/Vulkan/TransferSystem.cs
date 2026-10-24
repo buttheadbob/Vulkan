@@ -222,7 +222,7 @@ internal sealed unsafe class TransferSystem : IDisposable
         {
             semaphore = timeline,
             value = value,
-            stageMask = VkPipelineStageFlags2.AllCommands,
+            stageMask = VkPipelineStageFlags2.AllTransfer,
         };
         var bufferInfo = new VkCommandBufferSubmitInfo { commandBuffer = commands };
         var submit = new VkSubmitInfo2
@@ -234,7 +234,12 @@ internal sealed unsafe class TransferSystem : IDisposable
         };
 
         lock (context.Device.QueueLock)
-            api.vkQueueSubmit2(context.Device.TransferQueue, 1, &submit, VkFence.Null).CheckResult("vkQueueSubmit2 (transfer)");
+        {
+            var result = api.vkQueueSubmit2(context.Device.TransferQueue, 1, &submit, VkFence.Null);
+            if (result == VkResult.ErrorDeviceLost)
+                context.Device.LogDeviceFault();
+            result.CheckResult("vkQueueSubmit2 (transfer)");
+        }
 
         ReleaseStaging();
         Clear();
@@ -266,11 +271,11 @@ internal sealed unsafe class TransferSystem : IDisposable
             {
                 srcStageMask = VkPipelineStageFlags2.Copy,
                 srcAccessMask = VkAccessFlags2.TransferWrite,
-                dstStageMask = VkPipelineStageFlags2.AllCommands,
-                dstAccessMask = VkAccessFlags2.ShaderRead
-                               | VkAccessFlags2.VertexAttributeRead
-                               | VkAccessFlags2.IndexRead
-                               | VkAccessFlags2.UniformRead,
+                dstStageMask = dedicated ? VkPipelineStageFlags2.AllTransfer : VkPipelineStageFlags2.AllGraphics,
+                dstAccessMask = dedicated
+                    ? VkAccessFlags2.None
+                    : VkAccessFlags2.ShaderRead | VkAccessFlags2.VertexAttributeRead |
+                      VkAccessFlags2.IndexRead | VkAccessFlags2.UniformRead,
                 srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 buffer = pendingBuffers[i].Destination.Handle,
@@ -329,7 +334,7 @@ internal sealed unsafe class TransferSystem : IDisposable
             if (pendingImages[i].GenerateMips)
             {
                 MipGenerator.Record(api, commands, pendingImages[i].Image, VkImageLayout.TransferDstOptimal,
-                    VkPipelineStageFlags2.Copy, VkAccessFlags2.TransferWrite);
+                    VkPipelineStageFlags2.Copy, VkAccessFlags2.TransferWrite, transferQueue: dedicated);
                 continue;
             }
 
@@ -337,8 +342,10 @@ internal sealed unsafe class TransferSystem : IDisposable
             ref var barrier = ref barriers[post++];
             barrier.srcStageMask = VkPipelineStageFlags2.Copy;
             barrier.srcAccessMask = VkAccessFlags2.TransferWrite;
-            barrier.dstStageMask = VkPipelineStageFlags2.AllCommands;
-            barrier.dstAccessMask = VkAccessFlags2.ShaderSampledRead;
+            barrier.dstStageMask = dedicated
+                ? VkPipelineStageFlags2.AllTransfer
+                : VkPipelineStageFlags2.AllGraphics;
+            barrier.dstAccessMask = dedicated ? VkAccessFlags2.None : VkAccessFlags2.ShaderSampledRead;
             barrier.oldLayout = VkImageLayout.TransferDstOptimal;
             barrier.newLayout = VkImageLayout.ShaderReadOnlyOptimal;
         }

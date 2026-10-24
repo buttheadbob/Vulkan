@@ -11,6 +11,7 @@ internal struct DiagnosticsStats
     public bool Visible;
     public double FrameMilliseconds;
     public double RawFrameMilliseconds;
+    public double ProbeCpuMs;
     public double Fps;
     public uint Triangles;
     public uint Parts;
@@ -33,7 +34,7 @@ internal sealed class DiagnosticsOverlay
     private const double SampleSeconds = 0.5;
     private const float X = 10f;
     private const float Y = 10f;
-    private const float Width = 400f;
+    private const float Width = 440f;
     private const float Height = 248f;
     private const float GraphHeight = 42f;
     private const float TextScale = 0.62f;
@@ -69,7 +70,7 @@ internal sealed class DiagnosticsOverlay
 
         var line = 0;
         DrawLine(font, addText, ref line,
-            $"Vulkan  {stats.Fps:0.0} fps   frame {stats.FrameMilliseconds:0.00} ms");
+            $"Vulkan  {stats.Fps:0.0} fps   frame {stats.FrameMilliseconds:0.00} ms   probe {stats.ProbeCpuMs:0.00} ms");
         DrawLine(font, addText, ref line, $"GPU tris {stats.Triangles:N0}  parts {stats.Parts:N0}  inst {stats.Instances:N0}");
         DrawLine(font, addText, ref line, $"Direct draws {stats.DrawnActors}  culled {stats.CulledActors}  GPU parts {stats.GpuParts:N0}");
         DrawLine(font, addText, ref line, $"GPU culled {stats.Culled:N0}  visible {stats.GpuVisible:N0}  direct tris {stats.DirectTriangles:N0}");

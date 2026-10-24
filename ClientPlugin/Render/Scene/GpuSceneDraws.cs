@@ -48,18 +48,20 @@ internal struct GpuSceneActor
     public Vector4 LodDistances0; // LOD1..4 switch distances
     public Vector4 LodDistances1; // LOD5..8 switch distances
     public ulong Instances;      // cube instance buffer address, 0 when not instanced
+    public ulong SkinnedVertices; // deformed vertex buffer, when Flags has Skinned
     public uint InstanceStart;
     public uint InstanceCount;
-    public uint Flags;           // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance, 4: Visible
+    public uint Flags;           // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance, 4: Visible, 8: Skinned
     public uint RangeBase;       // index into the persistent LOD range buffer
     public uint LodStateIndex;   // index into the persistent LOD state buffer
     public uint LodCount;
+    public uint ForcedLod;       // skinned actors use the LOD the skinning pass produced
     public float MaxViewDistance;
-    public uint Pad0;
 
     public const uint NoBackFaceCulling = 1u << 0;
     public const uint DrawOutsideViewDistance = 1u << 1;
     public const uint Visible = 1u << 2;
+    public const uint Skinned = 1u << 3;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -81,6 +83,9 @@ internal struct CullParams
     public ulong Bucket3;
     public ulong Diagnostics;
     public Vector4 CameraPosition;
+    public Vector4 SkinnedOffset;   // main-camera-relative -> probe-camera-relative for skinned draws
+    public uint DrawAll;
+    public uint ShadowCulling;      // 1: append LOD0 shadow casters, 0: probe
 }
 
 // Must match Shaders/Scene/Culling.slang and Scene/Model.slang (184 bytes)
@@ -110,11 +115,10 @@ internal struct GpuDrawData
 [StructLayout(LayoutKind.Sequential)]
 internal struct CullPushConstants
 {
-    public Vector4 Plane0;
-    public Vector4 Plane1;
-    public Vector4 Plane2;
-    public Vector4 Plane3;
-    public Vector4 Plane4;
+    public Vector4 ViewProjection0;
+    public Vector4 ViewProjection1;
+    public Vector4 ViewProjection2;
+    public Vector4 ViewProjection3;
     public ulong Actors;
     public ulong Parts;
     public ulong Ranges;
@@ -133,7 +137,7 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
     private const int InitialCapacity = 8192;
 
     private readonly GpuContext context;
-    private readonly GpuBuffer[,] bucketBuffers = new GpuBuffer[FrameLoop.FramesInFlight, 4];
+    private readonly GpuBuffer[,] bucketBuffers = new GpuBuffer[FrameLoop.FramesInFlight, 6];
     private readonly GpuBuffer[] diagnosticsBuffers = new GpuBuffer[FrameLoop.FramesInFlight];
     private readonly int[] capacities = new int[FrameLoop.FramesInFlight];
     private readonly VkPipeline pipeline;
@@ -191,6 +195,37 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
             *(uint*)bucketBuffers[slot, bucket].Mapped = 0;
     }
 
+    // The culling shader derives its planes from these columns, replacing the old CPU Frustum.
+    private static void GetViewProjectionColumns(Matrix matrix,
+        out Vector4 c0, out Vector4 c1, out Vector4 c2, out Vector4 c3)
+    {
+        c0 = new Vector4(matrix.M11, matrix.M21, matrix.M31, matrix.M41);
+        c1 = new Vector4(matrix.M12, matrix.M22, matrix.M32, matrix.M42);
+        c2 = new Vector4(matrix.M13, matrix.M23, matrix.M33, matrix.M43);
+        c3 = new Vector4(matrix.M14, matrix.M24, matrix.M34, matrix.M44);
+    }
+
+    public void EnsureProbeBuckets(VkCommandBuffer commands)
+    {
+        // Whole-cube capture records several probe faces into one command buffer, so the CPU-side
+        // counter reset in Begin() would happen before the GPU executes any of them. Reset the
+        // counters on the GPU instead, between faces.
+        var api = context.Device.Api;
+        var waitForPreviousFace = new VkMemoryBarrier2
+        {
+            srcStageMask = VkPipelineStageFlags2.DrawIndirect | VkPipelineStageFlags2.VertexShader,
+            srcAccessMask = VkAccessFlags2.IndirectCommandRead | VkAccessFlags2.ShaderRead,
+            dstStageMask = VkPipelineStageFlags2.Transfer | VkPipelineStageFlags2.ComputeShader,
+            dstAccessMask = VkAccessFlags2.TransferWrite | VkAccessFlags2.ShaderRead |
+                            VkAccessFlags2.ShaderWrite,
+        };
+        var waitInfo = new VkDependencyInfo { memoryBarrierCount = 1, pMemoryBarriers = &waitForPreviousFace };
+        api.vkCmdPipelineBarrier2(commands, &waitInfo);
+
+        for (var bucket = 4; bucket < 6; bucket++)
+            api.vkCmdFillBuffer(commands, bucketBuffers[slot, bucket].Handle, 0, sizeof(uint), 0);
+    }
+
     private void EnsureCapacity(int needed)
     {
         var capacity = capacities[slot];
@@ -199,11 +234,12 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
 
         var newCapacity = Math.Max(Math.Max(needed, InitialCapacity), capacity * 2);
         var bucketSize = (ulong)(CommandOffset + newCapacity * 16 + newCapacity * DrawStride);
-        for (var bucket = 0; bucket < 4; bucket++)
+        for (var bucket = 0; bucket < 6; bucket++)
         {
             bucketBuffers[slot, bucket]?.Dispose();
             bucketBuffers[slot, bucket] = GpuBuffer.Create(context, bucketSize,
-                VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.IndirectBuffer, hostVisible: true);
+                VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.IndirectBuffer |
+                VkBufferUsageFlags.TransferDst, hostVisible: true);
             *(uint*)bucketBuffers[slot, bucket].Mapped = 0;
         }
 
@@ -232,11 +268,10 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
         };
         api.vkCmdPipelineBarrier2(commands, &hostDependency);
 
-        var frustum = new Frustum(cullingViewProjection);
-        Span<Vector4> planes = stackalloc Vector4[5];
-        frustum.WritePlanes(planes);
+        GetViewProjectionColumns(cullingViewProjection,
+            out var vp0, out var vp1, out var vp2, out var vp3);
 
-        var settings = lodding.Global;
+        var settings = MyGlobalLoddingSettings.Default;
         var parameters = new CullParams
         {
             LodCoefficient = lodCoefficient,
@@ -254,17 +289,19 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
             Bucket3 = bucketBuffers[slot, 3].DeviceAddress,
             Diagnostics = diagnosticsBuffers[slot].DeviceAddress,
             CameraPosition = new Vector4((Vector3)cameraPosition, 0),
+            SkinnedOffset = Vector4.Zero,
+            DrawAll = 0,
+            ShadowCulling = 1u,
         };
         var paramsAllocation = context.Transient.Allocate<CullParams>();
         paramsAllocation.As<CullParams>() = parameters;
 
         var push = new CullPushConstants
         {
-            Plane0 = planes[0],
-            Plane1 = planes[1],
-            Plane2 = planes[2],
-            Plane3 = planes[3],
-            Plane4 = planes[4],
+            ViewProjection0 = vp0,
+            ViewProjection1 = vp1,
+            ViewProjection2 = vp2,
+            ViewProjection3 = vp3,
             Actors = actors,
             Parts = parts,
             Ranges = ranges,
@@ -289,6 +326,78 @@ internal sealed unsafe class GpuSceneDraws : IDisposable
             memoryBarrierCount = 1,
             pMemoryBarriers = &drawBarrier,
         };
+        api.vkCmdPipelineBarrier2(commands, &drawDependency);
+    }
+
+    public void DispatchProbe(VkCommandBuffer commands, Matrix cullingViewProjection, Vector3D cameraPosition,
+        float lodCoefficient, ulong actors, uint actorCount, ulong parts, ulong ranges, ulong lodStates,
+        MyNewLoddingSettings lodding, Vector3 skinnedOffset)
+    {
+        if (actorCount == 0)
+            return;
+
+        var api = context.Device.Api;
+        EnsureProbeBuckets(commands);
+        var hostBarrier = new VkMemoryBarrier2
+        {
+            // Compute is included so the main view's LOD-state writes are visible to the probe
+            // cull dispatches (the probe reads that state with LodUpdate = 0).
+            srcStageMask = VkPipelineStageFlags2.Host | VkPipelineStageFlags2.Transfer |
+                           VkPipelineStageFlags2.ComputeShader,
+            srcAccessMask = VkAccessFlags2.HostWrite | VkAccessFlags2.TransferWrite |
+                            VkAccessFlags2.ShaderWrite,
+            dstStageMask = VkPipelineStageFlags2.ComputeShader,
+            dstAccessMask = VkAccessFlags2.ShaderRead | VkAccessFlags2.ShaderWrite,
+        };
+        var hostDependency = new VkDependencyInfo { memoryBarrierCount = 1, pMemoryBarriers = &hostBarrier };
+        api.vkCmdPipelineBarrier2(commands, &hostDependency);
+
+        GetViewProjectionColumns(cullingViewProjection,
+            out var vp0, out var vp1, out var vp2, out var vp3);
+        var settings = MyGlobalLoddingSettings.Default;
+        var parameters = new CullParams
+        {
+            LodCoefficient = lodCoefficient,
+            ObjectDistanceAdd = settings.ObjectDistanceAdd,
+            ObjectDistanceMult = settings.ObjectDistanceMult,
+            Hysteresis = settings.HisteresisRatio,
+            EnableLodSelection = settings.EnableLodSelection ? 1u : 0u,
+            LodSelection = (uint)Math.Clamp(settings.LodSelection, 0, 7),
+            // The probe uses the main view's LOD state: re-selecting from a different capture
+            // position would both corrupt the main LOD state and mismatch skinned vertex buffers.
+            LodUpdate = 0,
+            ActorCount = actorCount,
+            MaxParts = (uint)capacities[slot],
+            Bucket0 = bucketBuffers[slot, 4].DeviceAddress,
+            Bucket1 = bucketBuffers[slot, 5].DeviceAddress,
+            Bucket2 = bucketBuffers[slot, 4].DeviceAddress,
+            Bucket3 = bucketBuffers[slot, 5].DeviceAddress,
+            Diagnostics = diagnosticsBuffers[slot].DeviceAddress,
+            CameraPosition = new Vector4((Vector3)cameraPosition, 0),
+            SkinnedOffset = new Vector4(skinnedOffset, 0),
+            DrawAll = 0,
+            ShadowCulling = 0,
+        };
+        var paramsAllocation = context.Transient.Allocate<CullParams>();
+        paramsAllocation.As<CullParams>() = parameters;
+        var push = new CullPushConstants
+        {
+            ViewProjection0 = vp0, ViewProjection1 = vp1, ViewProjection2 = vp2, ViewProjection3 = vp3,
+            Actors = actors, Parts = parts, Ranges = ranges, LodStates = lodStates,
+            Params = paramsAllocation.Address,
+        };
+        api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Compute, pipeline);
+        api.vkCmdPushConstants(commands, context.Bindless.PipelineLayout, VkShaderStageFlags.Compute,
+            0, (uint)sizeof(CullPushConstants), &push);
+        api.vkCmdDispatch(commands, (actorCount + 63) / 64, 1, 1);
+        var drawBarrier = new VkMemoryBarrier2
+        {
+            srcStageMask = VkPipelineStageFlags2.ComputeShader,
+            srcAccessMask = VkAccessFlags2.ShaderWrite,
+            dstStageMask = VkPipelineStageFlags2.VertexShader | VkPipelineStageFlags2.DrawIndirect,
+            dstAccessMask = VkAccessFlags2.ShaderRead | VkAccessFlags2.IndirectCommandRead,
+        };
+        var drawDependency = new VkDependencyInfo { memoryBarrierCount = 1, pMemoryBarriers = &drawBarrier };
         api.vkCmdPipelineBarrier2(commands, &drawDependency);
     }
 

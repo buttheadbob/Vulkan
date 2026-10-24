@@ -38,7 +38,7 @@ internal sealed unsafe class GpuImage : IDisposable
     }
 
     public static GpuImage Create2D(GpuContext context, uint width, uint height, uint mipLevels, uint arrayLayers,
-        VkFormat format, VkImageUsageFlags usage, bool isCube = false)
+        VkFormat format, VkImageUsageFlags usage, bool isCube = false, VkSampleCountFlags samples = VkSampleCountFlags.Count1)
     {
         var api = context.Device.Api;
 
@@ -53,7 +53,7 @@ internal sealed unsafe class GpuImage : IDisposable
                 extent = new VkExtent3D(width, height, 1),
                 mipLevels = mipLevels,
                 arrayLayers = arrayLayers,
-                samples = VkSampleCountFlags.Count1,
+                samples = samples,
                 tiling = VkImageTiling.Optimal,
                 usage = usage,
                 sharingMode = context.SharingMode,

@@ -121,7 +121,9 @@ internal sealed unsafe class FrameLoop : IDisposable
         waits[0] = new VkSemaphoreSubmitInfo
         {
             semaphore = frame.ImageAvailable,
-            stageMask = VkPipelineStageFlags2.ColorAttachmentOutput | VkPipelineStageFlags2.Transfer,
+            // The swapchain image is read by the presentation engine; wait on all subsequent
+            // commands before the image-layout transition and first use.
+            stageMask = VkPipelineStageFlags2.AllCommands,
         };
 
         var waitCount = 1u;
@@ -153,7 +155,12 @@ internal sealed unsafe class FrameLoop : IDisposable
         };
 
         lock (device.QueueLock)
-            device.Api.vkQueueSubmit2(device.Queue, 1, &submit, frame.Fence).CheckResult("vkQueueSubmit2");
+        {
+            var submitResult = device.Api.vkQueueSubmit2(device.Queue, 1, &submit, frame.Fence);
+            if (submitResult == VkResult.ErrorDeviceLost)
+                device.LogDeviceFault();
+            submitResult.CheckResult("vkQueueSubmit2");
+        }
 
         submitted = true;
     }
@@ -183,7 +190,11 @@ internal sealed unsafe class FrameLoop : IDisposable
         if (result == VkResult.ErrorOutOfDateKHR || result == VkResult.SuboptimalKHR)
             SwapchainOutdated = true;
         else
+        {
+            if (result == VkResult.ErrorDeviceLost)
+                device.LogDeviceFault();
             result.CheckResult("vkQueuePresentKHR");
+        }
 
         frameIndex = (frameIndex + 1) % FramesInFlight;
         FrameNumber++;

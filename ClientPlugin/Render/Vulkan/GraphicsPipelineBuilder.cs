@@ -8,10 +8,14 @@ namespace ClientPlugin.Render.Vulkan;
 // Viewport and scissor are always dynamic. No vertex input: vertex data is fetched through buffer device addresses.
 internal sealed class GraphicsPipelineBuilder
 {
+    public VkSampleCountFlags Samples { get; init; } = VkSampleCountFlags.Count1;
+
     public ReadOnlyMemory<uint> Code { get; init; }           // SPIR-V module from ShaderBytecode
     public string VertexEntry { get; init; }
     public string FragmentEntry { get; init; }                // null for depth-only pipelines
     public VkFormat[] ColorFormats { get; init; } = [];
+    public VkVertexInputBindingDescription[] VertexBindings { get; init; } = [];
+    public VkVertexInputAttributeDescription[] VertexAttributes { get; init; } = [];
     public VkFormat DepthFormat { get; init; } = VkFormat.Undefined;
     public VkPrimitiveTopology Topology { get; init; } = VkPrimitiveTopology.TriangleList;
     public VkCullModeFlags CullMode { get; init; } = VkCullModeFlags.None;
@@ -48,7 +52,11 @@ internal sealed class GraphicsPipelineBuilder
                 stageCount = 2;
             }
 
-            var vertexInput = new VkPipelineVertexInputStateCreateInfo();
+            var vertexInput = new VkPipelineVertexInputStateCreateInfo
+            {
+                vertexBindingDescriptionCount = (uint)VertexBindings.Length,
+                vertexAttributeDescriptionCount = (uint)VertexAttributes.Length,
+            };
             var inputAssembly = new VkPipelineInputAssemblyStateCreateInfo { topology = Topology };
             var viewportState = new VkPipelineViewportStateCreateInfo { viewportCount = 1, scissorCount = 1 };
             var rasterization = new VkPipelineRasterizationStateCreateInfo
@@ -61,7 +69,7 @@ internal sealed class GraphicsPipelineBuilder
                 depthBiasConstantFactor = DepthBiasConstant,
                 depthBiasSlopeFactor = DepthBiasSlope,
             };
-            var multisample = new VkPipelineMultisampleStateCreateInfo { rasterizationSamples = VkSampleCountFlags.Count1 };
+            var multisample = new VkPipelineMultisampleStateCreateInfo { rasterizationSamples = Samples };
             var depthStencil = new VkPipelineDepthStencilStateCreateInfo
             {
                 depthTestEnable = DepthTest,
@@ -82,7 +90,11 @@ internal sealed class GraphicsPipelineBuilder
             var dynamicState = new VkPipelineDynamicStateCreateInfo { dynamicStateCount = 2, pDynamicStates = dynamicStates };
 
             fixed (VkFormat* colorFormats = ColorFormats)
+            fixed (VkVertexInputBindingDescription* bindings = VertexBindings)
+            fixed (VkVertexInputAttributeDescription* attributes = VertexAttributes)
             {
+                vertexInput.pVertexBindingDescriptions = bindings;
+                vertexInput.pVertexAttributeDescriptions = attributes;
                 var rendering = new VkPipelineRenderingCreateInfo
                 {
                     colorAttachmentCount = (uint)ColorFormats.Length,

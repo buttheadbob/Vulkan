@@ -25,7 +25,7 @@ struct ModelVertex
     uint tangent;
 };
 
-// Must match GpuSceneActor (184 bytes)
+// Must match GpuSceneActor (192 bytes)
 struct SceneActor
 {
     float4 world0;
@@ -38,14 +38,15 @@ struct SceneActor
     float4 lodDistances0;
     float4 lodDistances1;
     uint64_t instances;
+    uint64_t skinnedVertices; // deformed vertex buffer when flags has Skinned
     uint instanceStart;
     uint instanceCount;
-    uint flags;          // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance, 4: Visible
+    uint flags;          // 1: NoBackFaceCulling, 2: DrawOutsideViewDistance, 4: Visible, 8: Skinned
     uint rangeBase;
     uint lodStateIndex;
     uint lodCount;
+    uint forcedLod;      // skinned actors use the LOD the skinning pass produced
     float maxViewDistance;
-    uint pad0;
 };
 
 // Must match GpuScenePart (80 bytes)
@@ -86,6 +87,9 @@ struct CullParams
     uint64_t bucket3;
     uint64_t diagnostics;
     float4 cameraPosition;
+    float4 skinnedOffset; // main-camera-relative -> probe-camera-relative
+    uint drawAll;
+    uint shadowCulling;   // 1: append shadow casters, 0: reflection probe
 };
 
 // Must match GpuDiagnosticsCounters (32 bytes); written with atomics from this pass.
@@ -141,7 +145,12 @@ struct DrawCommand
 
 struct PushConstants
 {
-    float4 planes[5]; // normalized, xyz + d
+    // View-projection columns. The shader derives the five cull planes on the GPU instead of
+    // receiving them from the CPU.
+    float4 viewProjection0;
+    float4 viewProjection1;
+    float4 viewProjection2;
+    float4 viewProjection3;
     SceneActor* actors;
     ScenePart* parts;
     LodRange* ranges;
@@ -154,6 +163,12 @@ struct PushConstants
 // Bucket layout (see GpuSceneDraws.cs): counter @0, commands @64 (16 B each), draw data @64 + capacity * 16.
 static const uint64_t CommandOffset = 64;
 static const uint DrawStride = 184;
+
+float4 normalizePlane(float4 p)
+{
+    float lengthSq = dot(p.xyz, p.xyz);
+    return lengthSq > 1e-12 ? p * rsqrt(lengthSq) : p;
+}
 
 float lodThreshold(SceneActor actor, uint lod)
 {
@@ -173,6 +188,11 @@ uint selectLod(SceneActor actor, CullParams params)
 {
     if (actor.lodCount <= 1)
         return 0;
+
+    // The skinning pass produced vertices for one specific LOD; use exactly that LOD so the
+    // index range and deformed vertex buffer match, and do not disturb the main LOD state.
+    if ((actor.flags & 8u) != 0)
+        return min(actor.forcedLod, actor.lodCount - 1);
 
     if (params.enableLodSelection != 0)
         return min(params.lodSelection, actor.lodCount - 1);
@@ -207,6 +227,52 @@ uint selectLod(SceneActor actor, CullParams params)
     return lod;
 }
 
+DrawData makeDrawData(SceneActor actor, ScenePart part, float3 camera, CullParams params)
+{
+    DrawData draw;
+    if ((actor.flags & 8u) != 0)
+    {
+        // Skinned vertices were deformed relative to the main camera; shift them into the probe
+        // camera's frame (zero for the main view). The skinning pass already applied the world
+        // transform, so only this translation is needed.
+        float3 offset = params.skinnedOffset.xyz;
+        draw.world0 = float4(1.0, 0.0, 0.0, offset.x);
+        draw.world1 = float4(0.0, 1.0, 0.0, offset.y);
+        draw.world2 = float4(0.0, 0.0, 1.0, offset.z);
+        draw.world3 = float4(0.0, 0.0, 0.0, 1.0);
+        draw.vertices = (ModelVertex*)actor.skinnedVertices;
+        draw.instances = (CubeInstance*)0;
+        draw.instanceStart = 0;
+        draw.instanceCount = 1;
+    }
+    else
+    {
+        // Records store absolute transforms; the forward pass is camera-relative.
+        draw.world0 = actor.world0;
+        draw.world1 = actor.world1;
+        draw.world2 = actor.world2;
+        draw.world3 = actor.world3;
+        draw.world0.w -= camera.x;
+        draw.world1.w -= camera.y;
+        draw.world2.w -= camera.z;
+        draw.vertices = part.vertices;
+        draw.instances = (CubeInstance*)actor.instances;
+        draw.instanceStart = actor.instanceStart;
+        draw.instanceCount = actor.instanceCount;
+    }
+
+    draw.colorMaskHsv = actor.colorMaskHsv;
+    draw.material = part.material;
+    draw.indices = part.indices;
+    draw.indexStart = part.indexStart;
+    draw.indexCount = part.indexCount;
+    draw.pad0 = 0;
+    draw.pad1 = 0;
+    draw.pad2 = 0;
+    draw.pad3 = 0;
+    return draw;
+}
+
 [numthreads(64, 1, 1)]
 [shader("compute")]
 void main(uint3 threadId : SV_DispatchThreadID)
@@ -233,14 +299,43 @@ void main(uint3 threadId : SV_DispatchThreadID)
         return;
     }
 
-    [unroll]
-    for (uint i = 0; i < 5; i++)
+    // Keep the first-person self actor out of the probe when its bounds surround the camera.
+    if (params.shadowCulling == 0 && (actor.flags & 8u) != 0)
     {
-        float4 plane = push.planes[i];
-        if (dot(plane.xyz, center) + plane.w < -radius)
+        float selfDistance = length(actor.origin.xyz - camera);
+        if (selfDistance - radius < 0.5)
         {
             InterlockedAdd(diag->culledActors, 1u);
             return;
+        }
+    }
+
+    if (params.drawAll == 0)
+    {
+        // Plane extraction from the transposed view-projection columns (same formula as the old
+        // CPU Frustum helper). This keeps per-view cull setup on the GPU.
+        float4 c0 = push.viewProjection0;
+        float4 c1 = push.viewProjection1;
+        float4 c2 = push.viewProjection2;
+        float4 c3 = push.viewProjection3;
+        float4 planes[5] =
+        {
+            normalizePlane(c3 + c0), // left
+            normalizePlane(c3 - c0), // right
+            normalizePlane(c3 + c1), // bottom
+            normalizePlane(c3 - c1), // top
+            normalizePlane(c3 - c2), // near
+        };
+
+        [unroll]
+        for (uint i = 0; i < 5; i++)
+        {
+            float4 plane = planes[i];
+            if (dot(plane.xyz, center) + plane.w < -radius)
+            {
+                InterlockedAdd(diag->culledActors, 1u);
+                return;
+            }
         }
     }
 
@@ -258,11 +353,13 @@ void main(uint3 threadId : SV_DispatchThreadID)
     for (uint partIndex = 0; partIndex < range.count; partIndex++)
     {
         ScenePart part = push.parts[range.start + partIndex];
+        if (part.indexCount == 0 || part.vertices == nullptr || part.indices == nullptr)
+            continue;
 
         uint slot;
         InterlockedAdd(counter[0], 1, slot);
 
-        uint instanceCount = max(actor.instanceCount, 1u);
+        uint instanceCount = (actor.flags & 8u) != 0 ? 1u : max(actor.instanceCount, 1u);
         InterlockedAdd(diag->triangles, (part.indexCount / 3u) * instanceCount);
         InterlockedAdd(diag->parts, 1u);
         InterlockedAdd(diag->instances, instanceCount);
@@ -274,30 +371,17 @@ void main(uint3 threadId : SV_DispatchThreadID)
         command.firstInstance = 0;
         commands[slot] = command;
 
-        DrawData draw;
-        // Records store absolute transforms; the forward pass is camera-relative.
-        draw.world0 = actor.world0;
-        draw.world1 = actor.world1;
-        draw.world2 = actor.world2;
-        draw.world3 = actor.world3;
-        draw.world0.w -= camera.x;
-        draw.world1.w -= camera.y;
-        draw.world2.w -= camera.z;
-        draw.colorMaskHsv = actor.colorMaskHsv;
-        draw.material = part.material;
-        draw.vertices = part.vertices;
-        draw.indices = part.indices;
-        draw.indexStart = part.indexStart;
-        draw.indexCount = part.indexCount;
-        draw.pad0 = 0;
-        draw.pad1 = 0;
-        draw.instances = (CubeInstance*)actor.instances;
-        draw.instanceStart = actor.instanceStart;
-        draw.instanceCount = actor.instanceCount;
-        draw.pad2 = 0;
-        draw.pad3 = 0;
-        draws[slot] = draw;
+        draws[slot] = makeDrawData(actor, part, camera, params);
     }
+
+    // The reflection probe captures the full surrounding scene, not a shadow-caster list.
+    if (params.shadowCulling == 0)
+        return;
+
+    // Skinned actors are not shadow casters yet: the shadow range is LOD0, while the skinned
+    // vertex buffer matches the selected LOD.
+    if ((actor.flags & 8u) != 0)
+        return;
 
     // Shadow casters are a separate LOD0 draw list: the forward pass may use a higher LOD, but the
     // shadow map must keep a consistent silhouette at distance or shadows pop when crossing a LOD.
@@ -325,27 +409,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
         command.firstInstance = 0;
         shadowCommands[slot] = command;
 
-        DrawData draw;
-        draw.world0 = actor.world0;
-        draw.world1 = actor.world1;
-        draw.world2 = actor.world2;
-        draw.world3 = actor.world3;
-        draw.world0.w -= camera.x;
-        draw.world1.w -= camera.y;
-        draw.world2.w -= camera.z;
-        draw.colorMaskHsv = actor.colorMaskHsv;
-        draw.material = part.material;
-        draw.vertices = part.vertices;
-        draw.indices = part.indices;
-        draw.indexStart = part.indexStart;
-        draw.indexCount = part.indexCount;
-        draw.pad0 = 0;
-        draw.pad1 = 0;
-        draw.instances = (CubeInstance*)actor.instances;
-        draw.instanceStart = actor.instanceStart;
-        draw.instanceCount = actor.instanceCount;
-        draw.pad2 = 0;
-        draw.pad3 = 0;
+        DrawData draw = makeDrawData(actor, part, camera, params);
         shadowDraws[slot] = draw;
     }
 }

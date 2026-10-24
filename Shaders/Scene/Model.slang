@@ -335,6 +335,32 @@ float3x3 pixelTangentSpace(float3 normal, float3 position, float2 uv)
     return float3x3(t * invMax, b * invMax, normal);
 }
 
+
+// Shipped Lighting/SpecularPhong.hlsli, used by both the sun and dynamic lights.
+float3 fresnelPhong(float cosTheta, float3 reflectivity, float fresnelStrength)
+{
+    float f = saturate(1.0 - cosTheta);
+    float f2 = f * f;
+    f *= f2 * f2;
+    return lerp(reflectivity, 1.0, f * fresnelStrength);
+}
+
+float3 specularPhong(float ln, float nh, float vn, float vh, float3 f0, float gloss)
+{
+    gloss = min(gloss, 0.995);
+    float specExp = -10.0 / log2(gloss * 0.968 + 0.03);
+    specExp *= specExp;
+    float phongNormalize = (specExp + 4.0) / (8.0 * 3.14159265);
+    float phong = phongNormalize * pow(nh, specExp);
+    float horizon = 1.0 - ln;
+    horizon *= horizon;
+    horizon *= horizon;
+    phong -= phong * horizon;
+    float glossAdjust = gloss * gloss;
+    float3 fres = fresnelPhong(vn, f0, glossAdjust);
+    return min(fres * phong, 100.0);
+}
+
 // Lighting/Brdf.hlsli ToksvigGloss: narrow normal-map detail also narrows the highlight.
 float roughnessToSpecular(float roughness)
 {
@@ -455,12 +481,19 @@ ShadowCascadeSample getShadowCascade(int cascade)
         result.slot = push.frame.shadowMap1;
         result.extent = push.frame.shadowCascadeParams.y;
     }
-    else
+    else if (cascade == 2)
     {
         result.matrix = float4x4(push.frame.shadowMatrix2_0, push.frame.shadowMatrix2_1,
                                  push.frame.shadowMatrix2_2, push.frame.shadowMatrix2_3);
         result.slot = push.frame.shadowMap2;
         result.extent = push.frame.shadowCascadeParams.z;
+    }
+    else
+    {
+        result.matrix = float4x4(push.frame.shadowMatrix3_0, push.frame.shadowMatrix3_1,
+                                 push.frame.shadowMatrix3_2, push.frame.shadowMatrix3_3);
+        result.slot = push.frame.shadowMap3;
+        result.extent = push.frame.shadowCascadeParams.w;
     }
     return result;
 }
@@ -499,8 +532,24 @@ float sampleShadowCascade(float4x4 matrix, uint slot, float extent, float3 world
     return lit / 16.0;
 }
 
+struct FragmentOutput
+{
+    float4 color : SV_Target0;
+    float4 gbuffer : SV_Target1; // xyz: world normal encoded 0..1, w: gloss
+    float4 gbuffer2 : SV_Target2; // rgb: F0, a: ambient occlusion
+};
+
+FragmentOutput makeOutput(float4 color, float3 n, float gloss)
+{
+    FragmentOutput output;
+    output.color = color;
+    output.gbuffer = float4(n * 0.5 + 0.5, gloss);
+    output.gbuffer2 = 0.0;
+    return output;
+}
+
 [shader("fragment")]
-float4 fragmentMain(VertexOutput input) : SV_Target0
+FragmentOutput fragmentMain(VertexOutput input)
 {
     DrawMaterial material = push.drawData != nullptr
         ? push.drawData[input.drawIndex].material
@@ -551,7 +600,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         {
             normalMap.y *= -1.0;
             float3 tangent = normalize(input.tangent.xyz - n * dot(n, input.tangent.xyz));
-            float3 bitangent = cross(n, tangent) * input.tangent.w;
+            float3 bitangent = cross(tangent, n) * input.tangent.w;
             n = normalize(mul(normalMap, float3x3(tangent, bitangent, n)));
         }
         else
@@ -563,6 +612,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         gloss = toksvigGloss(ng.w, min(normalLength, 1.0));
     }
 
+    // Specular antialiasing: bevels and normal-map edges turn into razor-thin, shimmering white
+    // lines when a high-gloss highlight is sampled once per pixel. Widen the lobe where the world
+    // normal changes quickly.
+    float normalVariance = length(ddx(n)) + length(ddy(n));
+    gloss = saturate(gloss - normalVariance * 1.5);
+
     float ao = extras.x;
     float emissive = saturate(extras.y - 1.0 / 255.0) * material.colorMulEmissive.w;
 
@@ -573,25 +628,22 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 faceNormal = normalize(cross(ddx(input.worldPosition), ddy(input.worldPosition)));
     if (dot(faceNormal, toCamera) < 0.0)
         faceNormal = -faceNormal;
-    float nol = saturate(dot(faceNormal, toSun));
-    n = faceNormal;
+    float nol = saturate(dot(n, toSun));
     float3 halfVector = normalize(toSun + toCamera);
     float noh = saturate(dot(n, halfVector));
     float voh = saturate(dot(toCamera, halfVector));
     float nov = saturate(dot(n, toCamera));
 
-    float roughness = max(1.0 - gloss, 0.04);
-    float alpha = roughness * roughness;
     float3 f0 = lerp(0.04, baseColor, metalness);
-    float3 fresnel = fresnelSchlick(f0, voh);
-    float specular = distributionGGX(noh, alpha) * visibilitySmithGGX(nov, nol, alpha);
+    float3 specular = specularPhong(nol, noh, nov, voh, f0, gloss);
 
-    float3 diffuse = albedo * (nol / PI);
-    float3 direct = (diffuse + fresnel * specular * nol * renderSettings[0].tuning0.z) * sunColor;
+    float3 diffuse = albedo * (nol / 3.14159265);
+    float3 direct = (diffuse + specular * nol * renderSettings[0].tuning0.z) * sunColor;
 
-    // Sun shadow cascades (reverse-Z). Three maps: a tight near cascade for close-up texel density,
-    // a mid cascade and a far cascade. The filter narrows with distance so the far map does not turn
-    // into visible dither, and neighbouring cascades overlap across a split to avoid a pop.
+    // Sun shadow cascades (reverse-Z). Four maps: a tight near cascade for close-up texel density
+    // and three progressively wider cascades out to the configured shadow distance. The filter
+    // narrows with distance so the far map does not turn into visible dither, and neighbouring
+    // cascades overlap across a split to avoid a pop.
     float shadowFactor = 1.0;
     if (push.frame.shadowEnabled != 0)
     {
@@ -599,9 +651,11 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
         float split0 = push.frame.shadowSplits.x;
         float split1 = push.frame.shadowSplits.y;
         float split2 = push.frame.shadowSplits.z;
+        float split3 = push.frame.shadowSplits.w;
 
-        int cascade = viewDistance < split0 ? 0 : (viewDistance < split1 ? 1 : 2);
-        if (viewDistance < split2)
+        int cascade = viewDistance < split0 ? 0 :
+            (viewDistance < split1 ? 1 : (viewDistance < split2 ? 2 : 3));
+        if (viewDistance < split3)
         {
             float nolGeometric = saturate(dot(faceNormal, toSun));
 
@@ -609,7 +663,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
             // filter (in its smaller texels); distant cascades need less screen-space dither.
             ShadowCascadeSample current = getShadowCascade(cascade);
             float softness = push.frame.shadowParams.w *
-                (cascade == 0 ? 1.0 : (cascade == 1 ? 0.8 : 0.6));
+                (cascade == 0 ? 1.0 : (cascade == 1 ? 0.8 : (cascade == 2 ? 0.65 : 0.55)));
             shadowFactor = sampleShadowCascade(current.matrix, current.slot, current.extent,
                 input.worldPosition, faceNormal, nolGeometric, softness, (float)cascade * 1.1);
 
@@ -620,11 +674,14 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
                 blend = smoothstep(split0 * 0.88, split0, viewDistance);
             else if (cascade == 1 && viewDistance > split1 * 0.90)
                 blend = smoothstep(split1 * 0.90, split1, viewDistance);
+            else if (cascade == 2 && viewDistance > split2 * 0.92)
+                blend = smoothstep(split2 * 0.92, split2, viewDistance);
 
             if (blend > 0.0)
             {
                 ShadowCascadeSample next = getShadowCascade(cascade + 1);
-                float nextSoftness = push.frame.shadowParams.w * (cascade == 0 ? 0.8 : 0.6);
+                float nextSoftness = push.frame.shadowParams.w *
+                    (cascade == 0 ? 0.8 : (cascade == 1 ? 0.65 : 0.55));
                 float nextShadow = sampleShadowCascade(next.matrix, next.slot, next.extent,
                     input.worldPosition, faceNormal, nolGeometric, nextSoftness,
                     (float)(cascade + 1) * 1.1);
@@ -677,15 +734,11 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
             float nohLight = saturate(dot(n, halfLight));
             float vohLight = saturate(dot(toCamera, halfLight));
             float lightGloss = saturate(gloss * light.params.x);
-            float lightRoughness = max(1.0 - lightGloss, 0.04);
-            float lightAlpha = lightRoughness * lightRoughness;
-            float specularLight = distributionGGX(nohLight, lightAlpha) *
-                                  visibilitySmithGGX(nov, nolLight, lightAlpha);
-            float3 fresnelLight = fresnelSchlick(f0, vohLight);
+            float3 specularLight = specularPhong(nolLight, nohLight, nov, vohLight, f0, lightGloss);
 
             float3 lightColor = light.colorFalloff.rgb * attenuationHard * ao * renderSettings[0].tuning1.y;
-            float3 lightDiffuse = albedo * (nolLight / PI) * light.params.y * attenuationDiffuse * lightColor;
-            float3 lightSpecular = fresnelLight * specularLight * nolLight * lightColor;
+            float3 lightDiffuse = albedo * (nolLight / 3.14159265) * light.params.y * attenuationDiffuse * lightColor;
+            float3 lightSpecular = specularLight * nolLight * lightColor;
             dynamicLight += lightDiffuse + lightSpecular;
         }
     }
@@ -703,33 +756,27 @@ float4 fragmentMain(VertexOutput input) : SV_Target0
     float3 ambient = albedo * push.frame.ambientColor.rgb * push.frame.ambientColor.w *
                      renderSettings[0].tuning0.y * ao;
     ambient += albedo * renderSettings[0].tuning0.y * 0.25;
-    float3 ambientSpecular = 0;
-    if (push.frame.iblCube != 0 && renderSettings[0].tuning1.z > 0.0)
-    {
-        float maxIblMip = max(push.frame.skyboxParams.y - 1.0, 0.0);
-        float3 reflection = reflect(-toCamera, n);
-        float3 prefiltered = iblColor(*push.frame, reflection, (1.0 - gloss) * maxIblMip);
-        float2 brdf = sampleTexture(push.frame.brdfLut, SamplerSlot.LinearClamp,
-                                    float2(gloss, nov)).rg;
-        ambientSpecular = prefiltered * (f0 * brdf.x + brdf.y) * push.frame.skyboxParams.w * ao *
-                          renderSettings[0].tuning1.z;
-    }
     int debugView = (int)push.frame.colorizeHsv.w;
     if (debugView == 1)
-        return float4(n * 0.5 + 0.5, 1.0);
+        return makeOutput(float4(n * 0.5 + 0.5, 1.0), n, gloss);
     if (debugView == 2)
-        return float4(direct, 1.0);
+        return makeOutput(float4(direct, 1.0), n, gloss);
     if (debugView == 3)
-        return float4(ambient, 1.0);
+        return makeOutput(float4(ambient, 1.0), n, gloss);
     if (debugView == 4)
-        return float4(emissiveColor, 1.0);
+        return makeOutput(float4(emissiveColor, 1.0), n, gloss);
     if (debugView == 5)
-        return float4(albedo, 1.0);
+        return makeOutput(float4(albedo, 1.0), n, gloss);
     if (debugView == 6)
-        return float4(shadowFactor.xxx, 1.0);
+        return makeOutput(float4(shadowFactor.xxx, 1.0), n, gloss);
     if (debugView == 7)
-        return float4(saturate(dynamicLight * 10.0), 1.0);
+        return makeOutput(float4(saturate(dynamicLight * 10.0), 1.0), n, gloss);
     if (debugView == 8)
-        return float4((float)push.frame.lightCount / 64.0, (float)push.frame.lightCount / 64.0, 0.0, 1.0);
-    return float4(direct + ambient + ambientSpecular + emissiveColor, 1.0);
+        return makeOutput(float4((float)push.frame.lightCount / 64.0, (float)push.frame.lightCount / 64.0, 0.0, 1.0), n, gloss);
+    FragmentOutput result = makeOutput(float4(direct + ambient + emissiveColor, 1.0), n, gloss);
+    // The composite attenuates environment reflections by this sun-shadow factor. Without it a
+    // metal block in shadow reflected the fully lit probe and looked brighter than the scene.
+    result.color.a = shadowFactor;
+    result.gbuffer2 = float4(f0, ao);
+    return result;
 }

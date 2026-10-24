@@ -46,7 +46,10 @@ internal struct FrameConstants
     public uint SkyboxCube;
     public uint IblCube;
     public uint BrdfLut;
-    public uint Pad;
+    public uint IblProbe; // 1: IblCube is a world-space scene probe, 0: oriented skybox IBL
+    public uint IblCubePrev; // previous probe cube while a completed capture is cross-fading
+    public float IblBlend;   // 0: previous cube, 1: current cube
+    public uint IblPad;
 
     // Dynamic lights (0 when none): array of GpuLight, count capped at SceneLights.MaxLights
     public ulong Lights;
@@ -84,7 +87,7 @@ internal struct FrameConstants
     public uint ShadowPad;
     public Vector4 ShadowParams; // x: strength, y: depth bias, z: PCF texel scale, w: softness
 
-    // Cascades 1 and 2, plus the split/extent table. Cascade 0 uses the fields above.
+    // Cascades 1-3, plus the split/extent table. Cascade 0 uses the fields above.
     public Vector4 ShadowMatrix1_0;
     public Vector4 ShadowMatrix1_1;
     public Vector4 ShadowMatrix1_2;
@@ -93,12 +96,27 @@ internal struct FrameConstants
     public Vector4 ShadowMatrix2_1;
     public Vector4 ShadowMatrix2_2;
     public Vector4 ShadowMatrix2_3;
-    public Vector4 ShadowSplits;         // x,y,z: far view distance of each cascade; w: count
-    public Vector4 ShadowCascadeParams;  // x,y,z: light-space extent; w: reserved
+    public Vector4 ShadowMatrix3_0;
+    public Vector4 ShadowMatrix3_1;
+    public Vector4 ShadowMatrix3_2;
+    public Vector4 ShadowMatrix3_3;
+    public Vector4 ShadowSplits;         // x,y,z,w: far view distance of each cascade
+    public Vector4 ShadowCascadeParams;  // x,y,z,w: light-space extent of each cascade
     public uint ShadowMap1;
     public uint ShadowMap2;
+    public uint ShadowMap3;
     public uint ShadowPad1;
-    public uint ShadowPad2;
+
+    // Bindless slots used by screen-space reflections.
+    public uint SceneColor;
+    public uint SceneDepth;
+    public uint SceneGBuffer;
+    public uint ScenePad;
+
+    // x: close/far quality blend start (m), y: blend end (m), z: far mip bias,
+    // w: minimum probe mip (0 = sharpest, 2+ = soft blobs)
+    public Vector4 ReflectionParams;
+
 }
 
 // Camera from MyRenderMessageSetCameraViewMatrix, plus the stock projection and camera-relative setup.
@@ -113,6 +131,10 @@ internal sealed class CameraState
 
     // Stock (unflipped) projection for frustum extraction, camera-relative
     public Matrix CullingViewProjection { get; private set; }
+
+    // World-space view * finite projection, matching stock MyEnvironmentMatrices.ViewFrustumClippedD.
+    // Used by the voxel clipmap, which expects a world-space frustum.
+    public MatrixD WorldFrustumMatrix { get; private set; }
 
     public Vector3D Position { get; private set; }
     public float Near { get; private set; }
@@ -142,6 +164,7 @@ internal sealed class CameraState
         // Frustum culling uses the stock D3D-space matrix (the Y flip below does not change the volume,
         // but keeping the stock matrix avoids mirrored plane winding)
         CullingViewProjection = view * projection;
+        var stockProjection = projection;
 
         // Vulkan clip space has +Y down; the stock matrices are D3D (Y up)
         projection.M22 = -projection.M22;
@@ -150,6 +173,10 @@ internal sealed class CameraState
         ViewD = message.ViewMatrix;
         ViewAt0 = view;
         ViewProjectionAt0 = view * projection;
+        var finiteProjection = message.ProjectionMatrix.M11 != 0f
+            ? (MatrixD)message.ProjectionMatrix
+            : (MatrixD)stockProjection;
+        WorldFrustumMatrix = message.ViewMatrix * finiteProjection;
         Position = message.CameraPosition;
         Near = message.NearPlane;
         Far = message.FarPlane;
@@ -159,6 +186,73 @@ internal sealed class CameraState
             ? (float)(Math.Tan(message.FOV / 2.0) / Math.Tan(35.0 * Math.PI / 180.0) * (1080.0 / resolution.Y))
             : 1f;
         HasValue = true;
+    }
+
+    // Camera for one face of the reflection cubemap: same position, 90 degree frustum, camera-relative.
+    public CameraState CreateProbeFace(int face) => CreateProbeFace(face, Position);
+
+    public CameraState CreateProbeFace(int face, Vector3D position)
+    {
+        Vector3[] directions =
+        [
+            Vector3.UnitX, -Vector3.UnitX, Vector3.UnitY, -Vector3.UnitY, Vector3.UnitZ, -Vector3.UnitZ,
+        ];
+        Vector3[] ups =
+        [
+            -Vector3.UnitY, -Vector3.UnitY, Vector3.UnitZ, -Vector3.UnitZ, -Vector3.UnitY, -Vector3.UnitY,
+        ];
+
+        var direction = directions[Math.Clamp(face, 0, 5)];
+        var up = ups[Math.Clamp(face, 0, 5)];
+        var view = Matrix.CreateLookAt(Vector3.Zero, direction, up);
+        var projection = CreatePerspectiveFovRhInfiniteComplementary(MathF.PI / 2f, 1f, Near > 0f ? Near : 0.05f);
+
+        // Do not apply the main camera's D3D->Vulkan Y flip (or an X flip) to the probe faces.
+        // The face images are not displayed directly: they are copied into a cubemap and sampled
+        // with Vulkan's face convention, which expects the unflipped stock projection. Any flip
+        // here makes the reflection appear vertically or horizontally mirrored.
+        return new CameraState
+        {
+            CullingViewProjection = view * projection,
+            ViewD = Matrix.Identity,
+            ViewAt0 = view,
+            ViewProjectionAt0 = view * projection,
+            Position = position,
+            Near = Near,
+            Far = Far,
+            FovH = MathF.PI / 2f,
+            FovV = MathF.PI / 2f,
+            LodCoefficient = LodCoefficient,
+            HasValue = true,
+        };
+    }
+
+    public FrameConstants BuildProbeFrameConstants(FrameConstants source, uint iblMipCount)
+    {
+        var viewProjection = Matrix.Transpose(ViewProjectionAt0);
+        var invViewProjection = Matrix.Transpose(Matrix.Invert(ViewProjectionAt0));
+        return BuildProbeFrameConstants(source, iblMipCount, viewProjection, invViewProjection);
+    }
+
+    // Cached-matrix overload used by the probe: the six face matrices only depend on the near plane.
+    public FrameConstants BuildProbeFrameConstants(FrameConstants source, uint iblMipCount,
+        Matrix viewProjection, Matrix invViewProjection)
+    {
+        var constants = source;
+        constants.ViewProjection0 = new Vector4(viewProjection.M11, viewProjection.M12, viewProjection.M13, viewProjection.M14);
+        constants.ViewProjection1 = new Vector4(viewProjection.M21, viewProjection.M22, viewProjection.M23, viewProjection.M24);
+        constants.ViewProjection2 = new Vector4(viewProjection.M31, viewProjection.M32, viewProjection.M33, viewProjection.M34);
+        constants.ViewProjection3 = new Vector4(viewProjection.M41, viewProjection.M42, viewProjection.M43, viewProjection.M44);
+        constants.InvViewProjection0 = new Vector4(invViewProjection.M11, invViewProjection.M12, invViewProjection.M13, invViewProjection.M14);
+        constants.InvViewProjection1 = new Vector4(invViewProjection.M21, invViewProjection.M22, invViewProjection.M23, invViewProjection.M24);
+        constants.InvViewProjection2 = new Vector4(invViewProjection.M31, invViewProjection.M32, invViewProjection.M33, invViewProjection.M34);
+        constants.InvViewProjection3 = new Vector4(invViewProjection.M41, invViewProjection.M42, invViewProjection.M43, invViewProjection.M44);
+        constants.SkyboxParams = new Vector4(source.SkyboxParams.X, iblMipCount, source.SkyboxParams.Z,
+            source.SkyboxParams.W);
+        // The probe reuses the main frame's shadow maps but does not need to sample them; skipping
+        // the cascade lookups saves six shadow-PCF evaluations per captured texel.
+        constants.ShadowEnabled = 0;
+        return constants;
     }
 
     // Development/test helper: override the game camera to frame a single model. Keeps the current

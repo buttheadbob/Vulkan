@@ -23,6 +23,7 @@ internal sealed unsafe class VulkanDevice : IDisposable
     public bool HasDedicatedTransfer { get; private set; }
     public uint TransferQueueFamily { get; private set; }
     public VkQueue TransferQueue { get; private set; }
+    public bool DeviceFaultEnabled { get; private set; }
 
     // Serializes queue submission and presentation, VkQueue access must be externally synchronized
     public readonly object QueueLock = new();
@@ -43,9 +44,19 @@ internal sealed unsafe class VulkanDevice : IDisposable
             RenderLog.Info("No dedicated transfer queue family; uploads use the graphics queue");
 
         var extensions = new List<string> { VkNames.ToString(VK_KHR_SWAPCHAIN_EXTENSION_NAME) };
+        var availableExtensions = VkNames.ToSet(instance.EnumerateDeviceExtensions(physicalDevice));
+        var faultEnabled = availableExtensions.Contains("VK_EXT_device_fault");
+        if (faultEnabled)
+            extensions.Add("VK_EXT_device_fault");
+        var faultFeatures = new VkPhysicalDeviceFaultFeaturesEXT
+        {
+            deviceFault = faultEnabled,
+            deviceFaultVendorBinary = false,
+        };
 
         var features13 = new VkPhysicalDeviceVulkan13Features
         {
+            pNext = faultEnabled ? &faultFeatures : null,
             dynamicRendering = true,
             synchronization2 = true,
         };
@@ -54,6 +65,7 @@ internal sealed unsafe class VulkanDevice : IDisposable
             pNext = &features13,
             timelineSemaphore = true,
             bufferDeviceAddress = true,
+            drawIndirectCount = true,
             descriptorIndexing = true,
             runtimeDescriptorArray = true,
             descriptorBindingPartiallyBound = true,
@@ -121,6 +133,7 @@ internal sealed unsafe class VulkanDevice : IDisposable
                 HasDedicatedTransfer = transferFamily.HasValue,
                 TransferQueueFamily = transferFamily ?? queueFamily,
                 TransferQueue = transferQueue,
+                DeviceFaultEnabled = faultEnabled,
             };
         }
     }
@@ -223,6 +236,64 @@ internal sealed unsafe class VulkanDevice : IDisposable
 
         lock (QueueLock)
             Api.vkDeviceWaitIdle();
+    }
+
+    // VK_EXT_device_fault: call immediately after a device-lost result, before destroying the
+    // device, to record the faulting GPU virtual address and vendor fault code.
+    public void LogDeviceFault()
+    {
+        if (!DeviceFaultEnabled)
+        {
+            RenderLog.Warning("Device lost; VK_EXT_device_fault is not available");
+            return;
+        }
+
+        try
+        {
+            var counts = new VkDeviceFaultCountsEXT
+            {
+                sType = VkStructureType.DeviceFaultCountsEXT,
+            };
+            Api.vkGetDeviceFaultInfoEXT(&counts, null);
+            var addresses = new VkDeviceFaultAddressInfoKHR[counts.addressInfoCount];
+            var vendors = new VkDeviceFaultVendorInfoKHR[counts.vendorInfoCount];
+            var info = new VkDeviceFaultInfoEXT
+            {
+                sType = VkStructureType.DeviceFaultInfoEXT,
+            };
+            fixed (VkDeviceFaultAddressInfoKHR* addressPtr = addresses)
+            fixed (VkDeviceFaultVendorInfoKHR* vendorPtr = vendors)
+            {
+                info.pAddressInfos = addressPtr;
+                info.pVendorInfos = vendorPtr;
+                var result = Api.vkGetDeviceFaultInfoEXT(&counts, &info);
+                if (result != VkResult.Success)
+                {
+                    RenderLog.Warning($"vkGetDeviceFaultInfoEXT returned {result}");
+                    return;
+                }
+                var description = VkNames.FromFixed((byte*)&info.description);
+                RenderLog.Error($"GPU device fault: {description}");
+                for (var i = 0; i < addresses.Length; i++)
+                {
+                    var a = addresses[i];
+                    RenderLog.Error($"  GPU fault address {i}: {a.addressType}, " +
+                                    $"0x{a.reportedAddress:X}, precision 0x{a.addressPrecision:X}");
+                }
+                for (var i = 0; i < vendors.Length; i++)
+                {
+                    var v = vendors[i];
+                    var vendorDescription =
+                        VkNames.FromFixed((byte*)&v.description);
+                    RenderLog.Error($"  GPU vendor fault {i}: {vendorDescription}, " +
+                                    $"code 0x{v.vendorFaultCode:X}, data 0x{v.vendorFaultData:X}");
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            RenderLog.Warning($"Could not query GPU fault info: {e.Message}");
+        }
     }
 
     public void Dispose()

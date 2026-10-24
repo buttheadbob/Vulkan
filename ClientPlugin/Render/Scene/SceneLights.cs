@@ -41,9 +41,19 @@ internal sealed class SceneLights
 
     public void Update(UpdateRenderLightData data) => lights[data.ID] = data;
 
-    public (ulong Address, uint Count) Build(GpuContext context, Vector3D cameraPosition, SceneActors actors)
+    public (ulong Address, uint Count) Build(GpuContext context, Vector3D cameraPosition, SceneActors actors,
+        float maxDistance, IReadOnlyList<GpuLight> extra = null)
     {
-        var candidates = new List<(float Distance, GpuLight Light)>(lights.Count * 2);
+        var candidates = new List<(float Distance, GpuLight Light)>(lights.Count * 2 + (extra?.Count ?? 0));
+        if (extra != null)
+        {
+            foreach (var light in extra)
+            {
+                var distance = new Vector3(light.PositionRange.X, light.PositionRange.Y, light.PositionRange.Z).Length();
+                if (distance <= maxDistance)
+                    candidates.Add((distance, light));
+            }
+        }
         foreach (var data in lights.Values)
         {
             var forward = data.SpotLight.Direction;
@@ -71,8 +81,10 @@ internal sealed class SceneLights
 
             var pointDistance = (float)(pointPosition - cameraPosition).Length();
             var spotDistance = (float)(spotPosition - cameraPosition).Length();
+            if (pointDistance > maxDistance && spotDistance > maxDistance)
+                continue;
 
-            if (data.PointLightOn && data.PointLight.Range > 0.01f)
+            if (data.PointLightOn && data.PointLight.Range > 0.01f && pointDistance <= maxDistance)
             {
                 var light = data.PointLight;
                 candidates.Add((pointDistance, new GpuLight
@@ -84,7 +96,7 @@ internal sealed class SceneLights
                 }));
             }
 
-            if (data.SpotLightOn && data.SpotLight.Light.Range > 0.01f)
+            if (data.SpotLightOn && data.SpotLight.Light.Range > 0.01f && spotDistance <= maxDistance)
             {
                 var light = data.SpotLight.Light;
                 candidates.Add((spotDistance, new GpuLight
@@ -112,7 +124,7 @@ internal sealed class SceneLights
     }
 
     // MyLightComponent.UpdateData: falloff = 1 / (0.001 + (falloff / 1.5)^3)
-    private static float ConvertFalloff(float falloff)
+    internal static float ConvertFalloff(float falloff)
     {
         var value = falloff / 1.5f;
         return 1f / (0.001f + value * value * value);

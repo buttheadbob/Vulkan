@@ -49,26 +49,43 @@ public sealed class VulkanRender : IMyRender
     private ExposurePass exposurePass;
     private BloomPass bloomPass;
     private SkyboxPass skyboxPass;
+    private ulong lastFrameConstants;
+    private BillboardPass billboards;
+    private readonly ThrusterEffects thrusterEffects = new();
     private CompositePass composite;
+    private FxaaPass fxaa;
     private VkFormat compositeFormat;
     private GpuBuffer renderSettingsBuffer;
     private int renderSettingsDirty;
     private ModelCache models;
     private InstanceBuffers instanceBuffers;
     private ModelPass modelPass;
+    private VoxelPass voxelPass;
 
     private readonly CameraState camera = new();
     private readonly SceneActors actors = new();
+    private FrameConstants lastFrameConstantsData;
+    private uint lastStaticIblSlot;
+    private uint lastStaticIblMips;
+    private ProbePass probePass;
     private readonly SceneLights sceneLights = new();
     private MyPostprocessSettings postprocessSettings = MyPostprocessSettings.Default;
     private readonly string debugLookAtModel = Environment.GetEnvironmentVariable("VULKAN_DEBUG_LOOKAT");
+    private readonly bool debugVoxel = Environment.GetEnvironmentVariable("VULKAN_DEBUG_VOXEL") == "1";
     private readonly bool debugLookAtDark = Environment.GetEnvironmentVariable("VULKAN_DEBUG_DARK") == "1";
     private readonly bool debugLookAtTop = Environment.GetEnvironmentVariable("VULKAN_DEBUG_TOP") == "1";
     private readonly float debugLookAtDistance = ParseDebugFloat("VULKAN_DEBUG_DISTANCE", 9f);
     private readonly bool debugShadowMap = Environment.GetEnvironmentVariable("VULKAN_DEBUG_VIEW") == "9";
+    private readonly bool debugSsr = Environment.GetEnvironmentVariable("VULKAN_DEBUG_VIEW") == "10";
+    private readonly bool debugSsrColor = Environment.GetEnvironmentVariable("VULKAN_DEBUG_VIEW") == "11";
+    private readonly bool probeDisabled = Environment.GetEnvironmentVariable("VULKAN_NO_PROBE") == "1";
+    private readonly VkSampleCountFlags sceneSamples = ToSamples(Config.Current.MsaaLevel);
     private bool reportedDebugLookAt;
     private SceneActor debugTarget;
     private Vector3D debugTargetCenter;
+    private bool hasDebugVoxel;
+    private Vector3D debugVoxelCenter;
+    private float debugVoxelRadius;
     private MyEnvironmentData environment;
     private bool hasEnvironment;
     private int lastDrawnActors;
@@ -160,7 +177,7 @@ public sealed class VulkanRender : IMyRender
             RendererStatus.SetDevice(device.Caps);
 
             swapchain = new VulkanSwapchain(instance, device, surface);
-            swapchain.Recreate(new Vector2I(requested.BackBufferWidth, requested.BackBufferHeight), requested.VSync != 0);
+            swapchain.Recreate(new Vector2I(requested.BackBufferWidth, requested.BackBufferHeight), Config.Current.VSync);
             frameLoop = new FrameLoop(device, swapchain);
 
             gpu = new GpuContext(instance, device);
@@ -172,13 +189,20 @@ public sealed class VulkanRender : IMyRender
             textures = new TextureCache(gpu);
             models = new ModelCache(gpu, textures);
             instanceBuffers = new InstanceBuffers(gpu);
-            modelPass = new ModelPass(gpu, models, instanceBuffers, textures);
+            modelPass = new ModelPass(gpu, models, instanceBuffers, textures, sceneSamples);
+            voxelPass = new VoxelPass(gpu, textures, sceneSamples);
             gui = new GuiRenderer(gpu, textures, () => messages.FrameId);
             capture = FrameCapture.FromEnvironment(gpu);
             sceneTargets = new SceneTargets(gpu);
             exposurePass = new ExposurePass(gpu);
             bloomPass = new BloomPass(gpu);
-            skyboxPass = new SkyboxPass(gpu);
+            skyboxPass = new SkyboxPass(gpu, sceneSamples);
+            billboards = new BillboardPass(gpu, textures);
+            probePass = new ProbePass(gpu, modelPass, skyboxPass, billboards, voxelPass,
+                ProbeResolution(Config.Current.ReflectionProbeQuality));
+            // A cubemap capture is sampled through blurred mips; MSAA would multiply the probe's
+            // memory and bandwidth six times for no visible gain.
+            probePass.SetSamples(VkSampleCountFlags.Count1);
 
             settings = requested;
             ForwardWindowMode(force: true);
@@ -229,14 +253,26 @@ public sealed class VulkanRender : IMyRender
         composite?.Dispose();
         composite = null;
 
+        fxaa?.Dispose();
+        fxaa = null;
+
         bloomPass?.Dispose();
         bloomPass = null;
+
+        billboards?.Dispose();
+        billboards = null;
+
+        probePass?.Dispose();
+        probePass = null;
 
         skyboxPass?.Dispose();
         skyboxPass = null;
 
         sceneTargets?.Dispose();
         sceneTargets = null;
+
+        voxelPass?.Dispose();
+        voxelPass = null;
 
         modelPass?.Dispose();
         modelPass = null;
@@ -280,8 +316,7 @@ public sealed class VulkanRender : IMyRender
         RenderLog.Info($"ApplySettings: {newSettings}");
 
         var resize = newSettings.BackBufferWidth != settings.BackBufferWidth
-                     || newSettings.BackBufferHeight != settings.BackBufferHeight
-                     || newSettings.VSync != settings.VSync;
+                     || newSettings.BackBufferHeight != settings.BackBufferHeight;
 
         settings = newSettings;
         ForwardWindowMode(force: false);
@@ -322,7 +357,7 @@ public sealed class VulkanRender : IMyRender
         if (swapchain == null)
             return;
 
-        swapchain.Recreate(new Vector2I(settings.BackBufferWidth, settings.BackBufferHeight), settings.VSync != 0);
+        swapchain.Recreate(new Vector2I(settings.BackBufferWidth, settings.BackBufferHeight), Config.Current.VSync);
         frameLoop.OnSwapchainRecreated();
     }
 
@@ -345,7 +380,31 @@ public sealed class VulkanRender : IMyRender
     // VULKAN_DEBUG_TOP=1 looks straight down instead.
     private void ApplyDebugCamera()
     {
-        if (string.IsNullOrEmpty(debugLookAtModel) || !hasEnvironment)
+        if (!hasEnvironment)
+            return;
+
+        if (debugVoxel)
+        {
+            if (!hasDebugVoxel)
+            {
+                if (voxelPass == null || !voxelPass.TryGetNearestActor(camera.Position,
+                        out debugVoxelCenter, out debugVoxelRadius))
+                    return;
+                hasDebugVoxel = true;
+            }
+            var distance = Math.Max(40f, debugVoxelRadius * 2.5f * debugLookAtDistance);
+            var voxelEye = debugVoxelCenter + Vector3D.Up * distance +
+                           new Vector3D(0, 0, -1) * distance * 0.25;
+            camera.SetDebugLookAt(voxelEye, debugVoxelCenter, BackBufferResolution);
+            if (!reportedDebugLookAt)
+            {
+                reportedDebugLookAt = true;
+                RenderLog.Info($"Debug voxel camera: eye {voxelEye}, target {debugVoxelCenter}, radius {debugVoxelRadius}");
+            }
+            return;
+        }
+
+        if (string.IsNullOrEmpty(debugLookAtModel))
             return;
 
         // Choose the target once, using the game's saved camera position; later frames run with the
@@ -455,6 +514,11 @@ public sealed class VulkanRender : IMyRender
         models.ProcessReady();
         instanceBuffers.ProcessPending();
         ApplyDebugCamera();
+        // Voxel clipmaps must keep loading even while the game shows the loading/spawn GUI and
+        // drawScene is false. Run before Uploads.Record so this frame's cell buffers are uploaded
+        // before the opaque pass consumes them.
+        if (camera.HasValue)
+            voxelPass?.Update(camera);
         lastMessagesMs = Ms(stageStart);
 
         stageStart = Stopwatch.GetTimestamp();
@@ -474,8 +538,9 @@ public sealed class VulkanRender : IMyRender
             RecordScene(commands);
         if (drawScene)
         {
-            exposurePass.Record(commands, sceneTargets.ColorSlot, postprocessSettings);
-            bloomPass.Record(commands, sceneTargets.ColorSlot, sceneTargets.Extent);
+            exposurePass.Record(commands, sceneTargets.ColorSlot, MyPostprocessSettings.Default);
+            bloomPass.Record(commands, sceneTargets.ColorSlot, sceneTargets.OitAccumSlot,
+                sceneTargets.OitRevealSlot, sceneTargets.Extent);
         }
         var counters = modelPass?.Diagnostics ?? default;
         gui.SetDiagnostics(new DiagnosticsStats
@@ -483,6 +548,7 @@ public sealed class VulkanRender : IMyRender
             Visible = Config.Current.Diagnostics,
             FrameMilliseconds = frameMilliseconds,
             RawFrameMilliseconds = rawFrameMilliseconds,
+            ProbeCpuMs = probePass?.LastCpuMs ?? 0,
             Fps = framesPerSecond,
             Triangles = counters.Triangles,
             Parts = counters.Parts,
@@ -514,6 +580,7 @@ public sealed class VulkanRender : IMyRender
                               $"skin {modelPass?.LastSkinningMs ?? 0:0.0}, prepare {modelPass?.LastPrepareMs ?? 0:0.0} " +
                               $"(cache {modelPass?.LastEnsureMs ?? 0:0.0}), " +
                               $"record {modelPass?.LastRecordMs ?? 0:0.0}, transparent {modelPass?.LastTransparentMs ?? 0:0.0}, " +
+                              $"probe {probePass?.LastCpuMs ?? 0:0.0}, " +
                               $"gui {lastGuiMs:0.0}; alloc {allocBytes / 1024.0:0.0} KB, " +
                               $"gc {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
         }
@@ -557,32 +624,103 @@ public sealed class VulkanRender : IMyRender
     }
 
     // The 3D scene into the HDR targets. No geometry yet: clears to the space background.
+    private static VkSampleCountFlags ToSamples(int level) => level switch
+    {
+        <= 0 => VkSampleCountFlags.Count1,
+        1 => VkSampleCountFlags.Count2,
+        2 => VkSampleCountFlags.Count4,
+        _ => VkSampleCountFlags.Count8,
+    };
+
+    private static uint ProbeResolution(int quality) => quality switch
+    {
+        <= 0 => 128,
+        1 => 256,
+        _ => 512,
+    };
+
     private unsafe void RecordScene(VkCommandBuffer commands)
     {
         var api = device.Api;
         var resolution = BackBufferResolution;
-        sceneTargets.EnsureSize((uint)Math.Max(1, resolution.X), (uint)Math.Max(1, resolution.Y));
+        var renderScale = Math.Clamp(Config.Current.RenderScale, 1f, 2f);
+        sceneTargets.EnsureSize((uint)Math.Max(1, resolution.X * renderScale),
+            (uint)Math.Max(1, resolution.Y * renderScale), sceneSamples);
         var extent = sceneTargets.Extent;
 
         frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
-            VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.None, VkImageLayout.Undefined,
+            VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead, sceneTargets.ColorLayout,
             VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
+        frameLoop.Barrier(sceneTargets.GBuffer.Handle, sceneTargets.GBuffer.FullRange,
+            VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.None, sceneTargets.GBufferLayout,
+            VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
+        frameLoop.Barrier(sceneTargets.GBuffer2.Handle, sceneTargets.GBuffer2.FullRange,
+            VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.None, sceneTargets.GBuffer2Layout,
+            VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
+        if (sceneSamples != VkSampleCountFlags.Count1)
+        {
+            frameLoop.Barrier(sceneTargets.ColorMs.Handle, sceneTargets.ColorMs.FullRange,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.None, VkImageLayout.Undefined,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
+            frameLoop.Barrier(sceneTargets.GBufferMs.Handle, sceneTargets.GBufferMs.FullRange,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.None, VkImageLayout.Undefined,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
+            frameLoop.Barrier(sceneTargets.GBuffer2Ms.Handle, sceneTargets.GBuffer2Ms.FullRange,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.None, VkImageLayout.Undefined,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
+            frameLoop.Barrier(sceneTargets.DepthMs.Handle, sceneTargets.DepthMs.FullRange,
+                VkPipelineStageFlags2.FragmentShader | VkPipelineStageFlags2.LateFragmentTests, VkAccessFlags2.None, VkImageLayout.Undefined,
+                VkPipelineStageFlags2.EarlyFragmentTests | VkPipelineStageFlags2.LateFragmentTests, VkAccessFlags2.DepthStencilAttachmentWrite, VkImageLayout.DepthAttachmentOptimal);
+        }
         frameLoop.Barrier(sceneTargets.Depth.Handle, sceneTargets.Depth.FullRange,
             VkPipelineStageFlags2.FragmentShader | VkPipelineStageFlags2.LateFragmentTests, VkAccessFlags2.None, VkImageLayout.Undefined,
             VkPipelineStageFlags2.EarlyFragmentTests | VkPipelineStageFlags2.LateFragmentTests, VkAccessFlags2.DepthStencilAttachmentWrite, VkImageLayout.DepthAttachmentOptimal);
 
-        var colorAttachment = new VkRenderingAttachmentInfo
+        var colorAttachments = stackalloc VkRenderingAttachmentInfo[3];
+        var multisampled = sceneSamples != VkSampleCountFlags.Count1;
+        colorAttachments[0] = new VkRenderingAttachmentInfo
         {
-            imageView = sceneTargets.Color.View,
+            imageView = multisampled ? sceneTargets.ColorMs.View : sceneTargets.Color.View,
             imageLayout = VkImageLayout.ColorAttachmentOptimal,
+            resolveMode = multisampled ? VkResolveModeFlags.Average : VkResolveModeFlags.None,
+            resolveImageView = multisampled ? sceneTargets.Color.View : default,
+            resolveImageLayout = VkImageLayout.ColorAttachmentOptimal,
             loadOp = VkAttachmentLoadOp.Clear,
             storeOp = VkAttachmentStoreOp.Store,
             clearValue = new VkClearValue { color = new VkClearColorValue(0.004f, 0.005f, 0.009f, 1f) },
         };
+        colorAttachments[1] = new VkRenderingAttachmentInfo
+        {
+            imageView = multisampled ? sceneTargets.GBufferMs.View : sceneTargets.GBuffer.View,
+            imageLayout = VkImageLayout.ColorAttachmentOptimal,
+            resolveMode = multisampled ? VkResolveModeFlags.Average : VkResolveModeFlags.None,
+            resolveImageView = multisampled ? sceneTargets.GBuffer.View : default,
+            resolveImageLayout = VkImageLayout.ColorAttachmentOptimal,
+            loadOp = VkAttachmentLoadOp.Clear,
+            storeOp = VkAttachmentStoreOp.Store,
+            clearValue = new VkClearValue { color = new VkClearColorValue(0f, 0f, 0f, 0f) },
+        };
+        colorAttachments[2] = new VkRenderingAttachmentInfo
+        {
+            imageView = multisampled ? sceneTargets.GBuffer2Ms.View : sceneTargets.GBuffer2.View,
+            imageLayout = VkImageLayout.ColorAttachmentOptimal,
+            resolveMode = multisampled ? VkResolveModeFlags.Average : VkResolveModeFlags.None,
+            resolveImageView = multisampled ? sceneTargets.GBuffer2.View : default,
+            resolveImageLayout = VkImageLayout.ColorAttachmentOptimal,
+            loadOp = VkAttachmentLoadOp.Clear,
+            storeOp = VkAttachmentStoreOp.Store,
+            clearValue = new VkClearValue { color = new VkClearColorValue(0f, 0f, 0f, 0f) },
+        };
+        sceneTargets.ColorLayout = VkImageLayout.ColorAttachmentOptimal;
+        sceneTargets.GBufferLayout = VkImageLayout.ColorAttachmentOptimal;
+        sceneTargets.GBuffer2Layout = VkImageLayout.ColorAttachmentOptimal;
         var depthAttachment = new VkRenderingAttachmentInfo
         {
-            imageView = sceneTargets.Depth.View,
+            imageView = multisampled ? sceneTargets.DepthMs.View : sceneTargets.Depth.View,
             imageLayout = VkImageLayout.DepthAttachmentOptimal,
+            resolveMode = multisampled ? VkResolveModeFlags.SampleZero : VkResolveModeFlags.None,
+            resolveImageView = multisampled ? sceneTargets.Depth.View : default,
+            resolveImageLayout = VkImageLayout.DepthAttachmentOptimal,
             loadOp = VkAttachmentLoadOp.Clear,
             storeOp = VkAttachmentStoreOp.Store,
             clearValue = new VkClearValue { depthStencil = new VkClearDepthStencilValue(0f, 0) }, // Reverse Z: far = 0
@@ -591,8 +729,8 @@ public sealed class VulkanRender : IMyRender
         {
             renderArea = new VkRect2D(0, 0, extent.width, extent.height),
             layerCount = 1,
-            colorAttachmentCount = 1,
-            pColorAttachments = &colorAttachment,
+            colorAttachmentCount = 3,
+            pColorAttachments = colorAttachments,
             pDepthAttachment = &depthAttachment,
         };
 
@@ -608,6 +746,7 @@ public sealed class VulkanRender : IMyRender
                 environment.EnvironmentLight.SunLightDirection);
             modelPass.RecordShadow(commands, camera);
             frameConstants = PrepareFrameConstants(environment);
+            lastFrameConstants = frameConstants;
         }
 
         api.vkCmdBeginRendering(commands, &renderingInfo);
@@ -616,13 +755,34 @@ public sealed class VulkanRender : IMyRender
             skyboxPass.Record(commands, sceneTargets, frameConstants);
             lastDrawnActors = modelPass.Record(commands, sceneTargets, camera, loddingSettings, actors,
                 frameConstants, out lastCulledActors);
+            voxelPass?.Record(commands, sceneTargets, camera, frameConstants);
         }
 
         api.vkCmdEndRendering(commands);
 
-        // Transparent pass into the order-independent OIT targets (same depth, read-only).
+        // The opaque scene is the source for screen-space reflections in transparent materials and
+        // in the composite pass; move it to a sampled layout before the OIT pass.
         if (sceneReady)
         {
+            frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead,
+                VkImageLayout.ShaderReadOnlyOptimal);
+            frameLoop.Barrier(sceneTargets.GBuffer.Handle, sceneTargets.GBuffer.FullRange,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead,
+                VkImageLayout.ShaderReadOnlyOptimal);
+            frameLoop.Barrier(sceneTargets.GBuffer2.Handle, sceneTargets.GBuffer2.FullRange,
+                VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite,
+                VkImageLayout.ColorAttachmentOptimal,
+                VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead,
+                VkImageLayout.ShaderReadOnlyOptimal);
+            sceneTargets.ColorLayout = VkImageLayout.ShaderReadOnlyOptimal;
+            sceneTargets.GBufferLayout = VkImageLayout.ShaderReadOnlyOptimal;
+            sceneTargets.GBuffer2Layout = VkImageLayout.ShaderReadOnlyOptimal;
+
             var depthBarrier = new VkImageMemoryBarrier2
             {
                 srcStageMask = VkPipelineStageFlags2.LateFragmentTests | VkPipelineStageFlags2.EarlyFragmentTests,
@@ -689,7 +849,10 @@ public sealed class VulkanRender : IMyRender
 
             api.vkCmdBeginRendering(commands, &oitInfo);
             if (Environment.GetEnvironmentVariable("VULKAN_NO_TRANSPARENT") != "1")
+            {
                 lastDrawnActors += modelPass.RecordTransparent(commands, sceneTargets, frameConstants);
+                billboards.Record(commands, sceneTargets, camera, actors, frameConstants, sharedData, thrusterEffects);
+            }
             api.vkCmdEndRendering(commands);
 
             frameLoop.Barrier(sceneTargets.OitAccum.Handle, sceneTargets.OitAccum.FullRange,
@@ -706,9 +869,6 @@ public sealed class VulkanRender : IMyRender
             sceneTargets.OitRevealLayout = VkImageLayout.ShaderReadOnlyOptimal;
         }
 
-        frameLoop.Barrier(sceneTargets.Color.Handle, sceneTargets.Color.FullRange,
-            VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal,
-            VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead, VkImageLayout.ShaderReadOnlyOptimal);
     }
 
     private void OnConfigChanged(object sender, PropertyChangedEventArgs e)
@@ -722,13 +882,17 @@ public sealed class VulkanRender : IMyRender
         if (renderSettingsBuffer == null)
             return;
 
+        var noReflections = Environment.GetEnvironmentVariable("VULKAN_NO_REFLECTIONS") == "1";
+        var noSsr = Environment.GetEnvironmentVariable("VULKAN_NO_SSR") == "1" ||
+                    !Config.Current.ScreenSpaceReflections;
         var settings = new GpuRenderSettings
         {
             Tuning0 = new Vector4(Config.Current.SunScale, Config.Current.AmbientScale,
                 Config.Current.SpecularScale, Config.Current.MetalnessScale),
             Tuning1 = new Vector4(Config.Current.EmissiveScale, Config.Current.LightScale,
-                Config.Current.ReflectionScale, Config.Current.ScreenScale),
-            Post = new Vector4(Config.Current.ExposureScale, Config.Current.BloomScale, 0f, 0f),
+                noReflections ? 0f : Config.Current.ReflectionScale, Config.Current.ScreenScale),
+            Post = new Vector4(Config.Current.ExposureScale, Config.Current.BloomScale,
+                noSsr ? -1f : 0f, Config.Current.ReflectionQuality),
         };
         *(GpuRenderSettings*)renderSettingsBuffer.Mapped = settings;
     }
@@ -759,19 +923,49 @@ public sealed class VulkanRender : IMyRender
         var iblSlot = TextureCache.CubeSlotOf(iblEntry);
         var iblMips = TextureCache.MipLevelsOf(iblEntry);
         var brdfSlot = TextureCache.SlotOf(brdf);
+        lastStaticIblSlot = iblSlot;
+        lastStaticIblMips = iblMips;
 
         var constants = camera.BuildFrameConstants(environment, skyboxSlot, iblSlot, brdfSlot, iblMips);
-        constants.EmissiveScale = postprocessSettings.Data.BloomEmissiveness;
-        var lightData = sceneLights.Build(gpu, camera.Position, actors);
+        // Live reflection quality blend. The probe stores a full close cube; distant receivers
+        // sample progressively blurrier mips instead of switching to a separate sky-only cube.
+        var blendStart = Math.Max(1f, Config.Current.ReflectionBlendStart);
+        var blendEnd = Math.Max(blendStart + 1f, Config.Current.ReflectionBlendEnd);
+        constants.ReflectionParams = new Vector4(blendStart, blendEnd,
+            Math.Clamp(Config.Current.ReflectionFarMipBias, 0f, 4f),
+            Math.Clamp(Config.Current.ReflectionMinMip, 0f, 4f));
+        constants.EmissiveScale = MyPostprocessSettings.Default.Data.BloomEmissiveness;
+        var thrusterLights = thrusterEffects.BuildLights(camera.Position, actors);
+        if (Environment.GetEnvironmentVariable("VULKAN_DEBUG_LIGHTS") == "1" && thrusterLights.Count > 0)
+        {
+            var l = thrusterLights[0];
+            RenderLog.Info($"Thruster lights: {thrusterLights.Count}, first pos={l.PositionRange.X:F1},{l.PositionRange.Y:F1},{l.PositionRange.Z:F1} range={l.PositionRange.W:F2} color={l.ColorFalloff.X:F2},{l.ColorFalloff.Y:F2},{l.ColorFalloff.Z:F2} falloff={l.ColorFalloff.W:F2}");
+        }
+        var lightData = sceneLights.Build(gpu, camera.Position, actors, Config.Current.EffectsDistance,
+            thrusterLights);
         constants.Lights = lightData.Address;
         constants.LightCount = lightData.Count;
         constants.ShadowParams = new Vector4(1f, 0.00005f, 1f, 4f);
+        constants.SceneColor = sceneTargets.ColorSlot;
+        constants.SceneDepth = sceneTargets.DepthSlot;
+        constants.SceneGBuffer = sceneTargets.GBufferSlot;
+
+        if (!probeDisabled && probePass is { HasActive: true })
+        {
+            constants.IblCube = probePass.ActiveSlot;
+            constants.IblCubePrev = probePass.PreviousSlot;
+            constants.IblBlend = probePass.Blend;
+            constants.IblProbe = 1;
+            constants.SkyboxParams = new Vector4(constants.SkyboxParams.X, probePass.MipLevels,
+                constants.SkyboxParams.Z, constants.SkyboxParams.W);
+        }
 
         if (modelPass.ShadowsReady && modelPass.ShadowPassRecorded)
         {
             var shadow0 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(0));
             var shadow1 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(1));
             var shadow2 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(2));
+            var shadow3 = Matrix.Transpose(modelPass.ShadowViewProjectionAt(3));
             constants.ShadowMatrix0 = new Vector4(shadow0.M11, shadow0.M12, shadow0.M13, shadow0.M14);
             constants.ShadowMatrix1 = new Vector4(shadow0.M21, shadow0.M22, shadow0.M23, shadow0.M24);
             constants.ShadowMatrix2 = new Vector4(shadow0.M31, shadow0.M32, shadow0.M33, shadow0.M34);
@@ -784,17 +978,24 @@ public sealed class VulkanRender : IMyRender
             constants.ShadowMatrix2_1 = new Vector4(shadow2.M21, shadow2.M22, shadow2.M23, shadow2.M24);
             constants.ShadowMatrix2_2 = new Vector4(shadow2.M31, shadow2.M32, shadow2.M33, shadow2.M34);
             constants.ShadowMatrix2_3 = new Vector4(shadow2.M41, shadow2.M42, shadow2.M43, shadow2.M44);
+            constants.ShadowMatrix3_0 = new Vector4(shadow3.M11, shadow3.M12, shadow3.M13, shadow3.M14);
+            constants.ShadowMatrix3_1 = new Vector4(shadow3.M21, shadow3.M22, shadow3.M23, shadow3.M24);
+            constants.ShadowMatrix3_2 = new Vector4(shadow3.M31, shadow3.M32, shadow3.M33, shadow3.M34);
+            constants.ShadowMatrix3_3 = new Vector4(shadow3.M41, shadow3.M42, shadow3.M43, shadow3.M44);
             constants.ShadowMap = modelPass.ShadowSlotAt(0);
             constants.ShadowMap1 = modelPass.ShadowSlotAt(1);
             constants.ShadowMap2 = modelPass.ShadowSlotAt(2);
+            constants.ShadowMap3 = modelPass.ShadowSlotAt(3);
             constants.ShadowSize = ShadowMap.Size;
             constants.ShadowEnabled = 1;
             var splits = ModelPass.ShadowSplitEnds;
-            constants.ShadowSplits = new Vector4(splits[0], splits[1], splits[2], ModelPass.ShadowCascadeCount);
+            constants.ShadowSplits = new Vector4(splits[0], splits[1], splits[2], splits[3]);
             constants.ShadowCascadeParams = new Vector4(
-                modelPass.ShadowExtentAt(0), modelPass.ShadowExtentAt(1), modelPass.ShadowExtentAt(2), 0f);
+                modelPass.ShadowExtentAt(0), modelPass.ShadowExtentAt(1), modelPass.ShadowExtentAt(2),
+                modelPass.ShadowExtentAt(3));
         }
 
+        lastFrameConstantsData = constants;
         var allocation = gpu.Transient.Allocate<FrameConstants>();
         allocation.As<FrameConstants>() = constants;
 
@@ -826,15 +1027,22 @@ public sealed class VulkanRender : IMyRender
         return string.IsNullOrEmpty(directory) ? name : Path.Combine(directory, name);
     }
 
+    private static bool IsSrgb(VkFormat format) =>
+        format is VkFormat.B8G8R8A8Srgb or VkFormat.R8G8B8A8Srgb;
+
     private unsafe void RecordFrame(VkCommandBuffer commands)
     {
+        probePass?.BeginFrame();
         var api = device.Api;
         var image = frameLoop.BackbufferImage;
         var extent = frameLoop.BackbufferExtent;
         var range = new VkImageSubresourceRange(VkImageAspectFlags.Color, 0, 1, 0, 1);
 
+        // The acquired swapchain image was read by vkAcquireNextImageKHR; the layout transition
+        // is a write, so it must be ordered after both the graphics and transfer stages included
+        // in the acquire semaphore wait.
         frameLoop.Barrier(image, range,
-            VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.None, VkImageLayout.Undefined,
+            VkPipelineStageFlags2.AllCommands, VkAccessFlags2.None, VkImageLayout.Undefined,
             VkPipelineStageFlags2.ColorAttachmentOutput, VkAccessFlags2.ColorAttachmentWrite, VkImageLayout.ColorAttachmentOptimal);
 
         // No world rendering yet: the GUI goes over a black screen, like the stock renderer without a scene
@@ -854,22 +1062,40 @@ public sealed class VulkanRender : IMyRender
             pColorAttachments = &colorAttachment,
         };
 
+        if (drawScene)
+        {
+            composite ??= new CompositePass(gpu);
+            composite.Record(commands, sceneTargets, extent, lastFrameConstants, exposurePass.Slot, bloomPass.Slot,
+                modelPass.ShadowSlot, debugShadowMap ? 1u : (debugSsr ? 2u : (debugSsrColor ? 3u : 0u)),
+                MyPostprocessSettings.Default.Data.WhitePoint);
+
+            if (fxaa == null || compositeFormat != swapchain.Format)
+            {
+                fxaa?.Dispose();
+                fxaa = new FxaaPass(gpu, swapchain.Format);
+                compositeFormat = swapchain.Format;
+            }
+        }
+
         api.vkCmdBeginRendering(commands, &renderingInfo);
         if (drawScene)
         {
-            if (composite == null || compositeFormat != swapchain.Format)
-            {
-                composite?.Dispose();
-                composite = new CompositePass(gpu, swapchain.Format);
-                compositeFormat = swapchain.Format;
-            }
-
-            composite.Record(commands, sceneTargets, extent, exposurePass.Slot, bloomPass.Slot,
-                modelPass.ShadowSlot, debugShadowMap, postprocessSettings.Data.WhitePoint);
+            var antialiasing = Config.Current.Fxaa;
+            var fxaaQuality = Math.Clamp(Config.Current.FxaaQuality, 1, 4) - 1;
+            fxaa.Record(commands, composite.SourceSlot, extent, antialiasing, IsSrgb(swapchain.Format), fxaaQuality);
         }
 
         gui.RecordMain(commands, swapchain.Format, BackBufferResolution, extent);
         api.vkCmdEndRendering(commands);
+
+        if (drawScene && lastFrameConstants != 0)
+        {
+            // Whole-cube updates every frame keep reflections live (moving ships, thrusters, lights)
+            // without the old 2/4/8 Hz stepping. The lower default resolution and single-sample,
+            // shadow-less capture keep the per-frame cost bounded.
+            probePass?.RecordCube(commands, frameLoop.FrameSlot, camera, loddingSettings, actors,
+                lastFrameConstantsData, sharedData, thrusterEffects, lastStaticIblSlot, lastStaticIblMips);
+        }
 
         if (capture != null && capture.ShouldCapture)
             capture.Record(commands, frameLoop, swapchain.Format);
@@ -940,6 +1166,40 @@ public sealed class VulkanRender : IMyRender
                 sceneLights.Create(((MyRenderMessageCreateRenderLight)message).ID);
                 break;
 
+            case MyRenderMessageEnum.CreateRenderVoxelMaterials:
+            {
+                var m = (MyRenderMessageCreateRenderVoxelMaterials)message;
+                voxelPass?.SetMaterials(m.Materials);
+                m.Materials = null;
+                break;
+            }
+
+            case MyRenderMessageEnum.UpdateRenderVoxelMaterials:
+            {
+                var m = (MyRenderMessageUpdateRenderVoxelMaterials)message;
+                voxelPass?.SetMaterials(m.Materials);
+                m.Materials = null;
+                break;
+            }
+
+            case MyRenderMessageEnum.PreloadVoxelMaterials:
+                // Materials are uploaded when Create/UpdateRenderVoxelMaterials arrives.
+                break;
+
+            case MyRenderMessageEnum.VoxelCreate:
+                voxelPass?.Create((MyRenderMessageVoxelCreate)message);
+                break;
+
+            case MyRenderMessageEnum.InvalidateClipmapRange:
+            {
+                var m = (MyRenderMessageInvalidateClipmapRange)message;
+                voxelPass?.InvalidateRange(m.ClipmapId, m.MinCellLod0, m.MaxCellLod0);
+                break;
+            }
+
+            case MyRenderMessageEnum.ClipmapsReady:
+                break;
+
             case MyRenderMessageEnum.UpdatePostprocessSettings:
             {
                 postprocessSettings = ((MyRenderMessageUpdatePostprocessSettings)message).Settings;
@@ -948,6 +1208,10 @@ public sealed class VulkanRender : IMyRender
 
             case MyRenderMessageEnum.UpdateRenderLight:
                 sceneLights.Update(((MyRenderMessageUpdateRenderLight)message).Data);
+                break;
+
+            case MyRenderMessageEnum.UpdateRenderComponent:
+                thrusterEffects.Process((MyRenderMessageUpdateComponent)message);
                 break;
 
             case MyRenderMessageEnum.AddRuntimeModel:
@@ -1077,19 +1341,29 @@ public sealed class VulkanRender : IMyRender
             }
 
             case MyRenderMessageEnum.UpdateRenderObject:
-                actors.Update((MyRenderMessageUpdateRenderObject)message);
+            {
+                var update = (MyRenderMessageUpdateRenderObject)message;
+                actors.Update(update);
+                voxelPass?.UpdateObject(update);
                 break;
+            }
 
             case MyRenderMessageEnum.UpdateRenderObjectVisibility:
             {
                 var m = (MyRenderMessageUpdateRenderObjectVisibility)message;
                 actors.SetVisible(m.ID, m.Visible, m.NearFlag);
+                voxelPass?.SetVisible(m.ID, m.Visible);
                 break;
             }
 
             case MyRenderMessageEnum.UpdateRenderEntity:
-                actors.UpdateEntity((MyRenderMessageUpdateRenderEntity)message);
+            {
+                var m = (MyRenderMessageUpdateRenderEntity)message;
+                actors.UpdateEntity(m);
+                // Dithering is used by the game while voxel LOD cells fade in/out. The basic pass
+                // doesn't alpha-test, but acknowledging the message keeps the state coherent.
                 break;
+            }
 
             case MyRenderMessageEnum.UpdateModelProperties:
                 actors.SetModelProperties((MyRenderMessageUpdateModelProperties)message);
@@ -1145,8 +1419,10 @@ public sealed class VulkanRender : IMyRender
             {
                 var id = ((MyRenderMessageRemoveRenderObject)message).ID;
                 actors.Remove(id);
+                voxelPass?.Remove(id);
                 instanceBuffers.Remove(id);
                 sceneLights.Remove(id);
+                thrusterEffects.Remove(id);
                 var type = MyRenderProxy.GetObjectType(id);
                 if (type != MyRenderProxy.ObjectType.Invalid)
                     MyRenderProxy.RemoveMessageId(id, type);

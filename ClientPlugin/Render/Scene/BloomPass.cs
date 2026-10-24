@@ -20,6 +20,8 @@ internal sealed unsafe class BloomPass : IDisposable
         public float Threshold;
         public float DirectionX;
         public float DirectionY;
+        public uint OitAccum;
+        public uint OitReveal;
     }
 
     private readonly GpuContext context;
@@ -77,10 +79,11 @@ internal sealed unsafe class BloomPass : IDisposable
         layoutB = VkImageLayout.Undefined;
     }
 
-    public void Record(VkCommandBuffer commands, uint sceneTexture, VkExtent2D fullExtent)
+    public void Record(VkCommandBuffer commands, uint sceneTexture, uint oitAccum, uint oitReveal,
+        VkExtent2D fullExtent)
     {
         EnsureSize(fullExtent);
-        Prefilter(commands, sceneTexture);
+        Prefilter(commands, sceneTexture, oitAccum, oitReveal);
 
         var dx = 1f / extent.width;
         var dy = 1f / extent.height;
@@ -105,7 +108,7 @@ internal sealed unsafe class BloomPass : IDisposable
             VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead);
     }
 
-    private void Prefilter(VkCommandBuffer commands, uint sceneTexture)
+    private void Prefilter(VkCommandBuffer commands, uint sceneTexture, uint oitAccum, uint oitReveal)
     {
         Transition(commands, a, ref layoutA, VkImageLayout.ColorAttachmentOptimal,
             VkPipelineStageFlags2.FragmentShader, VkAccessFlags2.ShaderSampledRead,
@@ -115,6 +118,8 @@ internal sealed unsafe class BloomPass : IDisposable
         {
             Source = sceneTexture,
             Threshold = Threshold,
+            OitAccum = oitAccum,
+            OitReveal = oitReveal,
             DirectionX = 0f,
             DirectionY = 0f,
         });

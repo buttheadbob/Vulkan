@@ -18,8 +18,9 @@ internal sealed unsafe class SkyboxPass : IDisposable
 
     private readonly GpuContext context;
     private readonly VkPipeline pipeline;
+    private readonly VkPipeline probePipeline;
 
-    public SkyboxPass(GpuContext context)
+    public SkyboxPass(GpuContext context, VkSampleCountFlags samples)
     {
         this.context = context;
         pipeline = new GraphicsPipelineBuilder
@@ -27,18 +28,34 @@ internal sealed unsafe class SkyboxPass : IDisposable
             Code = ShaderBytecode.Skybox.Code.ToArray(),
             VertexEntry = ShaderBytecode.Skybox.VertexMain,
             FragmentEntry = ShaderBytecode.Skybox.FragmentMain,
-            ColorFormats = [SceneTargets.ColorFormat],
+            ColorFormats = [SceneTargets.ColorFormat, SceneTargets.GBufferFormat, SceneTargets.GBufferFormat],
             DepthFormat = SceneTargets.DepthFormat,
+            Samples = samples,
             DepthTest = false,
             DepthWrite = false,
             CullMode = VkCullModeFlags.None,
         }.Build(context, "skybox");
+
+        // Probe faces are single-sample; the main scene may use MSAA.
+        probePipeline = new GraphicsPipelineBuilder
+        {
+            Code = ShaderBytecode.Skybox.Code.ToArray(),
+            VertexEntry = ShaderBytecode.Skybox.VertexMain,
+            FragmentEntry = ShaderBytecode.Skybox.FragmentMain,
+            ColorFormats = [SceneTargets.ColorFormat, SceneTargets.GBufferFormat, SceneTargets.GBufferFormat],
+            DepthFormat = SceneTargets.DepthFormat,
+            Samples = VkSampleCountFlags.Count1,
+            DepthTest = false,
+            DepthWrite = false,
+            CullMode = VkCullModeFlags.None,
+        }.Build(context, "skybox-probe");
     }
 
     public void Record(VkCommandBuffer commands, SceneTargets targets, ulong frameConstants)
     {
         var api = context.Device.Api;
-        api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics, pipeline);
+        api.vkCmdBindPipeline(commands, VkPipelineBindPoint.Graphics,
+            targets.Samples == VkSampleCountFlags.Count1 ? probePipeline : pipeline);
         context.Bindless.Bind(commands, VkPipelineBindPoint.Graphics);
 
         var viewport = new VkViewport(0, 0, targets.Extent.width, targets.Extent.height, 0, 1);
@@ -56,6 +73,11 @@ internal sealed unsafe class SkyboxPass : IDisposable
     {
         var api = context.Device.Api;
         var handle = pipeline;
-        context.Release(() => api.vkDestroyPipeline(handle, null));
+        var probe = probePipeline;
+        context.Release(() =>
+        {
+            api.vkDestroyPipeline(handle, null);
+            api.vkDestroyPipeline(probe, null);
+        });
     }
 }
